@@ -7,6 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
+[[ "$ENGINE" == python ]] || die "these tests are the Python engine's; ENGINE=zig has zig build test (docs/zig-engine.md)"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing: run scripts/prepare.sh first"
 args=(--rm --memory "${MEM:-3g}" --cpus "${CPUS:-6}" -v "$PWD/tests:/tests:ro" -w /tests)
 [[ -z "${TF_SRC:-}" ]] || args+=(-v "$(readlink -f "$TF_SRC"):/tf-src:ro" -e TF_SRC=/tf-src)

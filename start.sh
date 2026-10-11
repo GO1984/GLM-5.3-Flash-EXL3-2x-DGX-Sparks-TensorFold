@@ -16,6 +16,8 @@
 #   KV=bf16 ./start.sh restart         # the exact bf16 KV cache (and a 196,608 window)
 #   DRAFTER=mtp ./start.sh restart     # the checkpoint's own MTP head instead of DFlash2 (one request at a time)
 #   DRY_RUN=1 ./start.sh               # print every rank's docker command and exit, stopping and starting nothing
+#   ENGINE=zig ./start.sh              # TensorFold v1.0.7's Zig engine (tensorfold-native) instead of the Python engine
+#                                      # (docs/zig-engine.md: what it serves so far, and which settings it does not read yet)
 # Extra arguments go to both ranks after the defaults, so they win (the last value of a flag counts).
 # Setup: WORKER=user@<worker address> in scripts/local.sh (key-based ssh).
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
@@ -30,6 +32,7 @@
 #            WORKER_WEIGHTS (copy | nfs: rank 1 reads the head's HF_CACHE over NFS), NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_WEIGHTS2, NFS_SERVER2, WORKER_WEIGHTS3, NFS_SERVER3,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
+#   engine   ENGINE (python | zig), ZIG_TF_REF, ZIG_VERSION, ZIG_NCCL_VERSION, ZIG_BUILD_IMAGE, ZIG_RUN_IMAGE (zig/Dockerfile)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
@@ -104,12 +107,29 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$TF_GLM_EXL3_DEC_ORDER" =~ ^[012]$ ]] || die "TF_GLM_EXL3_DEC_ORDER is 0, 1 or 2, not $TF_GLM_EXL3_DEC_ORDER"
 [[ "$TF_ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "TF_ROCE_MAX_KB is a size in KiB (512: up to 32-row windows over RoCE), not $TF_ROCE_MAX_KB"
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
-[[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
-[[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
-if [[ "$SPILL_GIB" != 0 ]]; then                   # patch 0088: the spill tier (scripts/config.sh)
-  [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
-  SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
-               --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
+if [[ "$ENGINE" == zig ]]; then
+  # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
+  # cannot do yet is refused here, before anything is stopped, never silently dropped
+  zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); use ENGINE=python or leave it at its default"; }
+  [[ "$DRAFTER" == dflash2 ]]            || zig_unsupported "DRAFTER=$DRAFTER (only DFlash2 drafts)"
+  [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
+  [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
+  [[ "$VISION" == 0 ]]                   || zig_unsupported "VISION=1 (image and video input)"
+  [[ "$SPILL_GIB" == 0 ]]                || zig_unsupported "the spill tier (SPILL_GIB)"
+  (( DISPLAY_KV_MIB == 0 ))              || zig_unsupported "DISPLAY_KV_MIB"
+  if (( TP == 3 )); then (( DRY )) || zig_unsupported "TP=3"; warn "ENGINE=zig: TP=3 is not in the Zig engine yet (its parser refuses --tp 3); printing the commands only"; fi
+  if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4"; warn "ENGINE=zig: TP=4 is not in the Zig engine yet (no split, ring or relay); printing the commands only"; fi
+  [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
+    warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL fail with MissingTritonVariant until more shapes are captured"
+  SERVE_ARGS+=(--backend cuda --prompt-cache-gib 0)  # (no prompt cache in the GLM Zig engine yet: kept prompt states are TODO)
+else
+  [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
+  [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+  if [[ "$SPILL_GIB" != 0 ]]; then                   # patch 0088: the spill tier (scripts/config.sh)
+    [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
+    SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
+                 --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
+  fi
 fi
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
@@ -145,8 +165,8 @@ source ./scripts/banner.sh
 echo
 banner                                             # the TensorFold ribbon and MIA AI LAB (terminals only)
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s x DGX Spark · %s at once · %s-token window · %s KV · %s drafts · port %s%s\n\n' "$D" "$MODEL_ID" "$TP" \
-  "$(arg_value --parallel)" "$(arg_value --context)" "$KV" "$DRAFTER" "$PORT" "$R"
+printf '%s  %s · %s x DGX Spark · %s at once · %s-token window · %s KV · %s drafts · port %s%s%s\n\n' "$D" "$MODEL_ID" "$TP" \
+  "$(arg_value --parallel)" "$(arg_value --context)" "$KV" "$DRAFTER" "$PORT" "$( [[ "$ENGINE" == zig ]] && echo " · Zig engine")" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -222,15 +242,25 @@ MODEL_ARG=$(snapshot "$MODEL_ID")
 if [[ "$DRAFTER" == dflash2 ]]; then DRAFTER_ARG=$(snapshot "$DFLASH2_ID")
 else DRAFTER_ARG=none; fi                           # the checkpoint's MTP head, even when DFlash2 is downloaded
 SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the command line comes later and wins
+ENGINE_CMD=(tensorfold serve); [[ "$ENGINE" == zig ]] && ENGINE_CMD=(tensorfold-native serve)
 
 # ---------------------------------------------------------------- 2. checks
 step 2 "Checks: arguments, link, previous server, port, memory"
 # tensorfold's own parser, in a throwaway container without the GPU: a typo fails here, before anything is stopped
+# (ENGINE=zig: the binary's `capabilities --json` lists the flags and values it serves; every one we pass must be there)
+if [[ "$ENGINE" == zig ]]; then
+  { docker run --rm --entrypoint tensorfold-native "$IMAGE" capabilities --json 2>"$STATE_DIR/args.err" |
+      python3 "$PWD/scripts/zig_flags.py" --tp "$TP" --rank 0 --master 127.0.0.1 --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" \
+      >/dev/null 2>>"$STATE_DIR/args.err"; } ||
+  if (( DRY )); then warn "DRY_RUN: tensorfold-native in $IMAGE rejects these arguments: $(tail -1 "$STATE_DIR/args.err")"
+  else cat "$STATE_DIR/args.err" >&2; die "tensorfold-native serve rejects these arguments (see above); nothing was changed"; fi
+else
 docker run --rm --entrypoint python "$IMAGE" -c \
   'import sys; from tensorfold.cli import build_parser; build_parser().parse_args(sys.argv[1:])' \
   serve "$MODEL_ARG" --tp "$TP" --rank 0 --master 127.0.0.1 --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" >/dev/null 2>"$STATE_DIR/args.err" ||
   if (( DRY )); then warn "DRY_RUN: tensorfold serve in $IMAGE rejects these arguments: $(tail -1 "$STATE_DIR/args.err")"
   else cat "$STATE_DIR/args.err" >&2; die "tensorfold serve rejects these arguments (see above); nothing was changed"; fi
+fi
 detect_links
 if (( TP == 2 )); then log "Link: $HEAD_ADDR ($HEAD_DEV) <-> $WORKER_ADDR ($WORKER_DEV), RoCE $HEAD_HCAS / $WORKER_HCAS (GID $HEAD_GID / $WORKER_GID; $(tr ',' '\n' <<<"$HEAD_HCAS" | wc -l) rail(s) -> NCCL_IB_HCA, TF_ROCE_HCA)"
 else
@@ -308,10 +338,27 @@ fi
 # docker commands run over ssh, where this shell's environment does not reach. None of them is a secret. At TP>2,
 # TF_ROCE_HCA names a node's own devices, so each rank gets its own (scripts/nodes.sh, rank_nccl_env); at TP=2 it
 # passes as set, as in v1.4 (unset: the ranks take NCCL_IB_HCA's devices).
+# ENGINE=zig: the recipe's settings the Zig engine reads, as the variables it reads (docs/zig-engine.md has the full table)
+zig_env() {
+  local v l2=1
+  [[ "$TF_GLM_L2PF" =~ ^(0|off)$ ]] && l2=0
+  ENV_ARGS+=(-e TENSORFOLD_NO_UPDATE_CHECK=1 -e "TENSORFOLD_MEMORY_RESERVE_GIB=$MEMORY_RESERVE_GIB"
+             -e "TF_GLM_ROCE=$([[ "$COMM" == roce ]] && echo 1 || echo 0)" -e "TF_ROCE_MAX_KB=$TF_ROCE_MAX_KB" -e "TF_GLM_L2PF=$l2")
+  # set by you (not by scripts/config.sh): read by the Zig engine as they are
+  for v in TF_GLM_LOAD_THREADS TENSORFOLD_CUDA_MEMORY_LIMIT_GB TF_CUDA_DEVICE TF_GRAPH_LOG TF_ROUND_LOG TF_TP_TRACE TF_TP_STATS TF_TP_TIMEOUT_S TF_GLM_PROFILE_API; do
+    [[ -z "${!v:-}" ]] || ENV_ARGS+=(-e "$v=${!v}")
+  done
+}
 env_args() {
   local _skip='^$' name
   ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
+  if [[ "$ENGINE" == zig ]]; then
+    # the Zig engine reads few of them (docs/zig-engine.md): the settings it maps, then any TENSORFOLD_ / TF_ variable you
+    # set yourself that it reads, by name; the Python engine's own switches (TF_GLM_*) stay out of its environment
+    zig_env
+    return
+  fi
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }
 env_args
@@ -338,7 +385,7 @@ launch() {
   local rank0 rankw worker_cmd remote a i
   local -a here_cmd
   for (( i = TP - 1; i >= 1; i-- )); do
-    rankw=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank "$i" --master "${LINK_HEAD_ADDR[i]:-$MASTER_ADDR}" --master-port "$MASTER_PORT" "${SERVE_ARGS[@]}")
+    rankw=("${ENGINE_CMD[@]}" "$MODEL_ARG" --tp "$TP" --rank "$i" --master "${LINK_HEAD_ADDR[i]:-$MASTER_ADDR}" --master-port "$MASTER_PORT" "${SERVE_ARGS[@]}")
     log "Rank $i on $(worker_host "$i"): ${rankw[*]}"
     worker_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
                 $(rank_nccl_env "$i")
@@ -353,7 +400,7 @@ launch() {
     fi
     worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53 &&$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
   done
-  rank0=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank 0 --master "$MASTER_ADDR" --master-port "$MASTER_PORT"
+  rank0=("${ENGINE_CMD[@]}" "$MODEL_ARG" --tp "$TP" --rank 0 --master "$MASTER_ADDR" --master-port "$MASTER_PORT"
          --name "$SERVED_NAME" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}")
   log "Rank 0 here: ${rank0[*]}"
   here_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
@@ -420,7 +467,7 @@ fail() {
 # fill slower), and says so.
 split_nccl_failed() {
   local i
-  [[ "$SPLIT" == 1 ]] || return 1
+  [[ "$SPLIT" == 1 && "$ENGINE" == python ]] || return 1       # (the Zig engine has no split prefill yet)
   { docker logs "$CONTAINER_NAME" 2>&1 || true
     for i in $(worker_ids); do worker "$i" docker logs "$CONTAINER_NAME" 2>&1 || true; done
   } | grep 'NCCL error 2: unhandled system error' >/dev/null      # not -q: an early exit fails the pipe (pipefail)

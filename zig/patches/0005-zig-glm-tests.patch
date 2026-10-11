@@ -1,0 +1,2441 @@
+TensorFold v1.0.7..7a2461b2 (glm-v107-perf): glm-tests
+Apply from the checkout root with: git apply 0005-zig-glm-tests.patch
+
+diff --git a/zig/src/cuda/roce.zig b/zig/src/cuda/roce.zig
+new file mode 100644
+index 00000000..e88a9d1e
+--- /dev/null
++++ b/zig/src/cuda/roce.zig
+@@ -0,0 +1,294 @@
++//! The one-shot RoCE all-gather between two ranks (decode plan D1, work/research/R1-decode.md 3.1): b12x's
++//! "RoCEnante" protocol (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by the b12x contributors at
++//! Local Inference Lab, Apache License 2.0) in a new implementation: the host proxy in roce_proxy.c (libibverbs opened
++//! at run time), the GPU kernel in zig/kernels/cuda/fn_roce.cu. A gather of up to `slot_bytes` a rank costs one kernel
++//! launch, with no host work on the receive side; the byte layout is ncclAllGather's (rank 0's shard first), so it is
++//! a drop-in for small gathers and graph-capturable (the sequence lives in device memory).
++//!
++//! Setup: `open` (region, ports, queue pairs), the two ranks swap `blob`s (the caller's control link), `connect`,
++//! `start` (the proxy thread). Both ranks must make the same gathers in the same order, as for NCCL.
++const std = @import("std");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const Error = @import("driver.zig").Error;
++const memory = @import("memory.zig");
++const module = @import("module.zig");
++const launch = @import("launch.zig");
++const Stream = @import("stream.zig").Stream;
++const kernels = @import("kernels.zig");
++
++const Proxy = opaque {};
++extern fn tf_roce_blob_bytes() u64;
++extern fn tf_roce_layout(world: c_int, slot_bytes: u64, out: *[5]u64) c_int;
++extern fn tf_roce_open(world: c_int, rank: c_int, names: [*]const [*:0]const u8, ports: c_int, gid_index: c_int, region: *anyopaque, region_bytes: u64, slot_bytes: u64, err: [*]u8, err_len: u64) ?*Proxy;
++extern fn tf_roce_blob_of(r: *Proxy, out: *anyopaque) c_int;
++extern fn tf_roce_connect(r: *Proxy, peer: *const anyopaque) c_int;
++extern fn tf_roce_start(r: *Proxy) c_int;
++extern fn tf_roce_failed(r: *Proxy) c_int;
++extern fn tf_roce_error(r: *Proxy) [*:0]const u8;
++extern fn tf_roce_ops(r: *Proxy) u64;
++extern fn tf_roce_close(r: *Proxy) void;
++
++pub const max_ports = 2;
++
++/// Read-only bytes to pull into the L2 while a gather waits (decode plan D2): the next kernels' weights.
++pub const Prefetch = struct { ptr: abi.DevicePtr = 0, bytes: usize = 0 };
++
++/// L2 prefetch blocks for `bytes`: four 128-byte lines a thread of 512, at most 64 blocks.
++fn prefetchBlocks(bytes: usize) usize {
++    if (bytes == 0) return 0;
++    return std.math.clamp((bytes / 128 + 2047) / 2048, 1, 64);
++}
++
++pub const prefetch_symbol: [:0]const u8 = "_ZN10tf_fn_roce8prefetchEPKcy";
++
++/// The prefetch alone, for gathers NCCL makes: one launch on the gather's stream just before it; the lines it asks
++/// for keep arriving while NCCL waits on the network.
++pub const L2 = struct {
++    mod: module.Module,
++    f: module.Function,
++    d: *const Driver,
++
++    pub fn init(d: *const Driver) !L2 {
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var mod = try module.Module.load(d, kernels.fn_roce);
++        errdefer mod.unload();
++        return .{ .mod = mod, .f = try mod.function(prefetch_symbol), .d = d };
++    }
++
++    pub fn deinit(l: *L2) void {
++        l.mod.unload();
++    }
++
++    pub fn run(l: *const L2, p: Prefetch, stream: abi.Stream) !void {
++        const blocks = prefetchBlocks(p.bytes);
++        if (blocks == 0 or p.ptr == 0) return;
++        var a: launch.Args = .{};
++        a.add(p.ptr);
++        a.add(@as(u64, p.bytes));
++        const s: Stream = .{ .d = l.d, .handle = stream };
++        try launch.launch(l.f, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 512 } }, s, &a);
++    }
++};
++
++/// The kernel's two forms: 16-byte units (aligned pointers, a multiple of 16 bytes) and 4-byte units.
++pub const symbols = [2][:0]const u8{
++    "_ZN10tf_fn_roce6gatherI5uint4EEvPKT_PS2_ijS5_S4_PKjPjyPNS_5StateEiiyiPKcy",
++    "_ZN10tf_fn_roce6gatherIjEEvPKT_PS1_ijS4_S3_PKjPjyPNS_5StateEiiyiPKcy",
++};
++
++pub const Settings = struct {
++    /// RDMA device names, one a port (rail), e.g. rocep1s0f1 and roceP2p1s0f1; the peer lists its own in the same order
++    ports: []const []const u8,
++    gid_index: c_int,
++    /// the largest shard a rank, a multiple of 4096 (larger gathers go elsewhere)
++    slot_bytes: u64 = 512 << 10,
++    /// how long a kernel waits for the peer before it stops the stream (a trap: the peer is gone or its proxy failed)
++    timeout_s: u64 = 600,
++};
++
++pub const Roce = struct {
++    d: *const Driver,
++    proxy: *Proxy,
++    region: memory.HostBuffer,
++    region_dev: abi.DevicePtr,
++    state: memory.DeviceBuffer,
++    mod: module.Module,
++    fns: [2]module.Function,
++    layout: [5]u64,
++    rank: u32,
++    ports: u32,
++    slot_bytes: u64,
++    timeout_ns: u64,
++
++    pub fn blobBytes() usize {
++        return @intCast(tf_roce_blob_bytes());
++    }
++
++    /// Two ranks only. `d` must outlive the value; the current CUDA context is the engine's.
++    pub fn open(d: *const Driver, rank: u32, s: Settings) !Roce {
++        if (rank > 1 or s.ports.len < 1 or s.ports.len > max_ports) return error.Invalid;
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var lay: [5]u64 = undefined;
++        if (tf_roce_layout(2, s.slot_bytes, &lay) != 0) return error.Invalid;
++        var region = try memory.HostBuffer.allocMapped(d, @intCast(lay[4]));
++        errdefer region.free();
++        @memset(region.bytes, 0);
++        const dev = try region.device();
++        var names: [max_ports][256:0]u8 = undefined;
++        var ptrs: [max_ports][*:0]const u8 = undefined;
++        for (s.ports, 0..) |p, i| {
++            if (p.len >= 256) return error.Invalid;
++            @memcpy(names[i][0..p.len], p);
++            names[i][p.len] = 0;
++            ptrs[i] = &names[i];
++        }
++        var err: [512]u8 = @splat(0);
++        const proxy = tf_roce_open(2, @intCast(rank), &ptrs, @intCast(s.ports.len), s.gid_index, region.bytes.ptr, lay[4], s.slot_bytes, &err, err.len) orelse {
++            std.log.err("RoCE: {s}", .{std.mem.sliceTo(&err, 0)});
++            return error.RoceUnavailable;
++        };
++        errdefer tf_roce_close(proxy);
++        var state = try memory.DeviceBuffer.alloc(d, 16);
++        errdefer state.free();
++        try state.fill32(0, null);
++        var mod = try module.Module.load(d, kernels.fn_roce);
++        errdefer mod.unload();
++        var fns: [2]module.Function = undefined;
++        for (symbols, &fns) |name, *f| f.* = try mod.function(name);
++        return .{ .d = d, .proxy = proxy, .region = region, .region_dev = dev, .state = state, .mod = mod, .fns = fns, .layout = lay, .rank = rank, .ports = @intCast(s.ports.len), .slot_bytes = s.slot_bytes, .timeout_ns = s.timeout_s * std.time.ns_per_s };
++    }
++
++    pub fn deinit(r: *Roce) void {
++        tf_roce_close(r.proxy);
++        r.mod.unload();
++        r.state.free();
++        r.region.free();
++    }
++
++    /// What the peer needs to connect (blobBytes() bytes into `out`).
++    pub fn blob(r: *Roce, out: []u8) !void {
++        if (out.len < blobBytes()) return error.Invalid;
++        if (tf_roce_blob_of(r.proxy, out.ptr) != 0) return error.Invalid;
++    }
++
++    pub fn connect(r: *Roce, peer: []const u8) !void {
++        if (peer.len != blobBytes()) return error.BadRoceBlob;
++        if (tf_roce_connect(r.proxy, peer.ptr) != 0) {
++            std.log.err("RoCE connect: {s}", .{std.mem.span(tf_roce_error(r.proxy))});
++            return error.RoceUnavailable;
++        }
++    }
++
++    pub fn start(r: *Roce) !void {
++        if (tf_roce_start(r.proxy) != 0) {
++            std.log.err("RoCE start: {s}", .{std.mem.span(tf_roce_error(r.proxy))});
++            return error.RoceUnavailable;
++        }
++    }
++
++    /// The proxy's failure, if any (an RDMA write that did not complete): the kernels then time out and trap.
++    pub fn failure(r: *const Roce) ?[]const u8 {
++        if (tf_roce_failed(r.proxy) == 0) return null;
++        return std.mem.span(tf_roce_error(r.proxy));
++    }
++
++    /// A kernel's wait that timed out (it trapped, a fatal error for the context): the sequence and the peer.
++    pub fn timedOut(r: *const Roce) ?struct { seq: u32, peer: u32 } {
++        const ctrl: *const [32]u32 = @ptrCast(@alignCast(r.region.bytes[@intCast(r.layout[3])..][0..128].ptr));
++        const seq = @atomicLoad(u32, &ctrl[2], .acquire);
++        if (seq == 0) return null;
++        return .{ .seq = seq, .peer = @atomicLoad(u32, &ctrl[3], .acquire) };
++    }
++
++    pub fn ops(r: *const Roce) u64 {
++        return tf_roce_ops(r.proxy);
++    }
++
++    /// Gathers this rank fits: up to slot_bytes a rank, whole 4-byte words.
++    pub fn fits(r: *const Roce, bytes: usize) bool {
++        return bytes > 0 and bytes <= r.slot_bytes and bytes % 4 == 0;
++    }
++
++    /// fits, with both pointers 4-byte aligned and the send buffer either apart from the receive one or exactly this
++    /// rank's block of it (NCCL's in-place form: the kernel then rewrites each word of that block with itself, after
++    /// staging it, and never reads the peer's block from `send`).
++    pub fn takes(r: *const Roce, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) bool {
++        if (!r.fits(bytes) or send % 4 != 0 or recv % 4 != 0) return false;
++        if (send == recv + r.rank * bytes) return true;
++        return send + bytes <= recv or recv + 2 * bytes <= send;
++    }
++
++    /// `bytes` from `send` on each rank into `recv` [2][bytes], rank 0's first, on `stream` (capturable); `pf`'s lines
++    /// prefetched into the L2 by extra blocks of the same launch. Gathers must run one after another (one stream, or
++    /// streams ordered by events): every launch shares the device sequence and counters.
++    pub fn allGather(r: *const Roce, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize, stream: abi.Stream, pf: Prefetch) !void {
++        if (!r.takes(send, recv, bytes)) return error.Invalid;
++        const wide = bytes % 16 == 0 and send % 16 == 0 and recv % 16 == 0;
++        const unit: usize = if (wide) 16 else 4;
++        const n = bytes / unit;
++        const threads: usize = 512;
++        // the grid stays resident (every block waits for the peer): at most 16 blocks, ~2 units a thread
++        const blocks = std.math.clamp((n + threads * 2 - 1) / (threads * 2), 1, 16);
++        const padded: u32 = @intCast((bytes + 15) / 16 * 16);
++        var a: launch.Args = .{};
++        a.add(send);
++        a.add(recv);
++        a.add(@as(c_int, @intCast(n)));
++        a.add(padded);
++        a.add(r.region_dev + r.layout[2]); // send slots
++        a.add(r.region_dev + r.layout[0]); // receive slots
++        a.add(r.region_dev + r.layout[1]); // flags
++        a.add(r.region_dev + r.layout[3]); // ctrl
++        a.add(@as(u64, r.slot_bytes));
++        a.add(r.state.ptr);
++        a.add(@as(c_int, @intCast(r.rank)));
++        a.add(@as(c_int, @intCast(r.ports)));
++        a.add(@as(u64, r.timeout_ns));
++        a.add(@as(c_int, @intCast(blocks)));
++        const pf_blocks = if (pf.ptr != 0) prefetchBlocks(pf.bytes) else 0;
++        a.add(pf.ptr);
++        a.add(@as(u64, if (pf_blocks > 0) pf.bytes else 0));
++        const s: Stream = .{ .d = r.d, .handle = stream };
++        try launch.launch(r.fns[if (wide) 0 else 1], .{ .grid = .{ .x = @intCast(blocks + pf_blocks) }, .block = .{ .x = @intCast(threads) } }, s, &a);
++    }
++};
++
++/// NCCL_IB_HCA's device names ("rocep1s0f1,roceP2p1s0f1", an optional leading = and :1 suffixes; the proxy uses port
++/// 1, so another port is refused), at most `max_ports`; `out` holds slices of `text`.
++pub fn parseHcas(text: []const u8, out: *[max_ports][]const u8) ![]const []const u8 {
++    var t = text;
++    if (t.len > 0 and t[0] == '^') return error.ExcludeListUnsupported;
++    if (t.len > 0 and t[0] == '=') t = t[1..];
++    var n: usize = 0;
++    var it = std.mem.tokenizeScalar(u8, t, ',');
++    while (it.next()) |item| {
++        var name = item;
++        if (std.mem.indexOfScalar(u8, item, ':')) |c| {
++            if (!std.mem.eql(u8, item[c + 1 ..], "1")) return error.PortOtherThanOne;
++            name = item[0..c];
++        }
++        if (name.len == 0) continue;
++        if (n == max_ports) break;
++        out[n] = name;
++        n += 1;
++    }
++    if (n == 0) return error.NoHcas;
++    return out[0..n];
++}
++
++test "the timeout reader compiles" {
++    _ = &Roce.timedOut;
++    _ = &Roce.takes;
++}
++
++test "prefetch blocks: four lines a thread, at most 64 blocks" {
++    try std.testing.expectEqual(@as(usize, 0), prefetchBlocks(0));
++    try std.testing.expectEqual(@as(usize, 1), prefetchBlocks(128));
++    try std.testing.expectEqual(@as(usize, 16), prefetchBlocks(4 << 20));
++    try std.testing.expectEqual(@as(usize, 64), prefetchBlocks(64 << 20));
++}
++
++test "NCCL_IB_HCA lists give the RoCE ports" {
++    var buf: [max_ports][]const u8 = undefined;
++    const two = try parseHcas("rocep1s0f1,roceP2p1s0f1", &buf);
++    try std.testing.expectEqual(@as(usize, 2), two.len);
++    try std.testing.expectEqualStrings("roceP2p1s0f1", two[1]);
++    const one = try parseHcas("=mlx5_0:1", &buf);
++    try std.testing.expectEqualStrings("mlx5_0", one[0]);
++    try std.testing.expectError(error.PortOtherThanOne, parseHcas("mlx5_0:2", &buf));
++    try std.testing.expectError(error.ExcludeListUnsupported, parseHcas("^mlx5_1", &buf));
++    try std.testing.expectError(error.NoHcas, parseHcas("", &buf));
++}
++
++test "the region layout: receive slots, flags, send slots, control" {
++    var lay: [5]u64 = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), tf_roce_layout(2, 512 << 10, &lay));
++    try std.testing.expectEqual(@as(u64, 0), lay[0]);
++    try std.testing.expectEqual(@as(u64, 4 * (512 << 10)), lay[1]);
++    try std.testing.expectEqual(lay[1] + 2 * 2 * 2 * 128, lay[2]);
++    try std.testing.expectEqual(lay[2] + 2 * (512 << 10), lay[3]);
++    try std.testing.expectEqual(lay[3] + 128, lay[4]);
++    try std.testing.expect(tf_roce_layout(2, 1000, &lay) != 0);
++    try std.testing.expect(tf_roce_layout(3, 4096, &lay) != 0);
++}
+diff --git a/zig/src/cuda/roce_proxy.c b/zig/src/cuda/roce_proxy.c
+new file mode 100644
+index 00000000..830cc319
+--- /dev/null
++++ b/zig/src/cuda/roce_proxy.c
+@@ -0,0 +1,516 @@
++// The host half of the one-shot RoCE all-gather between two DGX Sparks (decode plan D1, work/research/R1-decode.md 3.1).
++//
++// The protocol is b12x's "RoCEnante" (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by the b12x
++// contributors at Local Inference Lab, Apache License 2.0): each rank stages its shard into a pinned host send slot,
++// rings a doorbell, and this proxy thread RDMA-writes the shard into the peer's receive slot over every RoCE port,
++// each port's stripe followed on the same reliable queue pair by a 4-byte sequence number into the peer's flag for
++// that port; the peer's kernel waits for every flag, then reads the shard. This file is a new implementation of that
++// protocol for TensorFold's Zig CUDA runtime (zig/src/cuda/roce.zig drives it, zig/kernels/cuda/fn_roce.cu is the GPU
++// half); the GLM-5.3 recipe's TensorFold patch 0006 did the same for the Python engine.
++//
++// Region (pinned host memory mapped into the GPU, registered with every port), offsets from roce_layout:
++//   recv[src][slot]          ROCE_SLOTS x world x slot_bytes   written by the peers' NICs
++//   flag[src][slot][port]    128 B each, u32 sequence           written by the peers' NICs after each stripe
++//   send[slot]               ROCE_SLOTS x slot_bytes             written by this rank's kernel
++//   ctrl                     128 B: u32 seq (doorbell), u32 pad, u32 error seq, u32 missing peer,
++//                            u32 bytes[ROCE_SLOTS]               written by this rank's kernel
++// libibverbs is opened at run time (dlopen), so the binary runs without it until RoCE is turned on; only the
++// queue-pair fast paths (post_send, poll_cq) go through the header's inline wrappers, which call the provider's
++// function table and need no symbol.
++
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <infiniband/verbs.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#define ROCE_SLOTS 2
++#define ROCE_PORTS_MAX 2
++#define ROCE_WORLD_MAX 2
++#define ROCE_FLAG_STRIDE 128
++#define ROCE_IB_PORT 1
++#define ROCE_DEPTH 256
++
++// the exported libibverbs functions this file calls (by pointer: dlopen)
++struct verbs {
++  void *lib;
++  struct ibv_device **(*get_device_list)(int *);
++  void (*free_device_list)(struct ibv_device **);
++  const char *(*get_device_name)(struct ibv_device *);
++  struct ibv_context *(*open_device)(struct ibv_device *);
++  int (*close_device)(struct ibv_context *);
++  int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
++  int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
++  struct ibv_pd *(*alloc_pd)(struct ibv_context *);
++  int (*dealloc_pd)(struct ibv_pd *);
++  struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
++  int (*dereg_mr)(struct ibv_mr *);
++  struct ibv_cq *(*create_cq)(struct ibv_context *, int, void *, struct ibv_comp_channel *, int);
++  int (*destroy_cq)(struct ibv_cq *);
++  struct ibv_qp *(*create_qp)(struct ibv_pd *, struct ibv_qp_init_attr *);
++  int (*modify_qp)(struct ibv_qp *, struct ibv_qp_attr *, int);
++  int (*destroy_qp)(struct ibv_qp *);
++  const char *(*wc_status_str)(enum ibv_wc_status);
++};
++
++// what a rank tells its peer to connect (exchanged over the control link)
++typedef struct {
++  uint64_t region;  // the region's host address (the NIC's address space)
++  uint32_t rkey[ROCE_PORTS_MAX];
++  uint32_t qpn[ROCE_PORTS_MAX];
++  uint32_t mtu[ROCE_PORTS_MAX];
++  uint32_t ports;
++  uint32_t slot_pages;  // slot_bytes / 4096: both ranks must use the same slots
++  uint8_t gid[ROCE_PORTS_MAX][16];
++} tf_roce_blob;
++
++typedef struct {
++  struct ibv_context *ctx;
++  struct ibv_pd *pd;
++  struct ibv_mr *mr;
++  struct ibv_cq *cq;
++  struct ibv_qp *qp;
++  union ibv_gid gid;
++  enum ibv_mtu mtu;
++  uint32_t outstanding;
++} port_t;
++
++typedef struct tf_roce {
++  struct verbs v;
++  int rank, world, ports, gid_index;
++  port_t port[ROCE_PORTS_MAX];
++  uint8_t *region;
++  uint64_t region_bytes, slot_bytes;
++  uint64_t recv_off, flag_off, send_off, ctrl_off;
++  uint64_t peer_region;
++  uint32_t peer_rkey[ROCE_PORTS_MAX];
++  pthread_t thread;
++  int thread_started;
++  atomic_int running, failed;
++  uint32_t posted_seq;
++  _Atomic uint64_t ops;
++  uint64_t writes;
++  char err[512];
++} tf_roce;
++
++static void fail(tf_roce *r, const char *what, int e) {
++  snprintf(r->err, sizeof(r->err), "%s: %s", what, e ? strerror(e) : "failed");
++}
++
++uint64_t tf_roce_blob_bytes(void) { return sizeof(tf_roce_blob); }
++
++// {recv, flag, send, ctrl, total} offsets for `world` ranks and slots of `slot_bytes` (a multiple of 4096)
++int tf_roce_layout(int world, uint64_t slot_bytes, uint64_t *out) {
++  if (world < 2 || world > ROCE_WORLD_MAX || slot_bytes == 0 || slot_bytes % 4096 != 0 || slot_bytes > (1ull << 30))
++    return -1;
++  const uint64_t recv = 0;
++  const uint64_t flag = recv + (uint64_t)world * ROCE_SLOTS * slot_bytes;
++  const uint64_t send = flag + (uint64_t)world * ROCE_SLOTS * ROCE_PORTS_MAX * ROCE_FLAG_STRIDE;
++  const uint64_t ctrl = send + ROCE_SLOTS * slot_bytes;
++  out[0] = recv;
++  out[1] = flag;
++  out[2] = send;
++  out[3] = ctrl;
++  out[4] = ctrl + ROCE_FLAG_STRIDE;
++  return 0;
++}
++
++static int load_verbs(tf_roce *r) {
++  struct verbs *v = &r->v;
++  v->lib = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
++  if (!v->lib) {
++    snprintf(r->err, sizeof(r->err), "dlopen libibverbs.so.1: %s", dlerror());
++    return -1;
++  }
++#define SYM(field, name)                                                       \
++  do {                                                                         \
++    *(void **)&v->field = dlsym(v->lib, name);                                 \
++    if (!v->field) {                                                           \
++      snprintf(r->err, sizeof(r->err), "libibverbs.so.1 has no %s", name);     \
++      return -1;                                                               \
++    }                                                                          \
++  } while (0)
++  SYM(get_device_list, "ibv_get_device_list");
++  SYM(free_device_list, "ibv_free_device_list");
++  SYM(get_device_name, "ibv_get_device_name");
++  SYM(open_device, "ibv_open_device");
++  SYM(close_device, "ibv_close_device");
++  SYM(query_port, "ibv_query_port");
++  SYM(query_gid, "ibv_query_gid");
++  SYM(alloc_pd, "ibv_alloc_pd");
++  SYM(dealloc_pd, "ibv_dealloc_pd");
++  SYM(reg_mr, "ibv_reg_mr");
++  SYM(dereg_mr, "ibv_dereg_mr");
++  SYM(create_cq, "ibv_create_cq");
++  SYM(destroy_cq, "ibv_destroy_cq");
++  SYM(create_qp, "ibv_create_qp");
++  SYM(modify_qp, "ibv_modify_qp");
++  SYM(destroy_qp, "ibv_destroy_qp");
++  SYM(wc_status_str, "ibv_wc_status_str");
++#undef SYM
++  return 0;
++}
++
++static int open_port(tf_roce *r, int i, const char *name) {
++  struct verbs *v = &r->v;
++  port_t *p = &r->port[i];
++  int n = 0;
++  struct ibv_device **list = v->get_device_list(&n);
++  if (!list) {
++    fail(r, "ibv_get_device_list", errno);
++    return -1;
++  }
++  struct ibv_device *dev = NULL;
++  for (int k = 0; k < n; k++)
++    if (strcmp(v->get_device_name(list[k]), name) == 0) dev = list[k];
++  if (dev) p->ctx = v->open_device(dev);
++  v->free_device_list(list);
++  if (!dev) {
++    snprintf(r->err, sizeof(r->err), "no RDMA device %s", name);
++    return -1;
++  }
++  if (!p->ctx) {
++    fail(r, "ibv_open_device", errno);
++    return -1;
++  }
++  struct ibv_port_attr pa;
++  memset(&pa, 0, sizeof(pa));
++  if (v->query_port(p->ctx, ROCE_IB_PORT, &pa) != 0) {
++    fail(r, "ibv_query_port", errno);
++    return -1;
++  }
++  if (pa.state != IBV_PORT_ACTIVE) {
++    snprintf(r->err, sizeof(r->err), "%s port %d is not active", name, ROCE_IB_PORT);
++    return -1;
++  }
++  p->mtu = pa.active_mtu;
++  if (v->query_gid(p->ctx, ROCE_IB_PORT, r->gid_index, &p->gid) != 0) {
++    fail(r, "ibv_query_gid", errno);
++    return -1;
++  }
++  if (!(p->pd = v->alloc_pd(p->ctx))) {
++    fail(r, "ibv_alloc_pd", errno);
++    return -1;
++  }
++  if (!(p->mr = v->reg_mr(p->pd, r->region, r->region_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))) {
++    fail(r, "ibv_reg_mr", errno);
++    return -1;
++  }
++  if (!(p->cq = v->create_cq(p->ctx, ROCE_DEPTH, NULL, NULL, 0))) {
++    fail(r, "ibv_create_cq", errno);
++    return -1;
++  }
++  struct ibv_qp_init_attr qa;
++  memset(&qa, 0, sizeof(qa));
++  qa.send_cq = p->cq;
++  qa.recv_cq = p->cq;
++  qa.qp_type = IBV_QPT_RC;
++  qa.cap.max_send_wr = ROCE_DEPTH;
++  qa.cap.max_recv_wr = 1;
++  qa.cap.max_send_sge = 1;
++  qa.cap.max_recv_sge = 1;
++  qa.cap.max_inline_data = 16;
++  if (!(p->qp = v->create_qp(p->pd, &qa))) {
++    fail(r, "ibv_create_qp", errno);
++    return -1;
++  }
++  struct ibv_qp_attr a;
++  memset(&a, 0, sizeof(a));
++  a.qp_state = IBV_QPS_INIT;
++  a.port_num = ROCE_IB_PORT;
++  a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
++  const int rc = v->modify_qp(p->qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
++  if (rc != 0) {
++    fail(r, "ibv_modify_qp INIT", rc);
++    return -1;
++  }
++  return 0;
++}
++
++void tf_roce_close(tf_roce *r);
++
++// Opens `ports` RDMA devices (names[i]) on port 1 with GID `gid_index`, registers `region`, makes one RC queue pair a
++// port toward the one peer. Returns NULL with the reason in `err`.
++tf_roce *tf_roce_open(int world, int rank, const char *const *names, int ports, int gid_index, void *region,
++                      uint64_t region_bytes, uint64_t slot_bytes, char *err, uint64_t err_len) {
++  uint64_t lay[5];
++  if (tf_roce_layout(world, slot_bytes, lay) != 0 || lay[4] > region_bytes || rank < 0 || rank >= world ||
++      ports < 1 || ports > ROCE_PORTS_MAX) {
++    snprintf(err, err_len, "invalid RoCE geometry (world %d rank %d ports %d slot %llu region %llu)", world, rank,
++             ports, (unsigned long long)slot_bytes, (unsigned long long)region_bytes);
++    return NULL;
++  }
++  tf_roce *r = calloc(1, sizeof(*r));
++  if (!r) {
++    snprintf(err, err_len, "out of memory");
++    return NULL;
++  }
++  r->rank = rank;
++  r->world = world;
++  r->ports = ports;
++  r->gid_index = gid_index;
++  r->region = region;
++  r->region_bytes = region_bytes;
++  r->slot_bytes = slot_bytes;
++  r->recv_off = lay[0];
++  r->flag_off = lay[1];
++  r->send_off = lay[2];
++  r->ctrl_off = lay[3];
++  if (load_verbs(r) != 0) goto bad;
++  for (int i = 0; i < ports; i++)
++    if (open_port(r, i, names[i]) != 0) goto bad;
++  return r;
++bad:
++  snprintf(err, err_len, "%s", r->err);
++  tf_roce_close(r);
++  return NULL;
++}
++
++int tf_roce_blob_of(tf_roce *r, void *out) {
++  tf_roce_blob b;
++  memset(&b, 0, sizeof(b));
++  b.region = (uint64_t)(uintptr_t)r->region;
++  b.ports = (uint32_t)r->ports;
++  b.slot_pages = (uint32_t)(r->slot_bytes / 4096);
++  for (int i = 0; i < r->ports; i++) {
++    b.rkey[i] = r->port[i].mr->rkey;
++    b.qpn[i] = r->port[i].qp->qp_num;
++    b.mtu[i] = (uint32_t)r->port[i].mtu;
++    memcpy(b.gid[i], r->port[i].gid.raw, 16);
++  }
++  memcpy(out, &b, sizeof(b));
++  return 0;
++}
++
++// The peer's blob: each port's queue pair to RTR and RTS toward the peer's queue pair on the same port index.
++int tf_roce_connect(tf_roce *r, const void *peer_blob) {
++  tf_roce_blob b;
++  memcpy(&b, peer_blob, sizeof(b));
++  if ((int)b.ports != r->ports) {
++    snprintf(r->err, sizeof(r->err), "the peer has %u RoCE ports, this rank %d", b.ports, r->ports);
++    return -1;
++  }
++  if ((uint64_t)b.slot_pages * 4096 != r->slot_bytes) {
++    snprintf(r->err, sizeof(r->err), "the peer's RoCE slots are %u KiB, this rank's %llu KiB", b.slot_pages * 4,
++             (unsigned long long)(r->slot_bytes >> 10));
++    return -1;
++  }
++  r->peer_region = b.region;
++  for (int i = 0; i < r->ports; i++) {
++    port_t *p = &r->port[i];
++    r->peer_rkey[i] = b.rkey[i];
++    struct ibv_qp_attr a;
++    memset(&a, 0, sizeof(a));
++    a.qp_state = IBV_QPS_RTR;
++    a.path_mtu = (enum ibv_mtu)(b.mtu[i] < (uint32_t)p->mtu ? b.mtu[i] : (uint32_t)p->mtu);
++    a.dest_qp_num = b.qpn[i];
++    a.rq_psn = 0;
++    a.max_dest_rd_atomic = 1;
++    a.min_rnr_timer = 12;
++    a.ah_attr.is_global = 1;
++    a.ah_attr.port_num = ROCE_IB_PORT;
++    memcpy(a.ah_attr.grh.dgid.raw, b.gid[i], 16);
++    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
++    a.ah_attr.grh.hop_limit = 64;
++    int rc = r->v.modify_qp(p->qp, &a,
++                            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
++                                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
++    if (rc != 0) {
++      fail(r, "ibv_modify_qp RTR", rc);
++      return -1;
++    }
++    memset(&a, 0, sizeof(a));
++    a.qp_state = IBV_QPS_RTS;
++    a.timeout = 14;
++    a.retry_cnt = 7;
++    a.rnr_retry = 7;
++    a.sq_psn = 0;
++    a.max_rd_atomic = 1;
++    rc = r->v.modify_qp(p->qp, &a,
++                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
++                            IBV_QP_MAX_QP_RD_ATOMIC);
++    if (rc != 0) {
++      fail(r, "ibv_modify_qp RTS", rc);
++      return -1;
++    }
++  }
++  return 0;
++}
++
++// Completions of signalled flag writes (one a stripe); any error fails the proxy.
++static int reap(tf_roce *r, int i) {
++  struct ibv_wc wc[16];
++  const int n = ibv_poll_cq(r->port[i].cq, 16, wc);
++  if (n < 0) {
++    fail(r, "ibv_poll_cq", errno);
++    return -1;
++  }
++  for (int k = 0; k < n; k++) {
++    if (wc[k].status != IBV_WC_SUCCESS) {
++      snprintf(r->err, sizeof(r->err), "RDMA write on port %d failed: %s (vendor error 0x%x) after seq %u", i,
++               r->v.wc_status_str(wc[k].status), wc[k].vendor_err, r->posted_seq);
++      return -1;
++    }
++    r->port[i].outstanding--;
++    r->writes++;
++  }
++  return 0;
++}
++
++// Sequence `seq`'s shard (`bytes`, a multiple of 16) from send[seq % SLOTS] into the peer's recv[rank][seq % SLOTS],
++// split over the ports in 16-byte units, each port's stripe then its flag (same queue pair, so in order).
++static int post(tf_roce *r, uint32_t seq, uint32_t bytes) {
++  if (bytes == 0 || bytes % 16 != 0 || bytes > r->slot_bytes) {
++    snprintf(r->err, sizeof(r->err), "RoCE shard of %u bytes (a positive multiple of 16 up to %llu)", bytes,
++             (unsigned long long)r->slot_bytes);
++    return -1;
++  }
++  const uint32_t slot = seq % ROCE_SLOTS;
++  uint8_t *send = r->region + r->send_off + (uint64_t)slot * r->slot_bytes;
++  const uint64_t recv = r->peer_region + r->recv_off + ((uint64_t)r->rank * ROCE_SLOTS + slot) * r->slot_bytes;
++  const uint32_t units = bytes / 16;
++  uint32_t done = 0;
++  for (int i = 0; i < r->ports; i++) {
++    port_t *p = &r->port[i];
++    while (p->outstanding >= ROCE_DEPTH / 4) {
++      if (reap(r, i) != 0) return -1;
++      if (!atomic_load_explicit(&r->running, memory_order_relaxed)) {
++        snprintf(r->err, sizeof(r->err), "stopped with %u writes outstanding on port %d", p->outstanding, i);
++        return -1;
++      }
++    }
++    const uint32_t share = units / r->ports + ((uint32_t)i < units % r->ports ? 1u : 0u);
++    const uint64_t off = (uint64_t)done * 16;
++    uint32_t value = seq;
++    struct ibv_sge fs = {.addr = (uint64_t)(uintptr_t)&value, .length = 4, .lkey = 0};
++    struct ibv_send_wr fw;
++    memset(&fw, 0, sizeof(fw));
++    fw.wr_id = (uint64_t)i;
++    fw.sg_list = &fs;
++    fw.num_sge = 1;
++    fw.opcode = IBV_WR_RDMA_WRITE;
++    fw.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
++    fw.wr.rdma.remote_addr = r->peer_region + r->flag_off +
++                             (((uint64_t)r->rank * ROCE_SLOTS + slot) * ROCE_PORTS_MAX + (uint64_t)i) * ROCE_FLAG_STRIDE;
++    fw.wr.rdma.rkey = r->peer_rkey[i];
++    struct ibv_sge ds;
++    struct ibv_send_wr dw;
++    struct ibv_send_wr *first = &fw;
++    if (share) {
++      ds.addr = (uint64_t)(uintptr_t)(send + off);
++      ds.length = share * 16;
++      ds.lkey = p->mr->lkey;
++      memset(&dw, 0, sizeof(dw));
++      dw.wr_id = (uint64_t)i;
++      dw.next = &fw;
++      dw.sg_list = &ds;
++      dw.num_sge = 1;
++      dw.opcode = IBV_WR_RDMA_WRITE;
++      dw.wr.rdma.remote_addr = recv + off;
++      dw.wr.rdma.rkey = r->peer_rkey[i];
++      first = &dw;
++    }
++    struct ibv_send_wr *bad = NULL;
++    const int rc = ibv_post_send(p->qp, first, &bad);
++    if (rc != 0) {
++      fail(r, "ibv_post_send", rc);
++      return -1;
++    }
++    p->outstanding++;
++    done += share;
++  }
++  atomic_fetch_add_explicit(&r->ops, 1, memory_order_relaxed);
++  for (int i = 0; i < r->ports; i++)
++    if (reap(r, i) != 0) return -1;
++  return 0;
++}
++
++static uint64_t now_ns(void) {
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
++}
++
++// The proxy: poll the doorbell; post every sequence it has not posted, in order. A kernel finishes on the peer's
++// shard alone, so the next one can ring before this thread saw the last: at most ROCE_SLOTS are ever pending (a rank
++// cannot get two gathers ahead of its peer), each with its slot's byte count. Hot while gathers flow; after a second
++// without one it naps 50 us between polls, so an idle server does not hold a core.
++static void *proxy(void *arg) {
++  tf_roce *r = arg;
++  volatile uint32_t *ctrl = (volatile uint32_t *)(r->region + r->ctrl_off);
++  uint64_t polls = 0, last = now_ns();
++  int napping = 0;
++  const struct timespec nap = {0, 50000};
++  while (atomic_load_explicit(&r->running, memory_order_relaxed)) {
++    const uint32_t seq = __atomic_load_n(&ctrl[0], __ATOMIC_ACQUIRE);
++    if (seq == r->posted_seq) {
++      if ((++polls & 4095) == 0) {
++        for (int i = 0; i < r->ports; i++)
++          if (reap(r, i) != 0) goto failed;
++        if (!napping && now_ns() - last > 1000000000ull) napping = 1;
++      }
++      if (napping) nanosleep(&nap, NULL);
++      continue;
++    }
++    napping = 0;
++    last = now_ns();
++    const uint32_t pending = seq - r->posted_seq;
++    if (pending > ROCE_SLOTS) {
++      snprintf(r->err, sizeof(r->err), "the doorbell skipped %u sequences (posted %u, rung %u)", pending,
++               r->posted_seq, seq);
++      goto failed;
++    }
++    for (uint32_t s = r->posted_seq + 1; s != seq + 1; s++) {
++      if (post(r, s, ctrl[4 + s % ROCE_SLOTS]) != 0) goto failed;
++      r->posted_seq = s;
++    }
++  }
++  return NULL;
++failed:
++  atomic_store(&r->failed, 1);
++  return NULL;
++}
++
++int tf_roce_start(tf_roce *r) {
++  if (r->thread_started) return 0;
++  volatile uint32_t *ctrl = (volatile uint32_t *)(r->region + r->ctrl_off);
++  r->posted_seq = ctrl[0];
++  atomic_store(&r->failed, 0);
++  atomic_store(&r->running, 1);
++  const int rc = pthread_create(&r->thread, NULL, proxy, r);
++  if (rc != 0) {
++    atomic_store(&r->running, 0);
++    fail(r, "pthread_create", rc);
++    return -1;
++  }
++  r->thread_started = 1;
++  return 0;
++}
++
++int tf_roce_failed(tf_roce *r) { return atomic_load(&r->failed); }
++const char *tf_roce_error(tf_roce *r) { return r->err; }
++uint64_t tf_roce_ops(tf_roce *r) { return atomic_load_explicit(&r->ops, memory_order_relaxed); }
++
++void tf_roce_close(tf_roce *r) {
++  if (!r) return;
++  if (r->thread_started) {
++    atomic_store(&r->running, 0);
++    pthread_join(r->thread, NULL);
++  }
++  for (int i = 0; i < ROCE_PORTS_MAX; i++) {
++    port_t *p = &r->port[i];
++    if (p->qp) r->v.destroy_qp(p->qp);
++    if (p->cq) r->v.destroy_cq(p->cq);
++    if (p->mr) r->v.dereg_mr(p->mr);
++    if (p->pd) r->v.dealloc_pd(p->pd);
++    if (p->ctx) r->v.close_device(p->ctx);
++  }
++  if (r->v.lib) dlclose(r->v.lib);
++  free(r);
++}
+diff --git a/zig/src/cuda/roce_proxy_stub.c b/zig/src/cuda/roce_proxy_stub.c
+new file mode 100644
+index 00000000..ac774c25
+--- /dev/null
++++ b/zig/src/cuda/roce_proxy_stub.c
+@@ -0,0 +1,36 @@
++// roce_proxy.c's interface where libibverbs' headers are missing at build time (decode D1): the layout as there, and
++// every open refused, so cuda_comm.zig keeps NCCL for every gather.
++#include <stdint.h>
++#include <stdio.h>
++
++#define ROCE_SLOTS 2
++#define ROCE_PORTS_MAX 2
++#define ROCE_FLAG_STRIDE 128
++
++typedef struct tf_roce tf_roce;
++
++uint64_t tf_roce_blob_bytes(void) { return 72; }
++
++int tf_roce_layout(int world, uint64_t slot_bytes, uint64_t *out) {
++  if (world < 2 || world > 2 || slot_bytes == 0 || slot_bytes % 4096 != 0 || slot_bytes > (1ull << 30)) return -1;
++  out[0] = 0;
++  out[1] = (uint64_t)world * ROCE_SLOTS * slot_bytes;
++  out[2] = out[1] + (uint64_t)world * ROCE_SLOTS * ROCE_PORTS_MAX * ROCE_FLAG_STRIDE;
++  out[3] = out[2] + ROCE_SLOTS * slot_bytes;
++  out[4] = out[3] + ROCE_FLAG_STRIDE;
++  return 0;
++}
++
++tf_roce *tf_roce_open(int world, int rank, const char *const *names, int ports, int gid_index, void *region,
++                      uint64_t region_bytes, uint64_t slot_bytes, char *err, uint64_t err_len) {
++  (void)world, (void)rank, (void)names, (void)ports, (void)gid_index, (void)region, (void)region_bytes, (void)slot_bytes;
++  snprintf(err, err_len, "built without libibverbs headers: no RoCE all-gather");
++  return NULL;
++}
++int tf_roce_blob_of(tf_roce *r, void *out) { (void)r, (void)out; return -1; }
++int tf_roce_connect(tf_roce *r, const void *peer) { (void)r, (void)peer; return -1; }
++int tf_roce_start(tf_roce *r) { (void)r; return -1; }
++int tf_roce_failed(tf_roce *r) { (void)r; return 1; }
++const char *tf_roce_error(tf_roce *r) { (void)r; return "no RoCE in this build"; }
++uint64_t tf_roce_ops(tf_roce *r) { (void)r; return 0; }
++void tf_roce_close(tf_roce *r) { (void)r; }
+diff --git a/zig/src/server/fixtures_glm_chat.jinja b/zig/src/server/fixtures_glm_chat.jinja
+new file mode 100644
+index 00000000..15bf200e
+--- /dev/null
++++ b/zig/src/server/fixtures_glm_chat.jinja
+@@ -0,0 +1,210 @@
++[gMASK]<sop>
++{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
++{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
++{%- if tools -%}
++{%- macro tool_to_json(tool) -%}
++    {%- set ns_tool = namespace(first=true) -%}
++    {{ '{' -}}
++    {%- for k, v in tool.items() -%}
++        {%- if k != 'defer_loading' and k != 'strict' -%}
++            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}
++            {%- set ns_tool.first = false -%}
++            "{{ k }}": {{ v | tojson(ensure_ascii=False) }}
++        {%- endif -%}
++    {%- endfor -%}
++    {{- '}' -}}
++{%- endmacro -%}
++{%- macro tool_references_to_response(refs) -%}
++    {{- '<tool_response><tools>\n' -}}
++    {%- for tr in refs -%}
++        {%- for tool in tools -%}
++            {%- if 'function' in tool -%}
++                {%- set tool = tool['function'] -%}
++            {%- endif -%}
++            {%- if tool.name == tr.name -%}
++                {{- tool_to_json(tool) + '\n' -}}
++            {%- endif -%}
++        {%- endfor -%}
++    {%- endfor -%}
++    {{- '</tools></tool_response>' -}}
++{%- endmacro -%}
++<|system|>
++# Tools
++
++You may call one or more functions to assist with the user query.
++
++You are provided with function signatures within <tools></tools> XML tags:
++<tools>
++{% for tool in tools %}
++{%- if 'function' in tool -%}
++    {%- set tool = tool['function'] -%}
++{%- endif -%}
++{% if tool.defer_loading is not defined or not tool.defer_loading %}
++{{ tool_to_json(tool) }}
++{% endif %}
++{% endfor %}
++</tools>
++
++For each function call, output the function name and arguments within the following XML format:
++<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
++{%- macro visible_text(content) -%}
++    {%- if content is string -%}
++        {{- content }}
++    {%- elif content is iterable and content is not mapping -%}
++        {%- for item in content -%}
++            {%- if item is mapping and item.type == 'text' -%}
++                {{- item.text }}
++            {%- elif item is string -%}
++                {{- item }}
++            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}
++                {%- set media_type = item.type | replace('_url', '') | replace('input_', '') -%}
++                {{- "<reminder>You are unable to process this " ~ media_type ~ " because you don't have multi-modal input ability. Try different methods.</reminder>" }}
++            {%- endif -%}
++        {%- endfor -%}
++    {%- else -%}
++        {{- content }}
++    {%- endif -%}
++{%- endmacro -%}
++{%- macro tool_response(text) -%}
++{{- '<tool_response>' + text + '</tool_response>' -}}
++{%- endmacro -%}
++{%- macro render_tool_response(m) -%}
++{%- if m.content is string -%}
++    {{- tool_response(m.content) -}}
++{%- elif m.content and m.content is not mapping and m.content.0.type == "tool_reference" -%}
++    {{- tool_references_to_response(m.content) -}}
++{%- elif is_list_of_outputs(m) -%}
++    {%- for tr in m.content -%}
++        {%- if tr.output is iterable and tr.output is not string and tr.output is not mapping and tr.output and tr.output.0.type == "tool_reference" -%}
++            {{- tool_references_to_response(tr.output) -}}
++        {%- else -%}
++            {{- tool_response(visible_text(tr.output)) -}}
++        {%- endif -%}
++    {%- endfor -%}
++{%- else -%}
++    {{- tool_response(visible_text(m.content)) -}}
++{%- endif -%}
++{%- endmacro -%}
++{%- macro id_of(obj) -%}
++    {%- if obj.tool_call_id -%}
++        {{- obj.tool_call_id -}}
++    {%- elif obj.id -%}
++        {{- obj.id -}}
++    {%- endif -%}
++{%- endmacro -%}
++{%- macro is_list_of_outputs(m) -%}
++    {%- if m.content and m.content.0.output is defined -%}1{%- endif -%}
++{%- endmacro -%}
++{%- set ns = namespace(last_user_index=-1) -%}
++{%- for m in messages %}
++    {%- if m.role == 'user' %}
++        {%- set ns.last_user_index = loop.index0 -%}
++    {%- endif %}
++{%- endfor %}
++{%- for m in messages -%}
++{%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}
++{%- elif m.role == 'assistant' -%}
++<|assistant|>
++{%- set content = visible_text(m.content) %}
++{%- if m.reasoning_content is string %}
++    {%- set reasoning_content = m.reasoning_content %}
++{%- elif '</think>' in content %}
++    {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
++    {%- set content = content.split('</think>')[-1] %}
++{%- endif %}
++{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
++{{ '<think>' + reasoning_content +  '</think>'}}
++{%- else -%}
++{{ '<think></think>' }}
++{%- endif -%}
++{%- if content.strip() -%}
++{{ content.strip() }}
++{%- endif -%}
++{% if m.tool_calls %}
++{% for tc in m.tool_calls %}
++{%- if tc.function %}
++    {%- set tc = tc.function %}
++{%- endif %}
++{{- '<tool_call>' + tc.name -}}
++{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}
++{% endif %}
++{%- elif m.role == 'tool' -%}
++{%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
++    {{- '<|observation|>' -}}
++    {%- set block_start = loop.index0 -%}
++    {%- set ns_blk = namespace(end=block_start) -%}
++    {%- for j in range(block_start, messages|length) -%}
++        {%- if messages[j].role == 'tool' -%}
++            {%- set ns_blk.end = j -%}
++        {%- else -%}
++            {%- break -%}
++        {%- endif -%}
++    {%- endfor -%}
++    {%- set ns_a = namespace(tool_calls=none) -%}
++    {%- if block_start > 0 and messages[block_start - 1].role == 'assistant' and messages[block_start - 1].tool_calls -%}
++        {%- set ns_a.tool_calls = messages[block_start - 1].tool_calls -%}
++    {%- endif -%}
++    {%- set ns_chk = namespace(can_sort=true) -%}
++    {%- if not ns_a.tool_calls -%}
++        {%- set ns_chk.can_sort = false -%}
++    {%- else -%}
++        {%- for k in range(block_start, ns_blk.end + 1) -%}
++            {%- set m = messages[k] -%}
++            {%- if is_list_of_outputs(m) -%}
++                {%- for entry in m.content -%}
++                    {%- set eid = id_of(entry) -%}
++                    {%- if not eid -%}
++                        {%- set ns_chk.can_sort = false -%}
++                    {%- endif -%}
++                {%- endfor -%}
++            {%- else -%}
++                {%- set tk_id = id_of(m) -%}
++                {%- if not tk_id -%}
++                    {%- set ns_chk.can_sort = false -%}
++                {%- endif -%}
++            {%- endif -%}
++        {%- endfor -%}
++        {%- for tc in ns_a.tool_calls -%}
++            {%- set tc_id = id_of(tc) -%}
++            {%- if not tc_id -%}
++                {%- set ns_chk.can_sort = false -%}
++            {%- endif -%}
++        {%- endfor -%}
++    {%- endif -%}
++    {%- if ns_chk.can_sort -%}
++        {%- for tc in ns_a.tool_calls -%}
++            {%- set tc_id = id_of(tc) -%}
++            {%- for k in range(block_start, ns_blk.end + 1) -%}
++                {%- set m = messages[k] -%}
++                {%- if is_list_of_outputs(m) -%}
++                    {%- for entry in m.content -%}
++                        {%- set eid = id_of(entry) -%}
++                        {%- if eid == tc_id -%}
++                            {%- if entry.output is iterable and entry.output is not string and entry.output is not mapping and entry.output and entry.output.0.type == "tool_reference" -%}
++                                {{- tool_references_to_response(entry.output) -}}
++                            {%- else -%}
++                                {{- tool_response(visible_text(entry.output)) -}}
++                            {%- endif -%}
++                        {%- endif -%}
++                    {%- endfor -%}
++                {%- else -%}
++                    {%- set tk_id = id_of(m) -%}
++                    {%- if tk_id == tc_id -%}
++                        {{- render_tool_response(m) -}}
++                    {%- endif -%}
++                {%- endif -%}
++            {%- endfor -%}
++        {%- endfor -%}
++    {%- else -%}
++        {%- for k in range(block_start, ns_blk.end + 1) -%}
++            {{- render_tool_response(messages[k]) -}}
++        {%- endfor -%}
++    {%- endif -%}
++{% endif -%}
++{%- elif m.role == 'system' -%}
++<|system|>{{ visible_text(m.content) }}
++{%- endif -%}
++{%- endfor -%}
++{%- if add_generation_prompt -%}
++    <|assistant|>{{- '<think>' -}}
++{%- endif -%}
+diff --git a/zig/src/server/glm_chat_test.zig b/zig/src/server/glm_chat_test.zig
+new file mode 100644
+index 00000000..7d61d709
+--- /dev/null
++++ b/zig/src/server/glm_chat_test.zig
+@@ -0,0 +1,47 @@
++//! CPU HTTP checks using the shipped Mia-AiLab GLM-5.3-Flash template (snapshot 078455ff).
++//! Template by zai-org/GLM; TensorFold prompts.py wrapper by Ash Hart and contributors.
++const std = @import("std");
++const server = @import("root.zig");
++const helper = @import("late_system_test.zig");
++const template = @import("template");
++const source = @embedFile("fixtures_glm_chat.jinja");
++
++test "GLM HTTP chat, SSE and health use the reference thinking-off prompt" {
++    var encoder: helper.DropLate = .{};
++    var text = encoder.text();
++    var hf: server.hf_text.HfText = .{
++        .gpa = std.testing.allocator,
++        .arena = .init(std.testing.allocator),
++        .tok = undefined,
++        .glm = true,
++        .source = source,
++        .compiled = try template.compile(std.testing.allocator, source, null),
++    };
++    defer hf.arena.deinit();
++    defer hf.compiled.?.deinit();
++    var vt = text.vtable.*;
++    vt.render = hf.text().vtable.render;
++    vt.template_source = hf.text().vtable.template_source;
++    text.ctx = &hf;
++    text.vtable = &vt;
++    var backend: helper.Capture = .{};
++    defer std.testing.allocator.free(backend.prompt);
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text, .{ .served_name = "glm5_next", .enable_thinking = false, .model_ids = &.{"glm5_next"} }, null);
++    defer srv.deinit();
++    for ([_]bool{ false, true }) |thinking| {
++        for ([_]bool{ false, true }) |stream| {
++            const body = try std.fmt.allocPrint(std.testing.allocator, "{{\"model\":\"glm5_next\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hi\"}}],\"max_tokens\":4,\"stream\":{s},\"chat_template_kwargs\":{{\"enable_thinking\":{s}}}}}", .{ if (stream) "true" else "false", if (thinking) "true" else "false" });
++            defer std.testing.allocator.free(body);
++            const reply = try helper.exchange(srv, "/v1/chat/completions", body);
++            defer std.testing.allocator.free(reply.body);
++            try std.testing.expectEqual(@as(u16, 200), reply.status);
++            const expected = if (thinking) "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>" else "[gMASK]<sop><|user|>Hi<|assistant|><think></think>";
++            try std.testing.expectEqual(expected.len, backend.prompt.len);
++            for (expected, backend.prompt) |byte, id| try std.testing.expectEqual(@as(u32, byte), id);
++            try std.testing.expect(std.mem.indexOf(u8, reply.body, if (stream) "[DONE]" else "chat.completion") != null);
++        }
++    }
++    const health = try helper.exchangeMethod(srv, "GET", "/health", "");
++    defer std.testing.allocator.free(health.body);
++    try std.testing.expectEqual(@as(u16, 200), health.status);
++}
+diff --git a/zig/src/server/glm_prompts.zig b/zig/src/server/glm_prompts.zig
+new file mode 100644
+index 00000000..d23b3040
+--- /dev/null
++++ b/zig/src/server/glm_prompts.zig
+@@ -0,0 +1,31 @@
++//! TensorFold families/glm5_next/prompts.py:thinking_off (Ash Hart and contributors).
++const std = @import("std");
++/// Removes the first Max effort line and closes only an opened generation think block.
++/// Deliberately matches the Python replacement, including its High/Low behavior.
++pub fn thinkingOff(a: std.mem.Allocator, text: []const u8) ![]u8 {
++    const effort = "<|system|>Reasoning Effort: Max";
++    const opened = "<|assistant|><think>";
++    const at = std.mem.indexOf(u8, text, effort);
++    const close = std.mem.endsWith(u8, text, opened);
++    const n = text.len - (if (at != null) effort.len else @as(usize, 0));
++    const out = try a.alloc(u8, n + (if (close) @as(usize, 8) else 0));
++    if (at) |i| {
++        @memcpy(out[0..i], text[0..i]);
++        @memcpy(out[i..n], text[i + effort.len ..]);
++    } else @memcpy(out[0..n], text);
++    if (close) @memcpy(out[n..], "</think>");
++    return out;
++}
++test "GLM thinking off matches reference effort removal and empty block" {
++    const cases = [_]struct { []const u8, []const u8 }{
++        .{ "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>", "[gMASK]<sop><|user|>Hi<|assistant|><think></think>" },
++        .{ "<|system|>Reasoning Effort: High<|assistant|><think>", "<|system|>Reasoning Effort: High<|assistant|><think></think>" },
++        .{ "<|system|>Reasoning Effort: Max<|system|>Reasoning Effort: Max", "<|system|>Reasoning Effort: Max" },
++        .{ "<|assistant|><think>past</think>answer", "<|assistant|><think>past</think>answer" },
++    };
++    for (cases) |c| {
++        const out = try thinkingOff(std.testing.allocator, c[0]);
++        defer std.testing.allocator.free(out);
++        try std.testing.expectEqualStrings(c[1], out);
++    }
++}
+diff --git a/zig/tests/cuda/copies.py b/zig/tests/cuda/copies.py
+new file mode 100644
+index 00000000..42249a01
+--- /dev/null
++++ b/zig/tests/cuda/copies.py
+@@ -0,0 +1,275 @@
++"""Checks (or rewrites) zig/kernels/cuda copies of the Python engine's CUDA device code: same lines, same bits."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[3]
++# Upstream 1.0 removed the Python runtime. Supply its qualified source tree explicitly.
++SOURCE_ROOT = ROOT
++
++GDN_FOOTER = (
++    "// The instantiations the Python wrappers launch (gdn_replay_cuda, dispatch_tree for bf16 keys).\n"
++    "#define TF_REPLAY(QK) template __global__ void tf_gdn::replay_kernel<QK, 8, 4>(const long long*, int, const int*, int, \\\n"
++    "    const int*, int, float*, int, int, int);\n"
++    "TF_REPLAY(__nv_bfloat16)\n"
++    "TF_REPLAY(float)\n"
++    "#define TF_TREE(S, R, W, C) template __global__ void tf_gdn::tree_kernel<__nv_bfloat16, S, R, W, C>( \\\n"
++    "    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const float*, const float*, const float*, \\\n"
++    "    const long long*, const int*, const int*, int, __nv_bfloat16*, int, int, int, tf_gdn::Pending<__nv_bfloat16>, \\\n"
++    "    float*, const long long*, bool);\n"
++    "TF_TREE(0, 8, 4, true)\n"
++    "TF_TREE(1, 8, 4, false)\n"
++    "TF_TREE(2, 8, 2, false)\n"
++    "TF_TREE(2, 4, 4, false)\n"
++    "TF_TREE(4, 2, 4, false)\n"
++    "TF_TREE(8, 2, 4, false)\n"
++    "TF_TREE(16, 2, 2, false)\n"
++    "TF_TREE(32, 2, 1, false)\n"
++)
++
++FN_GDN_FOOTER = (
++    "// The instantiations gdn_chain_cuda and gdn_replay_cuda launch: one GPU (16, 48) and a TP=2 rank (8, 24).\n"
++    "#define TF_CHAIN(NK, NV, AHEAD) template __global__ void tf_fn_gdn::chain_kernel<NK, NV, AHEAD>( \\\n"
++    "    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const float*, const float*, const float*, \\\n"
++    "    const __nv_bfloat16*, float, int, __nv_bfloat16*, float*, float*, float*, __nv_bfloat16*, float*, float*);\n"
++    "TF_CHAIN(16, 48, true)\n"
++    "TF_CHAIN(16, 48, false)\n"
++    "TF_CHAIN(8, 24, true)\n"
++    "TF_CHAIN(8, 24, false)\n"
++    "#define TF_REPLAY(NK, NV) template __global__ void tf_fn_gdn::replay_kernel<NK, NV>(const float*, const float*, \\\n"
++    "    const __nv_bfloat16*, const float*, const float*, int, float*);\n"
++    "TF_REPLAY(16, 48)\n"
++    "TF_REPLAY(8, 24)\n"
++)
++
++FN_GDN_IO_FOOTER = (
++    "// The instantiations gdn_front_cuda and gdn_back_cuda launch: one GPU (16, 48) and a TP=2 rank (8, 24).\n"
++    "#define TF_FRONT(NK, NV) template __global__ void tf_fn_gdn_io::front_kernel<NK, NV>(const __nv_bfloat16*, \\\n"
++    "    const long long*, const int*, const int*, const __nv_bfloat16*, const float*, const float*, float*, float*, \\\n"
++    "    __nv_bfloat16*, float*, float*);\n"
++    "#define TF_BACK(NK, NV) template __global__ void tf_fn_gdn_io::back_kernel<NK, NV>(const __nv_bfloat16*, \\\n"
++    "    const __nv_bfloat16*, const __nv_bfloat16*, float, __nv_bfloat16*, float*);\n"
++    "TF_FRONT(16, 48)\n"
++    "TF_FRONT(8, 24)\n"
++    "TF_BACK(16, 48)\n"
++    "TF_BACK(8, 24)\n"
++)
++
++FN_GDN_PREFILL_FOOTER = (
++    "// The instantiations gdn_prefill_cuda launches (32 steps a stage): fp32 keys (Flash Next's front) and bf16,\n"
++    "// 128 value rows a block when the value heads fill the SMs, else 64.\n"
++    "#define TF_PREFILL(QK, ROWS) template __global__ void tf_fn_gdn_prefill::chain_kernel<QK, ROWS, 32>(const QK*, \\\n"
++    "    const QK*, const __nv_bfloat16*, const float*, const float*, const float*, float*, __nv_bfloat16*, int, int, int);\n"
++    "TF_PREFILL(float, 128)\n"
++    "TF_PREFILL(float, 64)\n"
++    "TF_PREFILL(__nv_bfloat16, 128)\n"
++    "TF_PREFILL(__nv_bfloat16, 64)\n"
++)
++
++FN_GDN_TREE_FOOTER = (
++    "// fp32 keys (Flash Next's front): every tree_kernel dispatch_tree<float> picks, and replay_kernel<float>.\n"
++    "#define TF_TREE(S, R, W, C) template __global__ void tf_fn_gdn_tree::tree_kernel<float, S, R, W, C>( \\\n"
++    "    const float*, const float*, const __nv_bfloat16*, const float*, const float*, const float*, \\\n"
++    "    const long long*, const int*, const int*, int, __nv_bfloat16*, int, int, int, tf_fn_gdn_tree::Pending<float>, \\\n"
++    "    float*, const long long*, bool);\n"
++    "TF_TREE(0, 8, 4, true)\n"
++    "TF_TREE(1, 8, 4, false)\n"
++    "TF_TREE(2, 8, 2, false)\n"
++    "TF_TREE(2, 4, 4, false)\n"
++    "TF_TREE(4, 2, 4, false)\n"
++    "TF_TREE(8, 2, 4, false)\n"
++    "TF_TREE(16, 2, 2, false)\n"
++    "TF_TREE(32, 2, 1, false)\n"
++    "template __global__ void tf_fn_gdn_tree::replay_kernel<float, 8, 4>(const long long*, int, const int*, int,\n"
++    "    const int*, int, float*, int, int, int);\n"
++)
++
++FN_NVFP4_FOOTER = (
++    "// The instantiations nvfp4_experts_cuda launches: gate/up SwiGLU (M 2, epilogue 2), down fp32 (0) and bf16 (3).\n"
++    "#define TF_NVFP4(M, EPI) template __global__ void tf_fn_nvfp4_experts::nvfp4_expert_kernel<M, EPI, 4>( \\\n"
++    "    const __nv_bfloat16*, int, int, const uint4*, const float*, int, int, const int*, const int*, const int*, \\\n"
++    "    void*, int, float, int);\n"
++    "TF_NVFP4(2, 2)\n"
++    "TF_NVFP4(1, 0)\n"
++    "TF_NVFP4(1, 3)\n"
++)
++
++FN_QMM_FOOTER = (
++    "// Groups of 32 (the MTP draft head's 4-bit copy of lm_head rows): row tiles 16, 32, 64, bf16 or fp32 out, one K\n"
++    "// slice (no cluster); the launches qmm_cuda's dispatch<32, F32, false> makes.\n"
++    "#define TF_QMM(BM, F32) template __global__ void tf_fn_qmm::qmm_kernel<32, BM, 64, 1, 4, 4, F32, false, false>( \\\n"
++    "    const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, float*, \\\n"
++    "    int, int, int, int, int, int, int);\n"
++    "TF_QMM(16, false)\n"
++    "TF_QMM(32, false)\n"
++    "TF_QMM(64, false)\n"
++    "TF_QMM(16, true)\n"
++    "TF_QMM(32, true)\n"
++    "TF_QMM(64, true)\n"
++)
++
++FN_QMM_PREFILL_FOOTER = (
++    "// Groups of 32 (the MTP draft head's prompt rows), tile 0: 128x128 on 2x4 warps, 3 stages; bf16 or fp32 out.\n"
++    "#define TF_QMM_PREFILL(F32) template __global__ void tf_fn_qmm_prefill::prefill_kernel<32, 128, 128, 2, 4, 3, \\\n"
++    "    F32>(const __nv_bfloat16*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int, int, \\\n"
++    "    int, int, int);\n"
++    "TF_QMM_PREFILL(false)\n"
++    "TF_QMM_PREFILL(true)\n"
++)
++
++FN_QMMF_FOOTER = (
++    "// Block FP8 (FP8G, an fp32 scale per 64 inputs and column: Fp8BlockLinear) on sm_121: row tiles 16, 32, 64 with\n"
++    "// one K slice (no cluster) or 2-8 slices in a cluster, and the fused prompt form (bm 0); bf16 or fp32 out. The\n"
++    "// reduce never runs: split_k stays <= 8 and sm_90+ adds those slices in the cluster.\n"
++    "#define TF_QMMF(BM, F32, CLUSTER, FUSE) template __global__ void tf_fn_qmmf::qmmf_kernel<3, BM, 64, 1, 4, 4, F32, \\\n"
++    "    CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, \\\n"
++    "    int, int, int, int);\n"
++    "TF_QMMF(16, false, false, false)\n"
++    "TF_QMMF(32, false, false, false)\n"
++    "TF_QMMF(64, false, false, false)\n"
++    "TF_QMMF(16, true, false, false)\n"
++    "TF_QMMF(32, true, false, false)\n"
++    "TF_QMMF(64, true, false, false)\n"
++    "TF_QMMF(16, false, true, false)\n"
++    "TF_QMMF(32, false, true, false)\n"
++    "TF_QMMF(64, false, true, false)\n"
++    "TF_QMMF(16, true, true, false)\n"
++    "TF_QMMF(32, true, true, false)\n"
++    "TF_QMMF(64, true, true, false)\n"
++    "TF_QMMF(64, false, false, true)\n"
++    "TF_QMMF(64, true, false, true)\n"
++)
++
++# name: source, first and last line taken, lines dropped (ATen includes), (namespace line, new name), instantiations
++COPIES = {
++    "gdn.cu": ("src/tensorfold/cuda/kernels/gdn.cu", 1, 319, (3, 4), (10, "tf_gdn"), GDN_FOOTER),
++    "qmm_frag.cuh": ("src/tensorfold/cuda/kernels/qmm_frag.cuh", 1, 118, (), None, ""),
++    "experts.cuh": ("src/tensorfold/cuda/experts.cuh", 1, 105, (), None, ""),
++    "qmm_group.cu": (
++        "src/tensorfold/cuda/kernels/qmm_group.cu", 1, 348, (3, 5), (14, "tf_qmm_group"),
++        "// The instantiations Nemotron's windows launch on sm_121 (tile 2: rows <= 16, bf16 out).\n"
++        "template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 8, false, false, false, false>(\n"
++        "    const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);\n",
++    ),
++    "qmm_prefill.cu": (
++        "src/tensorfold/cuda/kernels/qmm_prefill.cu", 1, 151, (3, 5), (11, "tf_qmm_prefill"),
++        "// The instantiation prefill_matmul launches (tile 0: 128x128 on 2x4 warps, 3 stages), bf16 out.\n"
++        "template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 4, 3, false>(\n"
++        "    const __nv_bfloat16*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int, int,\n"
++        "    int, int, int);\n",
++    ),
++    "experts.cu": (
++        "src/tensorfold/cuda/experts.cu", 1, 286, (3, 4, 7), (11, "tf_experts"),
++        "// Decode form for groups of 64: up with relu^2 (epilogue 1), down to fp32 (epilogue 0).\n"
++        "#define TF_EXPERT(EPI) template __global__ void tf_experts::expert_kernel<64, 1, EPI, 2, 4>(const __nv_bfloat16*, \\\n"
++        "    int, int, const uint4*, int, int, const int*, const int*, const int*, void*, int, float);\n"
++        "TF_EXPERT(1)\n"
++        "TF_EXPERT(0)\n",
++    ),
++    "experts_prefill.cu": (
++        "src/tensorfold/cuda/experts_prefill.cu", 1, 153, (3, 4, 7), (11, "tf_experts_prefill"),
++        "// Prefill form for groups of 64: up with relu^2 (epilogue 1), down to bf16 (epilogue 3).\n"
++        "#define TF_PREFILL(EPI) template __global__ void tf_experts_prefill::prefill_kernel<64, 1, EPI, 2, 2, 4>( \\\n"
++        "    const __nv_bfloat16*, int, int, const uint4*, int, int, const int*, const int*, const int*, void*, int, float);\n"
++        "TF_PREFILL(1)\n"
++        "TF_PREFILL(3)\n",
++    ),
++    "experts_pack.cu": (
++        "src/tensorfold/cuda/experts_pack.cu", 1, 42, (3, 4, 6), (8, "tf_experts_pack"),
++        "// Groups of 64 inputs.\n"
++        "template __global__ void tf_experts_pack::pack_kernel<2>(const uint32_t*, const uint16_t*, const uint16_t*,\n"
++        "    uint32_t*, int, int, int, int);\n",
++    ),
++    "prefill_attention.cu": (
++        "src/tensorfold/cuda/kernels/prefill_attention.cu", 1, 250, (3, 6), (11, "tf_prefill_attention"),
++        "// Head dim 128, eight warps, eight query heads a block, eight staging slots (Nemotron's 16 heads a KV head).\n"
++        "template __global__ void tf_prefill_attention::pattn_kernel<128, 8, 8, 8>(const __nv_bfloat16*,\n"
++        "    const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int, int, int, float);\n",
++    ),
++    "scan_rows.cu": ("src/tensorfold/families/nemotron_h/cuda/scan_rows.cu", 1, 90, (3, 4), (8, "tf_scan_rows"), ""),
++    # Flash Next (qwen4_exp) on the NVFP4 checkpoint: the extensions build_kernels loads and the engine launches.
++    "fn_gdn.cu": ("src/tensorfold/families/qwen4_exp/cuda/gdn.cu", 1, 213, (10, 11), (15, "tf_fn_gdn"), FN_GDN_FOOTER),
++    "fn_gdn_io.cu": (
++        "src/tensorfold/families/qwen4_exp/cuda/gdn_io.cu", 1, 103, (3, 4), (8, "tf_fn_gdn_io"), FN_GDN_IO_FOOTER),
++    "fn_gdn_prefill.cu": (
++        "src/tensorfold/cuda/kernels/gdn_prefill.cu", 1, 144, (3, 4), (9, "tf_fn_gdn_prefill"), FN_GDN_PREFILL_FOOTER),
++    "fn_gdn_tree.cu": ("src/tensorfold/cuda/kernels/gdn.cu", 1, 319, (3, 4), (10, "tf_fn_gdn_tree"), FN_GDN_TREE_FOOTER),
++    "fn_nvfp4_experts.cu": (
++        "src/tensorfold/cuda/nvfp4/experts.cu", 1, 148, (4, 5, 9), (13, "tf_fn_nvfp4_experts"), FN_NVFP4_FOOTER),
++    "fn_qmm.cu": ("src/tensorfold/cuda/kernels/qmm.cu", 1, 230, (3, 5), (12, "tf_fn_qmm"), FN_QMM_FOOTER),
++    "fn_qmm_prefill.cu": (
++        "src/tensorfold/cuda/kernels/qmm_prefill.cu", 1, 151, (3, 5), (11, "tf_fn_qmm_prefill"), FN_QMM_PREFILL_FOOTER),
++    # INT4-AutoRound checkpoint: its 128x128-block FP8 dense linears (Fp8BlockLinear, qmmf FP8G)
++    "fn_qmmf.cu": ("src/tensorfold/cuda/nvfp4/qmmf.cu", 1, 298, (4, 6), (14, "tf_fn_qmmf"), FN_QMMF_FOOTER),
++}
++
++# name: {line: (source text, copy text)}: includes whose path differs from the copy's directory (same header bytes)
++EDITS = {
++    "fn_nvfp4_experts.cu": {11: ('#include "../experts.cuh"\n', '#include "experts.cuh"\n')},
++    "fn_qmmf.cu": {12: ('#include "../kernels/qmm_frag.cuh"\n', '#include "qmm_frag.cuh"\n')},
++}
++
++
++def render(name: str) -> tuple[str, str]:
++    """The copy's expected text and the sha256 of the exact source lines it came from."""
++
++    src, first, last, drop, ns, footer = COPIES[name]
++    lines = (SOURCE_ROOT / src).read_text().splitlines(keepends=True)
++    if last > len(lines):
++        raise SystemExit(f"{src} has {len(lines)} lines, fewer than the copy's {last}; update copies.py")
++    taken = lines[first - 1:last]
++    digest = hashlib.sha256("".join(taken).encode()).hexdigest()
++    note = ", comments and ATen includes dropped" if drop else ", comments dropped"
++    out = [f"// Device code of {src} (lines {first}-{last}{note}), checked by zig/tests/cuda/copies.py.\n"]
++    for number, line in enumerate(taken, start=first):
++        if line.lstrip().startswith("//"):
++            continue                # comments stay in the source; the copy keeps code only (same SASS)
++        if number in drop:
++            if "ATen" not in line and "c10" not in line and "torch/" not in line:
++                raise SystemExit(f"{src}:{number} is no longer an ATen include; update copies.py")
++            continue
++        if number in EDITS.get(name, {}):
++            was, now = EDITS[name][number]
++            if line != was:
++                raise SystemExit(f"{src}:{number} is no longer {was.strip()!r}; update copies.py")
++            line = now
++        if ns is not None and number == ns[0]:
++            if line != "namespace {\n":
++                raise SystemExit(f"{src}:{number} is no longer the anonymous namespace; update copies.py")
++            line = f"namespace {ns[1]} {{\n"
++        out.append(line)
++    if ns is not None:
++        out.append(f"}} // namespace {ns[1]}\n\n")
++    out.append(footer)
++    return "".join(out), digest
++
++
++def main() -> int:
++    global SOURCE_ROOT
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--source-root", type=Path, default=ROOT, help="Python reference checkout containing src/tensorfold")
++    parser.add_argument("--write", action="store_true")
++    args = parser.parse_args()
++    SOURCE_ROOT = args.source_root.resolve()
++    write = args.write
++    bad = 0
++    for name in COPIES:
++        text, digest = render(name)
++        path = ROOT / "zig/kernels/cuda" / name
++        if write:
++            path.write_text(text)
++            print(f"wrote {path.relative_to(ROOT)} from source lines sha256 {digest}")
++        elif not path.exists() or path.read_text() != text:
++            print(f"DRIFT {path.relative_to(ROOT)}: differs from its source; rerun with --write and re-prove its bits")
++            bad += 1
++        else:
++            print(f"ok {name} (source lines sha256 {digest})")
++    return 1 if bad else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/zig/tests/cuda/glm_hc_check.zig b/zig/tests/cuda/glm_hc_check.zig
+new file mode 100644
+index 00000000..ef1c4ef8
+--- /dev/null
++++ b/zig/tests/cuda/glm_hc_check.zig
+@@ -0,0 +1,42 @@
++//! Byte check against tools/zig/glm_hc_oracle.py's actual reference Triton _hc_partial.
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++const Fixture = @import("fixture.zig").Fixture;
++pub fn main(init: std.process.Init) !void {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len != 2) return error.ExpectedFixtureDirectory;
++    var f = try Fixture.open(init.gpa, init.io, args[1]);
++    defer f.deinit();
++    const rows: usize = @intCast(try f.int("rows"));
++    if (rows < 1 or rows > 64) return error.BadRows;
++    const xraw = try f.bytes("x");
++    defer init.gpa.free(xraw);
++    const wraw = try f.bytes("fn");
++    defer init.gpa.free(wraw);
++    const expected = try f.bytes("part");
++    defer init.gpa.free(expected);
++    if (xraw.len != rows * 16384 * 2 or wraw.len != 24 * 16384 * 2 or expected.len != rows * 16 * 32 * 4) return error.BadFixture;
++    var d = try cuda.Driver.open();
++    defer d.close();
++    var ctx = try cuda.Context.init(&d, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&d, true);
++    defer stream.deinit();
++    var hc = try glm.hc.HC.init(&d);
++    defer hc.deinit();
++    var x = try cuda.DeviceBuffer.fromHost(&d, xraw);
++    defer x.free();
++    var w = try cuda.DeviceBuffer.fromHost(&d, wraw);
++    defer w.free();
++    var out = try cuda.DeviceBuffer.alloc(&d, expected.len);
++    defer out.free();
++    try out.fill8(0, null);
++    try hc.runPartial(stream, x.ptr, w.ptr, out.ptr, rows);
++    try stream.synchronize();
++    const actual = try init.gpa.alloc(u8, expected.len);
++    defer init.gpa.free(actual);
++    try out.download(0, actual);
++    try glm.layer_check.compare(0, expected, actual);
++    std.debug.print("PASS: HC {d} rows equals reference Triton bytes\n", .{rows});
++}
+diff --git a/zig/tests/cuda/glm_kda_check.zig b/zig/tests/cuda/glm_kda_check.zig
+new file mode 100644
+index 00000000..91ca863d
+--- /dev/null
++++ b/zig/tests/cuda/glm_kda_check.zig
+@@ -0,0 +1,438 @@
++//! GPU check for GLM KDA: the wide chain's bits equal the one-block chain, a replay of the saved rows equals
++//! that state (and a shorter replay equals a shorter chain), and each segment of a window equals a solo run
++//! of its own rows. Chunked prompt launches are deterministic and depend on the sub-chunk offset.
++//! `tf-glm-kda`. Exit 1 on any mismatch. Needs the glm_kda and glm_kda_chunk fatbins.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm");
++const kda = glm.kda;
++
++const H: usize = 4;
++const rows: usize = 5;
++const layers: usize = 2;
++const slots: usize = 2;
++
++pub fn main(init: std.process.Init) !u8 {
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    run(init.gpa, &driver) catch |e| {
++        std.debug.print("FAIL glm-kda: {t}\n", .{e});
++        return 1;
++    };
++    std.debug.print("PASS glm-kda: chain=wide=replay, segments=solo, chunk offset\n", .{});
++    return 0;
++}
++
++fn bf(i: usize) u16 {
++    const t = [_]u16{ 0x3f80, 0x3f00, 0xbf00, 0x4000, 0x3e80, 0x3fc0, 0x3f40, 0xbf80 };
++    return t[i % t.len];
++}
++
++fn off(ptr: u64, bytes: usize) u64 {
++    return ptr + @as(u64, bytes);
++}
++
++fn expectEq(name: []const u8, a: []const u8, b: []const u8) !void {
++    if (std.mem.eql(u8, a, b)) return;
++    var i: usize = 0;
++    while (i < a.len and i < b.len and a[i] == b[i]) i += 1;
++    std.debug.print("FAIL {s}: first mismatch at byte {d} (lens {d} {d})\n", .{ name, i, a.len, b.len });
++    return error.Mismatch;
++}
++
++const Hold = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    items: std.ArrayList(cuda.DeviceBuffer) = .empty,
++
++    fn deinit(h: *Hold) void {
++        for (h.items.items) |*b| b.free();
++        h.items.deinit(h.gpa);
++    }
++
++    fn put(h: *Hold, bytes: []const u8) !u64 {
++        const b = try cuda.DeviceBuffer.fromHost(h.d, bytes);
++        try h.items.append(h.gpa, b);
++        return b.ptr;
++    }
++
++    fn zeros(h: *Hold, n: usize) !u64 {
++        const b = try cuda.DeviceBuffer.alloc(h.d, n);
++        try b.fill8(0, null);
++        try h.items.append(h.gpa, b);
++        return b.ptr;
++    }
++
++    fn pull(h: *Hold, ptr: u64, out: []u8) !void {
++        var b = cuda.DeviceBuffer{ .d = h.d, .ptr = ptr, .len = out.len };
++        try b.download(0, out);
++    }
++};
++
++fn run(gpa: std.mem.Allocator, d: *const cuda.Driver) !void {
++    var k = try kda.Kernels.load(d);
++    defer k.deinit();
++    var stream = try cuda.Stream.init(d, true);
++    defer stream.deinit();
++    const ops: kda.Ops = .{ .k = &k, .s = stream };
++    var hold = Hold{ .gpa = gpa, .d = d };
++    defer hold.deinit();
++
++    const p_stride: usize = 1800;
++    const a_stride: usize = H * kda.dk;
++    const g_stride: usize = H * kda.dv;
++    const b_off = kda.bOff(H);
++    const C = kda.convChannels(H);
++    if (b_off + H > p_stride or p_stride % 8 != 0) return error.Invalid;
++
++    const state_bytes = H * kda.dv * kda.dk * 4;
++    const out_bytes = rows * H * kda.dv * 2;
++    const k_bytes = rows * H * kda.dk * 4;
++    const v_bytes = rows * H * kda.dv * 2;
++    const gk_bytes = rows * H * kda.dk * 4;
++    const b_bytes = rows * H * 4;
++    const q_bytes = k_bytes;
++    const y_bytes = v_bytes;
++
++    const P = try gpa.alloc(u16, rows * p_stride);
++    defer gpa.free(P);
++    const A = try gpa.alloc(u16, rows * a_stride);
++    defer gpa.free(A);
++    const G = try gpa.alloc(u16, rows * g_stride);
++    defer gpa.free(G);
++    const conv = try gpa.alloc(u16, kda.conv_rows * C);
++    defer gpa.free(conv);
++    const cw = try gpa.alloc(u16, C * kda.taps);
++    defer gpa.free(cw);
++    const state = try gpa.alloc(f32, H * kda.dv * kda.dk);
++    defer gpa.free(state);
++    const a_log = try gpa.alloc(f32, H);
++    defer gpa.free(a_log);
++    const dt = try gpa.alloc(f32, H * kda.dk);
++    defer gpa.free(dt);
++    const norm = try gpa.alloc(u16, kda.dv);
++    defer gpa.free(norm);
++
++    for (P, 0..) |*x, i| x.* = bf(i);
++    for (A, 0..) |*x, i| x.* = bf(i + 3);
++    for (G, 0..) |*x, i| x.* = bf(i + 9);
++    for (conv, 0..) |*x, i| x.* = bf(i + 1);
++    for (cw, 0..) |*x, i| x.* = bf(i + 5);
++    for (norm, 0..) |*x, i| x.* = if (i % 2 == 0) 0x3f80 else 0x3f00;
++    for (state, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 9)) * 0.05 - 0.1;
++    for (a_log, 0..) |*x, i| x.* = -0.3 - 0.05 * @as(f32, @floatFromInt(i));
++    for (dt, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.02;
++
++    const p = try hold.put(std.mem.sliceAsBytes(P));
++    const a = try hold.put(std.mem.sliceAsBytes(A));
++    const g = try hold.put(std.mem.sliceAsBytes(G));
++    const cs = try hold.put(std.mem.sliceAsBytes(conv));
++    const w = try hold.put(std.mem.sliceAsBytes(cw));
++    const s_in = try hold.put(std.mem.sliceAsBytes(state));
++    const al = try hold.put(std.mem.sliceAsBytes(a_log));
++    const dtb = try hold.put(std.mem.sliceAsBytes(dt));
++    const nw = try hold.put(std.mem.sliceAsBytes(norm));
++
++    const out1 = try hold.zeros(out_bytes);
++    const st1 = try hold.zeros(state_bytes);
++    const k1 = try hold.zeros(k_bytes);
++    const v1 = try hold.zeros(v_bytes);
++    const g1 = try hold.zeros(gk_bytes);
++    const b1 = try hold.zeros(b_bytes);
++    const out2 = try hold.zeros(out_bytes);
++    const st2 = try hold.zeros(state_bytes);
++    const k2 = try hold.zeros(k_bytes);
++    const v2 = try hold.zeros(v_bytes);
++    const g2 = try hold.zeros(gk_bytes);
++    const b2 = try hold.zeros(b_bytes);
++    const q = try hold.zeros(q_bytes);
++    const y = try hold.zeros(y_bytes);
++
++    try ops.chain(H, p, p_stride, b_off, a, a_stride, g, g_stride, cs, w, s_in, al, dtb, nw, kda.eps, kda.gate_lower, rows, out1, st1, k1, v1, g1, b1);
++    try ops.chainWide(H, p, p_stride, b_off, a, a_stride, g, g_stride, cs, w, s_in, al, dtb, nw, kda.eps, kda.gate_lower, rows, out2, st2, k2, v2, g2, b2, q, y);
++    try stream.synchronize();
++
++    const ho1 = try gpa.alloc(u8, out_bytes);
++    defer gpa.free(ho1);
++    const ho2 = try gpa.alloc(u8, out_bytes);
++    defer gpa.free(ho2);
++    const hs1 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(hs1);
++    const hs2 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(hs2);
++    const hk = try gpa.alloc(u8, k_bytes);
++    defer gpa.free(hk);
++    const hk2 = try gpa.alloc(u8, k_bytes);
++    defer gpa.free(hk2);
++    const hv = try gpa.alloc(u8, v_bytes);
++    defer gpa.free(hv);
++    const hv2 = try gpa.alloc(u8, v_bytes);
++    defer gpa.free(hv2);
++    const hg = try gpa.alloc(u8, gk_bytes);
++    defer gpa.free(hg);
++    const hg2 = try gpa.alloc(u8, gk_bytes);
++    defer gpa.free(hg2);
++    const hb = try gpa.alloc(u8, b_bytes);
++    defer gpa.free(hb);
++    const hb2 = try gpa.alloc(u8, b_bytes);
++    defer gpa.free(hb2);
++    try hold.pull(out1, ho1);
++    try hold.pull(out2, ho2);
++    try hold.pull(st1, hs1);
++    try hold.pull(st2, hs2);
++    try hold.pull(k1, hk);
++    try hold.pull(k2, hk2);
++    try hold.pull(v1, hv);
++    try hold.pull(v2, hv2);
++    try hold.pull(g1, hg);
++    try hold.pull(g2, hg2);
++    try hold.pull(b1, hb);
++    try hold.pull(b2, hb2);
++    try expectEq("chain vs wide out", ho1, ho2);
++    try expectEq("chain vs wide state", hs1, hs2);
++    try expectEq("chain vs wide k", hk, hk2);
++    try expectEq("chain vs wide v", hv, hv2);
++    try expectEq("chain vs wide g", hg, hg2);
++    try expectEq("chain vs wide beta", hb, hb2);
++
++    const st3 = try hold.zeros(state_bytes);
++    const st4 = try hold.zeros(state_bytes);
++    try ops.replay(H, s_in, k2, v2, g2, b2, rows, st3);
++    try ops.replay(H, s_in, k2, v2, g2, b2, 2, st4);
++    const st5 = try hold.zeros(state_bytes);
++    const out5 = try hold.zeros(2 * H * kda.dv * 2);
++    const k5 = try hold.zeros(2 * H * kda.dk * 4);
++    const v5 = try hold.zeros(2 * H * kda.dv * 2);
++    const g5 = try hold.zeros(2 * H * kda.dk * 4);
++    const b5 = try hold.zeros(2 * H * 4);
++    const q5 = try hold.zeros(2 * H * kda.dk * 4);
++    const y5 = try hold.zeros(2 * H * kda.dv * 2);
++    try ops.chainWide(H, p, p_stride, b_off, a, a_stride, g, g_stride, cs, w, s_in, al, dtb, nw, kda.eps, kda.gate_lower, 2, out5, st5, k5, v5, g5, b5, q5, y5);
++    try stream.synchronize();
++    const hr = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(hr);
++    const hr2 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(hr2);
++    const hs5 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(hs5);
++    try hold.pull(st3, hr);
++    try hold.pull(st4, hr2);
++    try hold.pull(st5, hs5);
++    try expectEq("replay all rows", hs2, hr);
++    try expectEq("replay prefix vs short chain", hr2, hs5);
++
++    try segments(&hold, ops, stream, gpa, p, a, g, w, p_stride, a_stride, g_stride, b_off, C);
++    try chunkCase(&hold, ops, stream, gpa, p, a, g, cs, w, s_in, al, dtb, nw, std.mem.sliceAsBytes(state), p_stride, a_stride, g_stride, b_off, out_bytes, state_bytes);
++}
++
++fn segments(hold: *Hold, ops: kda.Ops, stream: cuda.Stream, gpa: std.mem.Allocator, p: u64, a: u64, g: u64, w: u64, p_stride: usize, a_stride: usize, g_stride: usize, b_off: usize, C: usize) !void {
++    var table: [3]kda.Seg = undefined;
++    try kda.writeSegments(&.{
++        .{ .rows = 3, .slot = 0, .parity = 0 },
++        .{ .rows = 2, .slot = 1, .parity = 1 },
++    }, &table);
++    // a third, empty segment: the fixed table a graph keeps when fewer streams are live
++    var wide_table: [3]kda.Seg = table;
++    wide_table[2] = .{ .row0 = 5, .rows = 0, .slot = 0, .parity = 0, .conv = 0, .keep = 0 };
++    const seg = try hold.put(std.mem.asBytes(&wide_table));
++
++    const conv_elems = slots * layers * kda.conv_rows * C;
++    const conv_h = try gpa.alloc(u16, conv_elems);
++    defer gpa.free(conv_h);
++    for (conv_h, 0..) |*x, i| x.* = bf(i + 11);
++    const conv = try hold.put(std.mem.sliceAsBytes(conv_h));
++
++    const state_elems = H * kda.dv * kda.dk;
++    const rec_elems = slots * 2 * layers * state_elems;
++    const rec_h = try gpa.alloc(f32, rec_elems);
++    defer gpa.free(rec_h);
++    for (rec_h, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 13)) * 0.03 - 0.2;
++    const rec = try hold.put(std.mem.sliceAsBytes(rec_h));
++    const rec_src = try gpa.dupe(u8, std.mem.sliceAsBytes(rec_h));
++    defer gpa.free(rec_src);
++
++    const st = kda.recStride(layers, H);
++    const out_bytes = layers * rows * H * kda.dv * 2;
++    const k_bytes = layers * rows * H * kda.dk * 4;
++    const v_bytes = layers * rows * H * kda.dv * 2;
++    const g_bytes = k_bytes;
++    const b_bytes = layers * rows * H * 4;
++    const out = try hold.zeros(out_bytes);
++    const ks = try hold.zeros(k_bytes);
++    const vs = try hold.zeros(v_bytes);
++    const gs = try hold.zeros(g_bytes);
++    const bs = try hold.zeros(b_bytes);
++    const q = try hold.zeros(rows * H * kda.dk * 4);
++    const y = try hold.zeros(rows * H * kda.dv * 2);
++
++    var logs: [layers]u64 = undefined;
++    var dts: [layers]u64 = undefined;
++    var norms: [layers]u64 = undefined;
++    for (0..layers) |layer| {
++        const al = try gpa.alloc(f32, H);
++        defer gpa.free(al);
++        const dt = try gpa.alloc(f32, H * kda.dk);
++        defer gpa.free(dt);
++        const nw = try gpa.alloc(u16, kda.dv);
++        defer gpa.free(nw);
++        for (al, 0..) |*x, i| x.* = -0.2 * @as(f32, @floatFromInt(layer + 1)) - 0.01 * @as(f32, @floatFromInt(i));
++        for (dt, 0..) |*x, i| x.* = 0.01 * @as(f32, @floatFromInt((i + layer) % 7));
++        for (nw, 0..) |*x, i| x.* = if ((i + layer) % 2 == 0) 0x3f80 else 0x3f40;
++        logs[layer] = try hold.put(std.mem.sliceAsBytes(al));
++        dts[layer] = try hold.put(std.mem.sliceAsBytes(dt));
++        norms[layer] = try hold.put(std.mem.sliceAsBytes(nw));
++        const layer_b: u64 = @intCast(layer);
++        const conv_ptr = conv + layer_b * @as(u64, kda.conv_rows * C * 2);
++        const rec_ptr = rec + layer_b * @as(u64, st.layer * 4);
++        const out_ptr = out + layer_b * @as(u64, rows * H * kda.dv * 2);
++        const k_ptr = ks + layer_b * @as(u64, rows * H * kda.dk * 4);
++        const v_ptr = vs + layer_b * @as(u64, rows * H * kda.dv * 2);
++        const g_ptr = gs + layer_b * @as(u64, rows * H * kda.dk * 4);
++        const b_ptr = bs + layer_b * @as(u64, rows * H * 4);
++        try ops.chainWideSegments(wide_table.len, H, seg, p, p_stride, b_off, a, a_stride, g, g_stride, conv_ptr, kda.convSlotStride(layers, H), w, rec_ptr, st.slot, st.parity, logs[layer], dts[layer], norms[layer], kda.eps, kda.gate_lower, rows, out_ptr, k_ptr, v_ptr, g_ptr, b_ptr, q, y);
++    }
++    try stream.synchronize();
++
++    // solo each real segment, per layer, and compare its rows and its destination state
++    const seg_in = [_]kda.SegIn{
++        .{ .rows = 3, .slot = 0, .parity = 0 },
++        .{ .rows = 2, .slot = 1, .parity = 1 },
++    };
++    for (seg_in, 0..) |s, si| {
++        const n: usize = @intCast(s.rows);
++        const row0: usize = if (si == 0) 0 else 3;
++        const solo_out = try hold.zeros(n * H * kda.dv * 2);
++        const solo_k = try hold.zeros(n * H * kda.dk * 4);
++        const solo_v = try hold.zeros(n * H * kda.dv * 2);
++        const solo_g = try hold.zeros(n * H * kda.dk * 4);
++        const solo_b = try hold.zeros(n * H * 4);
++        const solo_q = try hold.zeros(n * H * kda.dk * 4);
++        const solo_y = try hold.zeros(n * H * kda.dv * 2);
++        const solo_st = try hold.zeros(state_elems * 4);
++        for (0..layers) |layer| {
++            const layer_b: u64 = @intCast(layer);
++            const slot: u64 = @intCast(s.slot);
++            const conv_ptr = conv + (slot * @as(u64, layers) + layer_b) * @as(u64, kda.conv_rows * C * 2);
++            const src_par: u64 = @intCast(s.parity);
++            const state_ptr = rec + slot * @as(u64, st.slot * 4) + src_par * @as(u64, st.parity * 4) + layer_b * @as(u64, st.layer * 4);
++            // the chain already overwrote the destination parity; the source parity is still the upload.
++            // re-upload that one state from the host copy so a previous solo cannot have touched it
++            // (chain reads state_in and does not write it). state_ptr points into `rec`, which the
++            // segmented chain wrote only at 1 - parity. source is intact.
++            const row_b: u64 = @intCast(row0);
++            try ops.chainWide(H, p + row_b * @as(u64, p_stride * 2), p_stride, b_off, a + row_b * @as(u64, a_stride * 2), a_stride, g + row_b * @as(u64, g_stride * 2), g_stride, conv_ptr, w, state_ptr, logs[layer], dts[layer], norms[layer], kda.eps, kda.gate_lower, n, solo_out, solo_st, solo_k, solo_v, solo_g, solo_b, solo_q, solo_y);
++            try stream.synchronize();
++            const got_out = try gpa.alloc(u8, n * H * kda.dv * 2);
++            defer gpa.free(got_out);
++            const exp_out = try gpa.alloc(u8, n * H * kda.dv * 2);
++            defer gpa.free(exp_out);
++            const got_st = try gpa.alloc(u8, state_elems * 4);
++            defer gpa.free(got_st);
++            const exp_st = try gpa.alloc(u8, state_elems * 4);
++            defer gpa.free(exp_st);
++            try hold.pull(solo_out, got_out);
++            try hold.pull(solo_st, got_st);
++            const out_off = (layer * rows + row0) * H * kda.dv * 2;
++            try hold.pull(off(out, out_off), exp_out);
++            const dest_par: u64 = 1 - src_par;
++            const dest = rec + slot * @as(u64, st.slot * 4) + dest_par * @as(u64, st.parity * 4) + layer_b * @as(u64, st.layer * 4);
++            try hold.pull(dest, exp_st);
++            var name: [96]u8 = undefined;
++            const no = try std.fmt.bufPrint(&name, "seg {d} layer {d} out", .{ si, layer });
++            try expectEq(no, got_out, exp_out);
++            const ns = try std.fmt.bufPrint(&name, "seg {d} layer {d} state", .{ si, layer });
++            try expectEq(ns, got_st, exp_st);
++        }
++    }
++
++    // keep == rows skips replay: destination bytes stay the chain's. Then keep < rows replays from the
++    // source parity over the chain's state, matching a solo chain of that prefix.
++    const before = try gpa.alloc(u8, rec_elems * 4);
++    defer gpa.free(before);
++    try hold.pull(rec, before);
++    try ops.replayLayersSegments(wide_table.len, H, layers, seg, rec, st.slot, st.parity, st.layer, ks, vs, gs, bs, kda.kvStride(rows, H), kda.betaStride(rows, H));
++    try stream.synchronize();
++    const after = try gpa.alloc(u8, rec_elems * 4);
++    defer gpa.free(after);
++    try hold.pull(rec, after);
++    try expectEq("replay skips keep==rows", before, after);
++
++    wide_table[0].keep = 1;
++    const seg2 = try hold.put(std.mem.asBytes(&wide_table));
++    try ops.replayLayersSegments(wide_table.len, H, layers, seg2, rec, st.slot, st.parity, st.layer, ks, vs, gs, bs, kda.kvStride(rows, H), kda.betaStride(rows, H));
++    try stream.synchronize();
++    // slot 1 keep stayed at 2 == rows, so its destination (parity 0) is unchanged; slot 0's dest is the first row only
++    try hold.pull(rec, after);
++    for (0..layers) |layer| {
++        const at = (1 * st.slot + layer * st.layer) * 4;
++        try expectEq("untouched segment", before[at .. at + state_elems * 4], after[at .. at + state_elems * 4]);
++        const n: usize = 1;
++        const solo_out = try hold.zeros(n * H * kda.dv * 2);
++        const solo_k = try hold.zeros(n * H * kda.dk * 4);
++        const solo_v = try hold.zeros(n * H * kda.dv * 2);
++        const solo_g = try hold.zeros(n * H * kda.dk * 4);
++        const solo_b = try hold.zeros(n * H * 4);
++        const solo_q = try hold.zeros(n * H * kda.dk * 4);
++        const solo_y = try hold.zeros(n * H * kda.dv * 2);
++        const solo_st = try hold.zeros(state_elems * 4);
++        // restore is unnecessary: source parity 0 of slot 0 was not written. Use the original host bytes uploaded
++        // again so we do not depend on that, and point the solo chain at a fresh copy.
++        const src_off = (0 * st.slot + 0 * st.parity + layer * st.layer) * 4;
++        const fresh = try hold.put(rec_src[src_off .. src_off + state_elems * 4]);
++        const layer_b: u64 = @intCast(layer);
++        const conv_ptr = conv + layer_b * @as(u64, kda.conv_rows * C * 2);
++        try ops.chainWide(H, p, p_stride, b_off, a, a_stride, g, g_stride, conv_ptr, w, fresh, logs[layer], dts[layer], norms[layer], kda.eps, kda.gate_lower, 1, solo_out, solo_st, solo_k, solo_v, solo_g, solo_b, solo_q, solo_y);
++        try stream.synchronize();
++        const got = try gpa.alloc(u8, state_elems * 4);
++        defer gpa.free(got);
++        const exp = try gpa.alloc(u8, state_elems * 4);
++        defer gpa.free(exp);
++        try hold.pull(solo_st, got);
++        const dest_off = (1 * st.parity + layer * st.layer) * 4;
++        try hold.pull(off(rec, dest_off), exp);
++        var name: [64]u8 = undefined;
++        const ns = try std.fmt.bufPrint(&name, "replay keep 1 layer {d}", .{layer});
++        try expectEq(ns, got, exp);
++    }
++}
++
++fn chunkCase(hold: *Hold, ops: kda.Ops, stream: cuda.Stream, gpa: std.mem.Allocator, p: u64, a: u64, g: u64, cs: u64, w: u64, s_in: u64, al: u64, dtb: u64, nw: u64, state: []const u8, p_stride: usize, a_stride: usize, g_stride: usize, b_off: usize, out_bytes: usize, state_bytes: usize) !void {
++    const o0 = try hold.zeros(out_bytes);
++    const o1 = try hold.zeros(out_bytes);
++    const o2 = try hold.zeros(out_bytes);
++    const t0 = try hold.zeros(state_bytes);
++    const t1 = try hold.zeros(state_bytes);
++    const t2 = try hold.zeros(state_bytes);
++    try ops.chunk(H, p, p_stride, b_off, a, a_stride, g, g_stride, cs, w, s_in, al, dtb, nw, kda.eps, kda.gate_lower, rows, 0, o0, t0);
++    try ops.chunk(H, p, p_stride, b_off, a, a_stride, g, g_stride, cs, w, s_in, al, dtb, nw, kda.eps, kda.gate_lower, rows, 0, o1, t1);
++    try ops.chunk(H, p, p_stride, b_off, a, a_stride, g, g_stride, cs, w, s_in, al, dtb, nw, kda.eps, kda.gate_lower, rows, kda.chunkOff(30), o2, t2); // 5 rows from row 30 straddle a 32-row sub-chunk boundary (an offset inside one sub-chunk only adds exact zeros)
++    try stream.synchronize();
++    const a0 = try gpa.alloc(u8, out_bytes);
++    defer gpa.free(a0);
++    const a1 = try gpa.alloc(u8, out_bytes);
++    defer gpa.free(a1);
++    const a2 = try gpa.alloc(u8, out_bytes);
++    defer gpa.free(a2);
++    const b0 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(b0);
++    const b1 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(b1);
++    const b2 = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(b2);
++    const sin = try gpa.alloc(u8, state_bytes);
++    defer gpa.free(sin);
++    try hold.pull(o0, a0);
++    try hold.pull(o1, a1);
++    try hold.pull(o2, a2);
++    try hold.pull(t0, b0);
++    try hold.pull(t1, b1);
++    try hold.pull(t2, b2);
++    try hold.pull(s_in, sin);
++    try expectEq("chunk twice out", a0, a1);
++    try expectEq("chunk twice state", b0, b1);
++    try expectEq("chunk leaves state_in", state, sin);
++    if (std.mem.eql(u8, a0, a2) and std.mem.eql(u8, b0, b2)) return error.ChunkOffsetIgnored;
++}
+diff --git a/zig/tests/cuda/glm_layer_check.zig b/zig/tests/cuda/glm_layer_check.zig
+new file mode 100644
+index 00000000..6da4e738
+--- /dev/null
++++ b/zig/tests/cuda/glm_layer_check.zig
+@@ -0,0 +1,9 @@
++//! tools/zig/glm_layer_dump.py v1 byte comparison. CPU-only; no CUDA driver is opened.
++const std = @import("std");
++const glm = @import("glm_cuda");
++pub fn main(init: std.process.Init) !void {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len != 3) return error.ExpectedReferenceAndActualDirectories;
++    try glm.layer_check.compareDirectories(init.gpa, init.io, args[1], args[2]);
++    std.debug.print("PASS: all 45 layers match byte for byte\n", .{});
++}
+diff --git a/zig/tests/cuda/glm_p1/README.md b/zig/tests/cuda/glm_p1/README.md
+new file mode 100644
+index 00000000..7cadbddd
+--- /dev/null
++++ b/zig/tests/cuda/glm_p1/README.md
+@@ -0,0 +1,31 @@
++Real GLM TP=2 capture and replay (TensorFold/Ash Hart reference)
++
++The recipe worktree is read only. The capture launcher sources its config, mounts
++these hooks through PYTHONPATH, and uses its docker GPU/RDMA/network privileges.
++Only uniquely named glm-p1-* containers created by the launcher are removed.
++
++    flock /tmp/claude-1000/gpu.lock env GLM_GPU_LOCKED=1 \
++      python3 tools/zig/glm_capture.py --out glm-capture
++    python3 tools/zig/glm_aot.py --capture glm-capture \
++      --out zig/tests/cuda/glm_p1/aot \
++      --zig zig/src/families/glm_cuda/cuda_triton_generated.zig
++    ZIG_GLOBAL_CACHE_DIR=$PWD/../.zig-global-cache nice -n 19 zig build glm-p1-replay -j2
++    flock /tmp/claude-1000/gpu.lock zig-out/bin/tf-glm-p1-replay \
++      zig/tests/cuda/glm_p1/aot glm-capture/rank0
++    flock /tmp/claude-1000/gpu.lock zig-out/bin/tf-glm-p1-replay \
++      zig/tests/cuda/glm_p1/aot glm-capture/rank1
++
++GPU-FREE must exist. The lock covers both reference ranks and cleanup. Startup,
++eager decode and eager prefill launches retain the compiled signature, constexprs,
++argument alignment, source, call sites, grid, compiler options and cached cubin.
++Fixtures retain the union of tensor pointer spans per storage, rounded down to a
++16-byte base, preserving offset pointers and aliasing. Each span has before/after
++raw little-endian bytes. The replay restores the complete before image and checks
++the complete after image, including untouched bytes and padding.
++
++The large checkpoint pointer spans live in ignored glm-capture/, not in Git.
++Small wrapper metadata and captured cubins can be kept separately. A snapshot
++size limit is explicit in fixtures.json; skipped snapshots are never reported as
++passing. Graph replays do not reenter JITFunction.run, so fixtures require eager
++batched verify/drafter execution. Captured specializations cover this workload;
++missing variants fail through aot.Set.find instead of approximating arithmetic.
+diff --git a/zig/tests/cuda/glm_p1/replay.zig b/zig/tests/cuda/glm_p1/replay.zig
+new file mode 100644
+index 00000000..704ca0ba
+--- /dev/null
++++ b/zig/tests/cuda/glm_p1/replay.zig
+@@ -0,0 +1,98 @@
++//! Replay real glm5_next/cuda Triton launches against eager Python CPU pointer-span fixtures.
++//! TensorFold/Ash Hart reference; preserves aliases, view offsets and original specialization.
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++const aot = cuda.aot;
++const PtrDiff = struct { to: []const u8, from: []const u8, elem: u64 };
++const ArgJson = struct { name: []const u8, type: []const u8, buffer: ?usize = null, offset: u64 = 0, int: ?i64 = null, f32: ?u32 = null, ptrdiff: ?PtrDiff = null };
++
++fn addressOf(sample: Sample, buffers: []const cuda.DeviceBuffer, name: []const u8) !u64 {
++    for (sample.args) |a| if (std.mem.eql(u8, a.name, name)) return buffers[a.buffer orelse return error.PtrDiffNotPointer].ptr + a.offset;
++    for (sample.extras) |a| if (std.mem.eql(u8, a.name, name)) return buffers[a.buffer orelse return error.PtrDiffNotPointer].ptr + a.offset;
++    return error.PtrDiffUnknownArgument;
++}
++const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
++const Sample = struct { @"fn": []const u8, hash: []const u8, phase: []const u8, grid: [3]usize, args: []ArgJson, extras: []ArgJson = &.{}, consts: std.json.ArrayHashMap(ConstJson), folder: []const u8, buffers: []usize };
++const Fixtures = struct { samples: []Sample };
++fn read(gpa: std.mem.Allocator, io: std.Io, root: []const u8, folder: []const u8, index: usize, suffix: []const u8) ![]u8 {
++    const path = try std.fmt.allocPrint(gpa, "{s}/{s}/{d}.{s}.bin", .{ root, folder, index, suffix });
++    defer gpa.free(path);
++    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(2 << 30));
++}
++pub fn main(init: std.process.Init) !void {
++    const argv = try init.minimal.args.toSlice(init.arena.allocator());
++    if (argv.len != 3) return error.ExpectedAotDirectoryAndCaptureRankDirectory;
++    const gpa = init.gpa;
++    const io = init.io;
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    var set = try aot.Set.load(gpa, io, &driver, ctx.device, argv[1]);
++    defer set.deinit();
++    var memo: glm.triton.Memo = .{ .gpa = gpa };
++    defer memo.deinit();
++    const tri: glm.triton.Tri = .{ .set = &set, .s = stream, .memo = &memo };
++    const path = try std.fs.path.join(gpa, &.{ argv[2], "replay.json" });
++    defer gpa.free(path);
++    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 26));
++    defer gpa.free(raw);
++    const parsed = try std.json.parseFromSlice(Fixtures, gpa, raw, .{ .ignore_unknown_fields = true });
++    defer parsed.deinit();
++    if (parsed.value.samples.len == 0) return error.EmptyFixtureSet;
++    for (parsed.value.samples) |sample| {
++        const buffers = try gpa.alloc(cuda.DeviceBuffer, sample.buffers.len);
++        defer gpa.free(buffers);
++        var loaded: usize = 0;
++        defer for (buffers[0..loaded]) |*b| b.free();
++        for (sample.buffers, 0..) |size, i| {
++            const bytes = try read(gpa, io, argv[2], sample.folder, i, "in");
++            defer gpa.free(bytes);
++            if (bytes.len != size) return error.FixtureSizeMismatch;
++            buffers[i] = try cuda.DeviceBuffer.alloc(&driver, size);
++            loaded += 1;
++            try buffers[i].upload(0, bytes);
++        }
++        var args: [64]aot.Arg = undefined;
++        if (sample.args.len > args.len) return error.TooManyArguments;
++        for (sample.args, 0..) |arg, i| {
++            if (arg.ptrdiff) |d| {
++                // Address-dependent scalar (hc_post_pair's RS): recomputed from this replay's own buffer addresses.
++                const to: i64 = @bitCast(try addressOf(sample, buffers, d.to));
++                const from: i64 = @bitCast(try addressOf(sample, buffers, d.from));
++                const v = @divFloor(to - from, @as(i64, @intCast(d.elem)));
++                // Triton types an integer argument by magnitude: i32 when it fits, else i64.
++                args[i] = if (std.math.cast(i32, v)) |small| aot.int(arg.name, small) else aot.word(arg.name, @bitCast(v));
++                continue;
++            }
++            args[i] = if (arg.buffer) |b| aot.ptr(arg.name, arg.type, buffers[b].ptr + arg.offset) else if (arg.f32) |v| aot.float(arg.name, @bitCast(v)) else if (std.mem.eql(u8, arg.type, "i32")) aot.int(arg.name, @intCast(arg.int.?)) else aot.word(arg.name, @bitCast(arg.int.?));
++        }
++        var consts: [64]aot.Const = undefined;
++        const map = sample.consts.map;
++        if (map.count() > consts.len) return error.TooManyConstants;
++        for (map.keys(), map.values(), 0..) |name, value, i| {
++            consts[i] = .{ .name = name, .int = value.int, .f32 = if (value.f32) |v| @as(f32, @bitCast(v)) else null };
++        }
++        try tri.run(sample.@"fn", sample.grid, args[0..sample.args.len], consts[0..map.count()]);
++        try stream.synchronize();
++        for (buffers, 0..) |buffer, i| {
++            const want = try read(gpa, io, argv[2], sample.folder, i, "out");
++            defer gpa.free(want);
++            const got = try gpa.alloc(u8, want.len);
++            defer gpa.free(got);
++            try buffer.download(0, got);
++            if (!std.mem.eql(u8, want, got)) {
++                for (want, got, 0..) |w, g, at| if (w != g) {
++                    std.log.err("{s} {s} buffer {d} byte {d}: Python {x}, Zig {x}", .{ sample.@"fn", sample.phase, i, at, w, g });
++                    break;
++                };
++                return error.TritonByteMismatch;
++            }
++        }
++        std.log.info("PASS {s} {s} ({s})", .{ sample.@"fn", sample.phase, sample.hash });
++    }
++    std.log.info("all {d} real Python Triton fixtures byte-exact", .{parsed.value.samples.len});
++}
+diff --git a/zig/tests/cuda/glm_p23_check.zig b/zig/tests/cuda/glm_p23_check.zig
+new file mode 100644
+index 00000000..5438d09b
+--- /dev/null
++++ b/zig/tests/cuda/glm_p23_check.zig
+@@ -0,0 +1,183 @@
++//! Byte checks against tools/zig/glm_p23_oracle.py fixtures. GPU execution requires GPU-FREE and flock.
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda").matmuls;
++const Fixture = @import("fixture.zig").Fixture;
++fn size(f: Fixture, name: []const u8) !usize {
++    return @intCast(try f.int(name));
++}
++fn upload(d: *const cuda.Driver, f: Fixture, name: []const u8) !cuda.DeviceBuffer {
++    const bytes = try f.bytes(name);
++    defer f.gpa.free(bytes);
++    return cuda.DeviceBuffer.fromHost(d, bytes);
++}
++pub fn main(init: std.process.Init) !void {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len != 2) return error.ExpectedFixtureDirectory;
++    var f = try Fixture.open(init.gpa, init.io, args[1]);
++    defer f.deinit();
++    const kind = try f.string("kind");
++    if (std.mem.eql(u8, kind, "layout") or std.mem.eql(u8, kind, "fp8")) {
++        try checkLayout(init.gpa, f, kind);
++        std.debug.print("PASS {s} {s}: host byte equality\n", .{ kind, args[1] });
++        return;
++    }
++    var d = try cuda.Driver.open();
++    defer d.close();
++    var ctx = try cuda.Context.init(&d, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&d, true);
++    defer stream.deinit();
++    var e = try glm.Entries.load(&ctx);
++    defer e.deinit();
++    const rows = try size(f, "rows");
++    const n = try size(f, "n");
++    const k = try size(f, "k");
++    var x = try upload(&d, f, "x");
++    defer x.free();
++    const want = try f.bytes("out");
++    defer init.gpa.free(want);
++    var out = try cuda.DeviceBuffer.alloc(&d, want.len);
++    defer out.free();
++    try out.fill8(0, null);
++    if (std.mem.eql(u8, kind, "qmm")) {
++        var w = try upload(&d, f, "w");
++        defer w.free();
++        var sc = try upload(&d, f, "s");
++        defer sc.free();
++        var b = try upload(&d, f, "b");
++        defer b.free();
++        var xs = try upload(&d, f, "xs");
++        defer xs.free();
++        var part = try cuda.DeviceBuffer.alloc(&d, glm.splitK(n, k) * rows * n * 4);
++        defer part.free();
++        const q: glm.Q4 = .{ .w = w.ptr, .s = sc.ptr, .b = b.ptr, .n = n, .k = k };
++        // Both cluster and ordered-buffer reductions must equal the Python oracle.
++        for ([_]bool{ false, true }) |cluster| {
++            try glm.matmul(&e, stream, x.ptr, k, xs.ptr, q, out.ptr, part.ptr, rows, try f.int("f32") != 0, cluster, try f.int("prompt") != 0);
++            try stream.synchronize();
++            try compare(init.gpa, out, want);
++        }
++    } else if (std.mem.eql(u8, kind, "exl3")) {
++        const slots = try size(f, "slots");
++        const ne = try size(f, "experts");
++        const tile = try size(f, "tile");
++        const pairs = rows * slots;
++        const items = glm.experts.maxItems(pairs, ne + 1, tile);
++        const names = [_][]const u8{ "gt", "ut", "dt", "suh_g", "suh_u", "svh_g", "svh_u", "suh_d", "svh_d", "picks" };
++        var buffers: [names.len]cuda.DeviceBuffer = undefined;
++        var loaded: usize = 0;
++        defer for (buffers[0..loaded]) |*v| v.free();
++        for (names, 0..) |name, i| {
++            buffers[i] = try upload(&d, f, name);
++            loaded += 1;
++        }
++        var members = try cuda.DeviceBuffer.alloc(&d, pairs * 4);
++        defer members.free();
++        var it = try cuda.DeviceBuffer.alloc(&d, items * 3 * 4);
++        defer it.free();
++        var cnt = try cuda.DeviceBuffer.alloc(&d, 12);
++        defer cnt.free();
++        var rank = try cuda.DeviceBuffer.alloc(&d, pairs * 4);
++        defer rank.free();
++        var hist = try cuda.DeviceBuffer.alloc(&d, ((pairs + 1023) / 1024) * (ne + 1) * 4);
++        defer hist.free();
++        const p: glm.experts.Plan = .{ .members = members.ptr, .items = it.ptr, .counts = cnt.ptr, .rank = rank.ptr, .hist = hist.ptr, .tile = tile, .experts = ne + 1 };
++        const ex: glm.experts.Experts = .{ .gt = buffers[0].ptr, .ut = buffers[1].ptr, .dt = buffers[2].ptr, .suh_g = buffers[3].ptr, .suh_u = buffers[4].ptr, .svh_g = buffers[5].ptr, .svh_u = buffers[6].ptr, .suh_d = buffers[7].ptr, .svh_d = buffers[8].ptr, .shared_suh = if (try f.int("shared") != 0) buffers[3].ptr else 0, .dims = k, .width = n, .count = ne };
++        var xg = try cuda.DeviceBuffer.alloc(&d, pairs * k * 2);
++        defer xg.free();
++        var xu = try cuda.DeviceBuffer.alloc(&d, pairs * k * 2);
++        defer xu.free();
++        var xd = try cuda.DeviceBuffer.alloc(&d, pairs * n * 2);
++        defer xd.free();
++        var z = try cuda.DeviceBuffer.alloc(&d, 8 * pairs * @max(k, n) * 4);
++        defer z.free();
++        var done = try cuda.DeviceBuffer.alloc(&d, (items * n / 128 + 1) * 4);
++        defer done.free();
++        var order = try cuda.DeviceBuffer.alloc(&d, items * 4);
++        defer order.free();
++        for ([_]cuda.DeviceBuffer{ xg, xu, xd, z, done }) |v| try v.fill8(0, null);
++        const scratch: glm.experts.Scratch = .{ .xg = xg.ptr, .xu = xu.ptr, .xd = xd.ptr, .z = z.ptr, .done = done.ptr, .order = order.ptr, .capacity = rows, .slots = slots };
++        try glm.experts.plan(&e, stream, buffers[9].ptr, pairs, p);
++        for ([_]bool{ false, true }) |grouped| {
++            try glm.experts.routed(&e, stream, x.ptr, k, buffers[9].ptr, p, ex, scratch, out.ptr, rows, 10, grouped);
++            try stream.synchronize();
++            if (grouped and k == 4096 and rows < 64 and (n == 1024 or n == 768 or n == 640 or n == 512)) {
++                // Python runs `dec` here; the grouped kernel is only its documented equivalent. A pick of
++                // `experts` (the fixtures draw 0..experts, inclusive) names no trellis: the grouped kernel
++                // reads past the arrays for it while `dec` skips it, so only in-range pairs are compared.
++                const picks = try f.bytes("picks");
++                defer init.gpa.free(picks);
++                try compareValidPairs(init.gpa, out, want, std.mem.bytesAsSlice(i32, picks), ne, k);
++            } else try compare(init.gpa, out, want);
++        }
++    } else return error.UnknownFixtureKind;
++    std.debug.print("PASS {s} {s}: byte equality\n", .{ kind, args[1] });
++}
++fn compareValidPairs(gpa: std.mem.Allocator, out: cuda.DeviceBuffer, want: []const u8, picks: []align(1) const i32, count: usize, width: usize) !void {
++    const got = try gpa.alloc(u8, want.len);
++    defer gpa.free(got);
++    try out.download(0, got);
++    const stride = width * 4;
++    for (picks, 0..) |pick, pair| {
++        if (pick < 0 or pick >= count) continue;
++        if (!std.mem.eql(u8, got[pair * stride ..][0..stride], want[pair * stride ..][0..stride])) return error.OracleMismatch;
++    }
++}
++fn compare(gpa: std.mem.Allocator, out: cuda.DeviceBuffer, want: []const u8) !void {
++    const got = try gpa.alloc(u8, want.len);
++    defer gpa.free(got);
++    try out.download(0, got);
++    if (!std.mem.eql(u8, got, want)) return error.OracleMismatch;
++}
++
++fn checkLayout(gpa: std.mem.Allocator, f: Fixture, kind: []const u8) !void {
++    const n = try size(f, "n");
++    const k = try size(f, "k");
++    const bytes = try f.bytes("x");
++    defer gpa.free(bytes);
++    const x: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, bytes));
++    if (std.mem.eql(u8, kind, "fp8")) {
++        const codes = try gpa.alloc(u8, n * k);
++        defer gpa.free(codes);
++        const scales = try gpa.alloc(f32, n * k / 128);
++        defer gpa.free(scales);
++        glm.layouts.makeF8(x, codes, scales);
++        try equalBytes(f, "codes", codes);
++        try equalBytes(f, "scales", std.mem.sliceAsBytes(scales));
++        return;
++    }
++    const words = try gpa.alloc(u32, n * k / 8);
++    defer gpa.free(words);
++    const scales = try gpa.alloc(u16, n * k / 64);
++    defer gpa.free(scales);
++    const biases = try gpa.alloc(u16, n * k / 64);
++    defer gpa.free(biases);
++    glm.layouts.quantize4(x, n, k, words, scales, biases, true);
++    try equalBytes(f, "words", std.mem.sliceAsBytes(words));
++    try equalBytes(f, "scales", std.mem.sliceAsBytes(scales));
++    try equalBytes(f, "biases", std.mem.sliceAsBytes(biases));
++    const npad = (n + 127) / 128 * 128;
++    const packed_words = try gpa.alloc(u32, npad * k / 8);
++    defer gpa.free(packed_words);
++    const sc = try gpa.alloc(u16, npad * k / 64);
++    defer gpa.free(sc);
++    const bi = try gpa.alloc(u16, npad * k / 64);
++    defer gpa.free(bi);
++    glm.layouts.pack(words, scales, biases, n, k, packed_words, sc, bi);
++    try equalBytes(f, "w", std.mem.sliceAsBytes(packed_words));
++    try equalBytes(f, "s", std.mem.sliceAsBytes(sc));
++    try equalBytes(f, "b", std.mem.sliceAsBytes(bi));
++}
++fn equalBytes(f: Fixture, name: []const u8, got: []const u8) !void {
++    const want = try f.bytes(name);
++    defer f.gpa.free(want);
++    if (!std.mem.eql(u8, want, got)) {
++        std.debug.print("FAIL loader {s}\n", .{name});
++        for (want, got, 0..) |w, g, i| if (w != g) {
++            std.debug.print("first diff at byte {d}: got {x:0>2} want {x:0>2}\n", .{ i, g, w });
++            break;
++        };
++        return error.OracleMismatch;
++    }
++}
+diff --git a/zig/tests/cuda/glm_p5/msa_check.zig b/zig/tests/cuda/glm_p5/msa_check.zig
+new file mode 100644
+index 00000000..b5a65b72
+--- /dev/null
++++ b/zig/tests/cuda/glm_p5/msa_check.zig
+@@ -0,0 +1,129 @@
++//! tf-glm-p5-msa: glm_msa.cu (Python msa.cu, TF_GLM_MSA=1) on the GPU against an fp32 host attention over the same FP8 rows.
++//!
++//!   tf-glm-p5-msa [ROWS] [CACHE_ROWS]
++//!
++//! For 16 heads (one m16 tile), 22 (TP=3's 22/21/21) and 32 (TP=2): random bf16 absorbed queries, a random FP8 latent
++//! cache (kv8 rows), ascending token lists of varying length (1, 15, 16, 17, 2051, ...). Checks (a) every row within a
++//! relative tolerance of the host reference, (b) row independence: a row computed alone (R=1) equals its bytes in the
++//! full launch, (c) rows with count 0 are left alone. GPU-only; run under the GPU lock. Exit 1 on any failure.
++const std = @import("std");
++const cuda = @import("cuda");
++const mla = @import("glm_cuda").mla;
++
++const lw = mla.lw;
++
++pub fn main(init: std.process.Init) !u8 {
++    const gpa = init.gpa;
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    const rows: usize = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 24;
++    const n_cache: usize = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 4096;
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    var msa = try mla.Msa.load(&driver);
++    defer msa.deinit();
++
++    var prng = std.Random.DefaultPrng.init(0x6d6c61);
++    const rnd = prng.random();
++    const w = mla.tokens;
++
++    // the cache
++    const cache = try gpa.alloc(u8, n_cache * mla.latent_row);
++    defer gpa.free(cache);
++    {
++        var x: [lw]f32 = undefined;
++        for (0..n_cache) |i| {
++            for (&x) |*v| v.* = mla.bf16((rnd.float(f32) - 0.5) * 8);
++            mla.quantizeRow(&x, cache[i * mla.latent_row ..][0..mla.latent_row]);
++        }
++    }
++    var d_cache = try cuda.DeviceBuffer.fromHost(&driver, cache);
++    defer d_cache.free();
++
++    var fails: usize = 0;
++    for ([_]usize{ 16, 22, 32 }) |h| {
++        const q = try gpa.alloc(f32, rows * h * lw);
++        defer gpa.free(q);
++        const qb = try gpa.alloc(u16, q.len);
++        defer gpa.free(qb);
++        for (q, qb) |*v, *b| {
++            v.* = mla.bf16((rnd.float(f32) - 0.5) * 2);
++            b.* = @intCast(@as(u32, @bitCast(v.*)) >> 16);
++        }
++        const toks = try gpa.alloc(i32, rows * w);
++        defer gpa.free(toks);
++        @memset(toks, -1);
++        const counts = try gpa.alloc(i32, rows);
++        defer gpa.free(counts);
++        const lens = [_]usize{ 1, 15, 16, 17, 100, 513, 2051, 0 };
++        for (0..rows) |r| {
++            const n = lens[r % lens.len];
++            counts[r] = @intCast(n);
++            // ascending distinct tokens
++            var t: usize = rnd.uintLessThan(usize, 3);
++            for (0..n) |i| {
++                toks[r * w + i] = @intCast(@min(t, n_cache - 1));
++                t += 1 + rnd.uintLessThan(usize, @max(1, (n_cache - t) / @max(1, n - i)));
++                if (t >= n_cache) t = n_cache - 1;
++            }
++        }
++        var d_q = try cuda.DeviceBuffer.fromHost(&driver, std.mem.sliceAsBytes(qb));
++        defer d_q.free();
++        var d_t = try cuda.DeviceBuffer.fromHost(&driver, std.mem.sliceAsBytes(toks));
++        defer d_t.free();
++        var d_c = try cuda.DeviceBuffer.fromHost(&driver, std.mem.sliceAsBytes(counts));
++        defer d_c.free();
++        var d_o = try cuda.DeviceBuffer.alloc(&driver, q.len * 2);
++        defer d_o.free();
++        const sentinel = try gpa.alloc(u16, q.len);
++        defer gpa.free(sentinel);
++        @memset(sentinel, 0x7777);
++        try d_o.upload(0, std.mem.sliceAsBytes(sentinel));
++        try msa.prompt(stream, d_q.ptr, d_cache.ptr, d_t.ptr, d_c.ptr, d_o.ptr, rows, h, w, mla.scale);
++        try stream.synchronize();
++        const out = try gpa.alloc(u16, q.len);
++        defer gpa.free(out);
++        try d_o.download(0, std.mem.sliceAsBytes(out));
++
++        var worst: f32 = 0;
++        var ref: [32 * lw]f32 = undefined;
++        for (0..rows) |r| {
++            const row = out[r * h * lw ..][0 .. h * lw];
++            if (counts[r] == 0) {
++                for (row) |v| if (v != 0x7777) {
++                    fails += 1;
++                    std.debug.print("FAIL h={d} row {d}: count 0 but written\n", .{ h, r });
++                    break;
++                };
++                continue;
++            }
++            try mla.msaReference(q[r * h * lw ..][0 .. h * lw], h, cache, toks[r * w ..], @intCast(counts[r]), mla.scale, &ref, gpa);
++            var mx: f32 = 0;
++            for (ref[0 .. h * lw]) |v| mx = @max(mx, @abs(v));
++            for (row, ref[0 .. h * lw]) |g, want| {
++                const got: f32 = @bitCast(@as(u32, g) << 16);
++                worst = @max(worst, @abs(got - want) / @max(mx, 1e-6));
++            }
++        }
++        const ok_ref = worst < 2e-2;
++        // (b) row independence: each row alone
++        var indep = true;
++        const one = try gpa.alloc(u16, h * lw);
++        defer gpa.free(one);
++        for (0..rows) |r| {
++            if (counts[r] == 0) continue;
++            var d_o1 = try cuda.DeviceBuffer.alloc(&driver, h * lw * 2);
++            defer d_o1.free();
++            try msa.prompt(stream, d_q.ptr + r * h * lw * 2, d_cache.ptr, d_t.ptr + r * w * 4, d_c.ptr + r * 4, d_o1.ptr, 1, h, w, mla.scale);
++            try stream.synchronize();
++            try d_o1.download(0, std.mem.sliceAsBytes(one));
++            if (!std.mem.eql(u16, one, out[r * h * lw ..][0 .. h * lw])) indep = false;
++        }
++        std.debug.print("{s} h={d}: worst relative error vs host {d:.5}; row independence {s}\n", .{ if (ok_ref and indep) "PASS" else "FAIL", h, worst, if (indep) "exact" else "BROKEN" });
++        if (!ok_ref or !indep) fails += 1;
++    }
++    return if (fails == 0) 0 else 1;
++}
+diff --git a/zig/tests/cuda/glm_prefill_check.zig b/zig/tests/cuda/glm_prefill_check.zig
+new file mode 100644
+index 00000000..efa6c34d
+--- /dev/null
++++ b/zig/tests/cuda/glm_prefill_check.zig
+@@ -0,0 +1,9 @@
++//! tools/zig/glm_prefill_dump.py version 2 byte comparison. CPU-only; no CUDA driver is opened.
++const std = @import("std");
++const glm = @import("glm_cuda");
++pub fn main(init: std.process.Init) !void {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len != 3) return error.ExpectedReferenceAndActualDirectories;
++    try glm.prefill_check.compareDirectories(init.gpa, init.io, args[1], args[2]);
++    std.debug.print("PASS: all 45 prompt-chunk layers match byte for byte\n", .{});
++}

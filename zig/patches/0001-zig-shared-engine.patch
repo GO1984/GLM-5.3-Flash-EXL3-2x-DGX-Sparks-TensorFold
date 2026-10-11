@@ -1,0 +1,1630 @@
+TensorFold v1.0.7..7a2461b2 (glm-v107-perf): shared-engine
+Apply from the checkout root with: git apply 0001-zig-shared-engine.patch
+
+diff --git a/.gitignore b/.gitignore
+index ed482c2e..4a3024f3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,6 +15,7 @@ venv/
+ .zig-toolchain
+ .zig-cache/
+ zig-out/
++/glm-capture*/
+ 
+ # Native Qwen CPU-only Metal compiler receipts.
+ .q27-metal-check/
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 7f19ad92..3db9dfbe 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -3,7 +3,7 @@
+ const std = @import("std");
+ 
+ /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
+-const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
++const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, optional: bool = false, arch_specific: bool = false };
+ 
+ /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
+ const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
+@@ -12,6 +12,15 @@ const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
+ const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=true", "--prec-sqrt=true" };
+ 
+ const kernels = [_]Kernel{
++    // GLM package images: optional until their owning packages supply the CUDA sources.
++    .{ .name = "glm_ops", .flags = torch_ops },
++    .{ .name = "glm_foundations", .flags = &.{"-O3"} },
++    .{ .name = "glm_kda", .optional = true, .flags = &.{ "-O3", "--fmad=false" } },
++    .{ .name = "glm_kda_chunk", .optional = true, .flags = &.{ "-O3", "--fmad=false" } },
++    .{ .name = "glm_hc", .optional = true, .flags = &.{"-O3"} },
++    .{ .name = "glm_exl3", .optional = true, .flags = &.{"-O3"} },
++    .{ .name = "glm_qmm", .optional = true, .flags = &.{"-O3"} },
++    .{ .name = "glm_qmm_prefill", .optional = true, .flags = &.{"-O3"} },
+     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
+     .{ .name = "probe", .flags = &.{"-O3"} },
+     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
+@@ -42,6 +51,26 @@ const kernels = [_]Kernel{
+     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
+     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
+     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
++    // Flash Next (qwen4_exp): copies of its extensions' device code (zig/tests/cuda/copies.py), the same flags
++    .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
++    .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
++    .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
++    .{ .name = "fn_gdn_tree", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
++    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"} }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
++    .{ .name = "fn_qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
++    .{ .name = "fn_qmm_prefill", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
++    .{ .name = "fn_pack", .flags = &.{"-O3"} }, // ours: the n-gram table's GPU gather (flashnext/cuda_weights.zig)
++    .{ .name = "torch_fn_ops", .src = "torch_ops/fn_ops", .flags = torch_ops }, // ours: Flash Next torch ops (SwiGLU, sampler packing)
++    .{ .name = "torch_fn_logsumexp", .src = "torch_ops/fn_logsumexp", .flags = torch_ops }, // ours: torch.logsumexp in ATen's order
++    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"} }, // ours: routed NVFP4 experts reading weights once a prompt call (fn_nvfp4_experts' bits)
++    // INT4-AutoRound checkpoint (GPTQ int4 experts and head, 128x128-block FP8 dense linears)
++    .{ .name = "fn_qmmf", .flags = &.{"-O3"} }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
++    .{ .name = "fn_int4", .flags = &.{"-O3"} }, // ours: GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
++    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"} }, // ours (decode D3): fn_nvfp4_experts' unit arithmetic in other launch shapes
++    .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // ours (decode D5): qmm_kernel's K-slice cluster forms for the MTP head in 4-bit
++    .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce.zig)
++    // GLM-5.3-Flash (glm5_next), P5 MLA/DSA: the only CUDA in the attention path (the rest is Triton, replayed from cubins)
++    .{ .name = "glm_msa", .flags = &.{ "-O3", "-lineinfo" } }, // glm5_next/cuda/msa.py, tensorfold_glm_flash_msa_v2 (TF_GLM_MSA=1)
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -63,16 +92,27 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
+     const options = b.addOptions();
+     var with = images.len > 0;
+-    for (images) |i| with = with and i != null;
++    if (images.len > 0) for (kernels, images) |k, i| {
++        if (!k.optional) with = with and i != null;
++    };
++    for (kernels, 0..) |k, i| if (k.optional) {
++        options.addOption(bool, k.name, images.len > 0 and images[i] != null);
++    };
+     options.addOption(bool, "with_kernels", with);
+     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     cuda.addOptions("kernel_options", options);
++    // the one-shot RoCE all-gather's proxy (decode D1): plain C over libibverbs' header, the library opened at run time
++    // (roce_proxy_stub.c, which refuses every open, where /usr/include has no infiniband/verbs.h)
++    const verbs = if (std.Io.Dir.accessAbsolute(b.graph.io, "/usr/include/infiniband/verbs.h", .{})) |_| true else |_| false;
++    cuda.addCSourceFile(.{ .file = b.path(if (verbs) "zig/src/cuda/roce_proxy.c" else "zig/src/cuda/roce_proxy_stub.c"), .flags = &.{ "-std=gnu11", "-O2", "-idirafter", "/usr/include" } });
+     cuda.addImport("stagger", stagger(b, target, optimize));
+-    if (with) for (kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
++    if (images.len > 0) for (kernels, images) |k, image| {
++        if (image) |file| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = file });
++    };
+     return cuda;
+ }
+ 
+-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
++fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, glm_cuda: *std.Build.Module, glm: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     core.addImport("tokenizer", tokenizer);
+@@ -84,7 +124,20 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
+     nemotron.addImport("lanes", lanes);
+     nemotron.addImport("heat", heat);
+     nemotron.addImport("nemotron_draft_ids", draft_ids);
+-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .heat = heat };
++    // Flash Next on CUDA: its root sits beside the Metal family's host files (config.zig), which it shares
++    const flashnext = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    flashnext.addImport("cuda", cuda);
++    flashnext.addImport("core", core);
++    flashnext.addImport("lanes", lanes);
++    const glm_cuda = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_cuda/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    glm_cuda.addImport("cuda", cuda);
++    glm_cuda.addImport("core", core);
++    glm_cuda.addImport("lanes", lanes);
++    glm_cuda.addImport("flashnext", flashnext);
++    // cuda_mla.zig stays a root so its host tests keep running; the family root re-exports it as mla.
++    const glm = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_cuda/cuda_mla.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    glm.addImport("cuda", cuda);
++    return .{ .glm_cuda = glm_cuda, .glm = glm, .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer, .heat = heat };
+ }
+ 
+ /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
+@@ -103,20 +156,29 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
+     for (kernels, &images) |k, *image| {
+         if (prebuilt) |dir| {
+-            image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
++            const path = b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) });
++            if (!k.optional or exists(b, path)) image.* = b.graph.cwdRelativePath(path);
+         } else if (nvcc) |tool| {
+-            image.* = fatbin(b, tool, version.?, k, sms);
++            if (!k.optional or exists(b, b.fmt("zig/kernels/cuda/{s}.cu", .{k.src orelse k.name}))) image.* = fatbin(b, tool, version.?, k, sms);
+         }
+         if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
+     }
+     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
++    const glm_matmuls = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_cuda/cuda_matmuls.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    glm_matmuls.addImport("cuda", cuda);
+     const mods = family(b, target, optimize, cuda, draft_ids);
++    const glm_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_p23_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
++    b.step("glm-matmuls", "Build tf-glm-matmuls: byte-check P2/P3 Python fixtures (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-matmuls", .root_module = glm_check }), .{}).step);
++    const glm_p1 = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_p1/replay.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
++    b.step("glm-p1-replay", "Build tf-glm-p1-replay: byte-check captured Python Triton pointer spans (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-p1-replay", .root_module = glm_p1 }), .{}).step);
+     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+     cli.addImport("cuda", cuda);
+     cli.addImport("core", mods.core);
+     cli.addImport("lanes", mods.lanes);
+     cli.addImport("nemotron", mods.nemotron);
+-    const native = engines(b, target, optimize, cuda, mods.lanes, mods.nemotron);
++    cli.addImport("flashnext", mods.flashnext);
++    cli.addImport("glm_cuda", mods.glm_cuda);
++    const native = engines(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.glm_cuda);
+     cli.addOptions("build_options", build_options);
+     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines));
+     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
+@@ -125,18 +187,32 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     runner.addImport("lanes", mods.lanes);
+     runner.addImport("nemotron", mods.nemotron);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+-    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
++    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.glm_cuda, mods.tokenizer, build_options, true).root_module.strip = strip;
++    // Flash Next's two-rank transport test (zig/tests/cuda/flashnext/box/comm.sh): its own step, not in `install`
++    const comm_test = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/comm_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
++    b.step("flashnext-comm", "tf-flashnext-comm RANK MASTER PORT: two-rank all-gathers, exact and timed").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-comm", .root_module = comm_test }), .{}).step);
++    // Flash Next's weights against the oracle's digests (zig/tests/cuda/flashnext/weights_check.zig): its own step
++    const weights_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
++    const hc_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_hc_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
++    b.step("glm-hc-check", "Build tf-glm-hc-check: HC partial byte oracle (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-hc-check", .root_module = hc_check }), .{}).step);
++    // GLM P5: glm_msa.cu on the GPU against the host attention (zig/tests/cuda/glm_p5/msa_check.zig): its own step
++    const msa_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_p5/msa_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
++    b.step("glm-p5-msa", "tf-glm-p5-msa [ROWS] [CACHE_ROWS]: glm_msa.cu against the host attention, row independence").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-p5-msa", .root_module = msa_check }), .{}).step);
++    b.step("flashnext-weights", "tf-flashnext-weights SNAPSHOT [WEIGHTS.json]: the loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-weights", .root_module = weights_check }), .{}).step);
++    // GLM KDA: chain vs wide vs replay, and a segmented window vs a solo run of each segment (needs the fatbins)
++    const kda_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_kda_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm", .module = mods.glm_cuda } } });
++    b.step("glm-kda", "tf-glm-kda: KDA chain vs replay, segments vs solo, chunk launch (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-kda", .root_module = kda_check }), .{}).step);
+ }
+ 
+ /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
+-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
++fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, glm_cuda: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+         .optimize = optimize,
+         .link_libc = true,
+-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
++        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "flashnext", .module = flashnext }, .{ .name = "glm_cuda", .module = glm_cuda } },
+     });
+     return .{ .api = api, .engines = mod };
+ }
+@@ -147,8 +223,8 @@ fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
+ }
+ 
+ /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
+-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
+-    const m = engines(b, target, optimize, cuda, lanes, nemotron);
++fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, glm_cuda: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
++    const m = engines(b, target, optimize, cuda, lanes, nemotron, flashnext, glm_cuda);
+     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
+     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
+@@ -176,7 +252,30 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
+     const cuda = runtime(b, host, .debug, &.{});
+     const mods = family(b, host, .debug, cuda, draft_ids);
+-    const native_modules = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron);
++    const layer_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_layer_check.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm_cuda", .module = mods.glm_cuda }} });
++    b.step("glm-layer-check", "Build tf-glm-layer-check REFERENCE_DIR ACTUAL_DIR (CPU byte oracle)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-layer-check", .root_module = layer_tool }), .{}).step);
++    const prefill_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_prefill_check.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm_cuda", .module = mods.glm_cuda }} });
++    b.step("glm-prefill-check", "Build tf-glm-prefill-check REFERENCE_DIR ACTUAL_DIR (prompt chunk byte oracle)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-prefill-check", .root_module = prefill_tool }), .{}).step);
++    const glm_test = b.addRunArtifact(b.addTest(.{ .root_module = mods.glm_cuda }));
++    b.step("test-glm-cuda-host", "GLM CUDA CPU contracts (foundations, packed sampling, rounds, lanes)").dependOn(&glm_test.step);
++    const serve_test = b.step("test-glm-serve", "GLM serving and drafted-versus-serial CPU contracts");
++    serve_test.dependOn(&glm_test.step);
++    const cli_tests = b.createModule(.{
++        .root_source_file = b.path("zig/src/cli/glm_cuda.zig"),
++        .target = host,
++        .optimize = .debug,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } },
++    });
++    const cli_test = b.addRunArtifact(b.addTest(.{ .root_module = cli_tests }));
++    step.dependOn(&cli_test.step);
++    serve_test.dependOn(&cli_test.step);
++    b.step("test-glm-p9", "GLM DFlash2 and copy draft CPU contracts").dependOn(&glm_test.step);
++    b.step("test-glm-p7", "GLM sampling/commit/rounds CPU fixtures").dependOn(&glm_test.step);
++    b.step("test-glm-layer-check", "P6 forward and layer byte oracle host contracts").dependOn(&glm_test.step);
++    b.step("test-glm-prefill-check", "P8 prompt chunk planner and layer byte oracle host contracts").dependOn(&glm_test.step);
++    step.dependOn(&glm_test.step);
++    const native_modules = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.glm_cuda);
+     const native = native_modules.engines;
+     // the HTTP server's unit tests (zig/src/server/root.zig), which the macOS build runs, on Linux hosts too
+     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .debug, .link_libc = true });
+@@ -189,13 +288,29 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     });
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     step.dependOn(&server_test.step);
++    serve_test.dependOn(&server_test.step);
+     b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU").dependOn(&server_test.step);
+-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    const glm_weights_mod = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/glm_cuda/glm_cuda.zig"),
++        .target = host,
++        .optimize = .debug,
++        .link_libc = true,
++        .imports = &.{.{ .name = "core", .module = mods.core }},
++    });
++    const glm_weights = b.addRunArtifact(b.addTest(.{ .root_module = glm_weights_mod }));
++    b.step("test-glm-weights", "GLM-5.3-Flash CUDA config and EXL3 weight-plan tests (CPU, headers only)").dependOn(&glm_weights.step);
++    step.dependOn(&glm_weights.step);
++    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, mods.glm, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    const glm_mm = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_cuda/cuda_matmuls.zig"), .target = host, .optimize = .debug, .link_libc = true });
++    glm_mm.addImport("cuda", cuda);
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm_mm })).step);
+     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
+     cli.addImport("cuda", cuda);
+     cli.addImport("core", mods.core);
+     cli.addImport("lanes", mods.lanes);
+     cli.addImport("nemotron", mods.nemotron);
++    cli.addImport("flashnext", mods.flashnext);
++    cli.addImport("glm_cuda", mods.glm_cuda);
+     cli.addOptions("build_options", build_options);
+     cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines));
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+@@ -222,11 +337,12 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
+ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, prebuilt: ?[]const u8) *std.Build.Step.Compile {
+     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
+     if (prebuilt) |dir| for (kernels, &images) |k, *image| {
+-        image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
++        const path = b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) });
++        if (!k.optional or exists(b, path)) image.* = b.graph.cwdRelativePath(path);
+     };
+     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
+     const mods = family(b, target, .fast, cuda, draft_ids);
+-    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, false);
++    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.glm_cuda, mods.tokenizer, build_options, false);
+ }
+ 
+ /// SASS targets every release fatbin holds: Ampere (sm_86), RTX 50 and RTX PRO Blackwell (sm_120), GB10 (sm_121).
+@@ -237,6 +353,14 @@ pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
+     const tool = b.addExecutable(.{ .name = "check-fatbins", .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = b.graph.host }) });
+     const check = b.addRunArtifact(tool);
+     check.addArg(release_sms);
+-    for (kernels) |k| check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
++    for (kernels) |k| {
++        if (k.optional) continue;
++        check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
++    }
+     return &check.step;
+ }
++
++fn exists(b: *std.Build, path: []const u8) bool {
++    std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
++    return true;
++}
+diff --git a/zig/src/cli/cuda_main.zig b/zig/src/cli/cuda_main.zig
+index 88a205f7..63dee906 100644
+--- a/zig/src/cli/cuda_main.zig
++++ b/zig/src/cli/cuda_main.zig
+@@ -11,7 +11,9 @@ const precision = @import("cuda_precision.zig");
+ const shared_checks = @import("cuda_shared_checks.zig");
+ const checkpoint_cli = @import("checkpoint_cli");
+ const lanes_cli = @import("cuda_lanes.zig");
++const glm_cli = @import("glm_cuda.zig");
+ const segments_cli = @import("cuda_segments.zig");
++const flashnext_cli = @import("flashnext_cuda.zig");
+ const train_check = @import("cuda_train_check.zig");
+ const decode = nemotron.decode;
+ 
+@@ -68,6 +70,9 @@ pub fn main(init: std.process.Init) !u8 {
+         std.debug.print("{s}", .{usage});
+         return 2;
+     }
++    // Flash Next (qwen4_exp) checkpoints take their own commands (flashnext_cuda.zig)
++    if (flashnext_cli.wants(gpa, init.io, args[2])) return flashnext_cli.main(init, args);
++    if (glm_cli.wants(gpa, init.io, args[2])) return glm_cli.main(init, args);
+     var opts = Options{ .model = args[2] };
+     var positional: std.ArrayList([]const u8) = .empty;
+     defer positional.deinit(gpa);
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index f72c13b2..8f917032 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -216,7 +216,8 @@ pub const Open = struct {
+ };
+ 
+ /// An opened engine; ``close`` stops its thread and frees its backend.
+-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
++/// ``follow``: a rank other than 0 runs it instead of serving, until rank 0 stops (two-rank engines only).
++pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, follow: ?*const fn (ctx: *anyopaque) anyerror!void = null };
+ 
+ pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
+ 
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 09ff0fa2..3b300282 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -91,7 +91,18 @@ pub const LaneHost = struct {
+         return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+     }
+ 
++    /// The lane core's word that a filling prompt is in (or its fill ended): emit `prefilled`, or end the job.
++    fn filled(ptr: *anyopaque, s: *lanes.Stream, err: ?anyerror) void {
++        const h: *LaneHost = @ptrCast(@alignCast(ptr));
++        const job: *Job = @alignCast(@fieldParentPtr("stream", s));
++        const e = err orelse return h.prefilled(job, job.began); // the run loop delivers its tokens
++        if (e == error.Cancelled) {
++            _ = h.cancel(job);
++        } else _ = h.drop(job, @errorName(e));
++    }
++
+     pub fn start(h: *LaneHost) !void {
++        h.core.fill_hook = .{ .ptr = h, .done = filled };
+         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+     }
+ 
+@@ -267,25 +278,28 @@ pub const LaneHost = struct {
+         h.mutex.unlock(h.io);
+     }
+ 
+-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+-    fn admitOne(h: *LaneHost) bool {
++    const Prep = union(enum) { none, dropped, job: *Job };
++
++    /// Takes the next queued request into a free lane and builds its stream, not yet prefilled: `none` when none waits
++    /// or no lane is free, `dropped` when it ended here.
++    fn admitPrepare(h: *LaneHost) Prep {
+         h.lock();
+         if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
+             h.unlock();
+-            return false;
++            return .none;
+         }
+         if (h.info_.admit) |a| { // a shared cache pool: the next request waits for room (always there when idle)
+             const r = h.queued.items[0].request;
+             if (h.core.activeCount() > 0 and !a.fits(a.ctx, @intCast(r.prompt.len), r.max_tokens)) {
+                 h.unlock();
+-                return false;
++                return .none;
+             }
+         }
+         const job = h.queued.orderedRemove(0);
+         h.admitted.append(h.gpa, job) catch {
+             h.unlock();
+             h.finish(job, .failed, "out of memory");
+-            return true;
++            return .dropped;
+         };
+         h.unlock();
+         const r = job.request;
+@@ -297,7 +311,7 @@ pub const LaneHost = struct {
+             job.marks = l.marks;
+             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+         } else |_| {};
+-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
++        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.droppedJob(job, "the drafter could not start");
+         job.stream = lanes.Stream.init(h.gpa, .{
+             .id = "request",
+             .prompt = r.prompt,
+@@ -320,23 +334,112 @@ pub const LaneHost = struct {
+             .reuse = reuse,
+             .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
+                 job.proposer.deinit();
+-                return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
++                return h.droppedJob(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+             } else null,
+             .decode_spans = h.spans(r),
+             .decide = r.decide,
+         }) catch {
+             job.proposer.deinit();
+-            return h.drop(job, "out of memory");
++            return h.droppedJob(job, "out of memory");
+         };
+         job.started = true;
++        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        return .{ .job = job };
++    }
++
++    fn droppedJob(h: *LaneHost, job: *Job, message: []const u8) Prep {
++        _ = h.drop(job, message);
++        return .dropped;
++    }
++
++    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
++    fn admitOne(h: *LaneHost) bool {
++        switch (h.admitPrepare()) {
++            .none => return false,
++            .dropped => return true,
++            .job => |job| return h.startJob(job),
++        }
++    }
++
++    /// Every request waiting for a lane, admitted now: prompts that arrive together (a burst, with no resume or kept
++    /// state to take) prefill in one backend call, where the backend can (one pass over their rows).
++    fn admitAll(h: *LaneHost) void {
++        var burst: [16]*Job = undefined;
++        var n: usize = 0;
++        while (true) switch (h.admitPrepare()) {
++            .none => break,
++            .dropped => {},
++            .job => |job| {
++                const r = job.request;
++                if (r.max_tokens == 0 or h.loneFits(job)) {
++                    _ = h.startJob(job);
++                } else if (n < burst.len and h.core.batches() and job.stream.reuse.at == 0 and
++                    job.stream.reuse.marks.len == 0 and r.logprobs == null and r.structure == null)
++                {
++                    burst[n] = job;
++                    n += 1;
++                } else _ = h.startJob(job);
++            },
++        };
++        h.startBurst(burst[0..n]);
++    }
++
++    /// The jobs' prompts in one backend call, then each joined and delivered in admission order; a refused burst
++    /// prefills one at a time.
++    fn startBurst(h: *LaneHost, jobs: []*Job) void {
++        if (jobs.len == 0) return;
++        if (jobs.len == 1) {
++            _ = h.startJob(jobs[0]);
++            return;
++        }
++        var ss: [16]*lanes.Stream = undefined;
+         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+-        job.began = began;
++        for (jobs, ss[0..jobs.len]) |job, *s| {
++            job.began = began;
++            s.* = &job.stream;
++        }
++        h.core.prefillBurst(ss[0..jobs.len]) catch |e| {
++            for (jobs) |job| {
++                if (e == error.BurstRefused) _ = h.startJob(job) else if (e == error.Cancelled) _ = h.cancel(job) else _ = h.drop(job, @errorName(e));
++            }
++            return;
++        };
++        for (jobs) |job| {
++            h.core.addPrefilled(&job.stream) catch |e| {
++                _ = switch (e) {
++                    error.Cancelled => h.cancel(job),
++                    else => h.drop(job, h.words(e)),
++                };
++                continue;
++            };
++            h.prefilled(job, began);
++            if (h.deliver(job)) h.remove(job);
++        }
++    }
++
++    /// One prepared job: its prompt prefilled alone (or its fill started), delivered.
++    fn startJob(h: *LaneHost, job: *Job) bool {
++        const r = job.request;
++        const began = job.began;
+         if (r.max_tokens == 0 and h.info_.warm_turns) return h.warmPass(job, began);
+         if (h.loneFits(job)) return h.runLone(job, began);
+         if (h.core.fills()) {
+             h.filling.append(h.gpa, job) catch return h.drop(job, "out of memory");
+             return true;
+         }
++        // a backend that fills prompts between rounds starts this one and admits the next (prompts that arrive
++        // together fill together); the fill hook reports it in
++        if (h.core.slices()) {
++            const filling = h.core.beginStream(&job.stream) catch |e| return switch (e) {
++                error.Cancelled => h.cancel(job),
++                error.LaneMemory => h.requeue(job),
++                else => h.drop(job, h.words(e)),
++            };
++            if (filling) return true;
++            h.prefilled(job, began);
++            if (h.deliver(job)) h.remove(job);
++            return true;
++        }
+         h.core.addStream(&job.stream) catch |e| return switch (e) {
+             error.Cancelled => h.cancel(job),
+             error.LaneMemory => h.requeue(job),
+@@ -423,7 +526,7 @@ pub const LaneHost = struct {
+         if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
+         h.lock();
+         defer h.unlock();
+-        return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0;
++        return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0 and h.core.fillingCount() == 0;
+     }
+ 
+     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
+@@ -525,7 +628,7 @@ pub const LaneHost = struct {
+     fn run(h: *LaneHost) void {
+         while (true) {
+             h.takeCancels();
+-            while (h.admitOne()) {}
++            h.admitAll();
+             h.fillOne();
+             status.noteLive(h);
+             h.lock();
+@@ -540,7 +643,7 @@ pub const LaneHost = struct {
+                 h.closeAll();
+                 continue;
+             }
+-            if (h.core.activeCount() == 0) {
++            if (h.core.activeCount() == 0 and h.core.fillingCount() == 0) {
+                 if (h.filling.items.len > 0) {
+                     h.unlock();
+                     continue;
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 549121dd..997d9049 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -314,3 +314,64 @@ test "a learn step that moves the weights drops every kept state: the next turn
+     try std.testing.expectEqual(@as(?u32, 0), b2.cached);
+     try std.testing.expectEqual(@as(u64, 0), store.counts.hits);
+ }
++
++test "a lane host fills prompts between rounds: requests arriving together fill together, each reply its own" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .slice = 2 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backendSliced(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        prefilled: bool = false,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .prefilled => b.prefilled = true,
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| b.done = f.reason,
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const prompts = [_][]const u32{ &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8 }, &.{ 2, 7, 1, 8, 2, 8 }, &.{ 1, 6, 1, 8, 0, 3, 3, 9, 8, 8, 7, 4, 9, 8 } };
++    var boxes: [3]Box = .{ .{}, .{}, .{} };
++    defer for (&boxes) |*b| b.tokens.deinit(gpa);
++    var reqs: [3]Request = undefined;
++    const e = host.engine();
++    for (prompts, &reqs, 0..) |p, *r, i| {
++        r.* = .{ .prompt = p, .max_tokens = 10 + @as(u32, @intCast(i)) * 5 };
++        try e.submit(@intCast(i + 1), r, .{ .ctx = &boxes[i], .event = Box.event });
++    }
++    for (prompts, &boxes, &reqs) |p, *b, r| {
++        try std.testing.expectEqual(Reason.length, b.wait());
++        try std.testing.expect(b.prefilled);
++        try std.testing.expectEqual(@as(usize, r.max_tokens), b.tokens.items.len);
++        var history: std.ArrayList(u32) = .empty; // the fake's tokens read the whole history: any slip changes them
++        defer history.deinit(gpa);
++        try history.appendSlice(gpa, p);
++        for (b.tokens.items) |t| {
++            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++            try history.append(gpa, t);
++        }
++    }
++    try std.testing.expect(target.fill_steps > 0);
++}
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 9d8d9d33..5957466d 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -5,6 +5,9 @@ const Shape = @import("shape.zig").Shape;
+ const Held = @import("stream.zig").Held;
+ const Row = @import("logprob.zig").Row;
+ 
++/// A filling stream's state after a fill_step.
++pub const FillState = enum { filling, done, cancelled };
++
+ /// A token to feed: one the backend drew and holds (a handle), or a host value (forced or pending).
+ pub const Feed = union(enum) { handle: u64, value: u32 };
+ 
+@@ -100,6 +103,18 @@ pub const Backend = struct {
+         held: ?*const fn (ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void = null,
+         /// The stream left the rounds: free its caches and held drafts.
+         release: *const fn (ptr: *anyopaque, s: *Stream) void,
++        /// Incremental prompt fills (prefill_begin and fill_step), both or neither (null: `prefill` runs a whole prompt at
++        /// admission). Start the
++        /// stream's prompt pass (its admission and caches) without running it.
++        prefill_begin: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
++        /// One slice of every filling stream's prompt pass, between rounds (prompts may share a pass): each one's
++        /// state after it (`done`: its prompt is in and `first` draws its first token; `cancelled`: its request
++        /// was cancelled, the backend stopped its pass). An error fails every filling stream.
++        fill_step: ?*const fn (ptr: *anyopaque, streams: []const *Stream, states: []FillState) anyerror!void = null,
++        /// Prefill several streams' prompts together (a burst admitted at once: prompts may share one pass), each as
++        /// `prefill` does it, ending at the same state; the core then joins each. `error.BurstRefused`: nothing ran
++        /// (a stream was refused or the burst does not fit one pass), prefill them one at a time.
++        prefill_many: ?*const fn (ptr: *anyopaque, streams: []const *Stream) anyerror!void = null,
+     };
+ 
+     pub fn prefill(b: Backend, s: *Stream) !void {
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 85361bd8..45ec7188 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -30,6 +30,9 @@ pub const Model = struct {
+     max_streams: u32 = 0, // a shared forward's streams at most (0: 32)
+     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
+     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
++    draft_stops: bool = false, // the head stops each chain itself (a running-product rule): ask the most drafts
++    draft_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live
++    join_batch: bool = false, // a joining stream's first drafts may wait for the next round (the prompt's last row is kept a stream)
+     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+@@ -50,6 +53,9 @@ pub const Config = struct {
+     batch_rows: u32,
+     batch_streams: u32,
+     node_probabilities: bool,
++    head_stops: bool = false, // the head stops each chain itself: every ask is the most drafts the room allows
++    head_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live
++    join_batch: bool = false, // joiners' first drafts go out together before the next round (first tokens first)
+     fill_lanes: u32 = 0, // rows a window may grow to with suffix-match branches (0: off; lanes/fill.zig)
+     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
+     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
+@@ -113,6 +119,9 @@ pub const Config = struct {
+             .batch_rows = batch_rows,
+             .batch_streams = if (streams) (if (m.max_streams != 0) m.max_streams else 32) else 1,
+             .node_probabilities = m.draft_probabilities,
++            .head_stops = m.draft_stops,
++            .head_stops_most = m.draft_stops_most,
++            .join_batch = m.join_batch,
+             .draft_streams = m.draft_streams,
+             .head_trees = m.head_trees,
+             .depth_prior = depth_prior,
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 78185920..0637002b 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -55,6 +55,12 @@ pub const Rule = struct {
+     mtp_step_ms: f64,
+     plain_guard: bool,
+     node_probabilities: bool,
++    /// the head stops each chain by its own rule (a running product of its draws' probabilities): every ask is the
++    /// most drafts the stream's room allows, and the head's stops are the depth (no acceptance-rate guess cuts them)
++    head_stops: bool = false,
++    /// ... while at most this many streams are live (`live`, which the round loop sets each step)
++    head_stops_most: u32 = std.math.maxInt(u32),
++    live: usize = 0,
+     batch_rows: u32,
+     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
+     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
+@@ -124,10 +130,16 @@ pub const Rule = struct {
+         return modeled;
+     }
+ 
++    /// Whether the head's own stops size the chains this step (head_stops, and few enough live streams).
++    pub fn stopsNow(r: *const Rule) bool {
++        return r.head_stops and r.live <= r.head_stops_most;
++    }
++
+     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
+     pub fn depth(r: *Rule, who: Who) !i64 {
+         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
+         if (most <= 0) return 0;
++        if (r.stopsNow()) return most;
+         const p = try r.rates(who);
+         if (r.family_costs.empty()) {
+             const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
+@@ -188,6 +200,11 @@ pub const Rule = struct {
+ 
+     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
+     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, out: []i64) !void {
++        if (r.stopsNow()) {
++            // the head's own stops size each chain: no allocation over guessed acceptance
++            for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
++            return;
++        }
+         if (r.node_probabilities) {
+             for (whos, out) |*w, *o| {
+                 const inner = try r.headDepth(w, null, probe);
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 4339af40..3c384bd8 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -25,6 +25,10 @@ const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follo
+ const Result = struct { rows: u32, keep: u32, got: []const u32 };
+ const Unread = struct { event: usize, handle: u64 };
+ 
++/// The host's hook for incremental fills: `err` null once the stream joined the rounds (or finished at its first
++/// token), else why its fill ended (error.Cancelled for a cancel); the stream is then released.
++pub const FillHook = struct { ptr: *anyopaque, done: *const fn (ptr: *anyopaque, s: *Stream, err: ?anyerror) void };
++
+ pub const Engine = struct {
+     gpa: Allocator,
+     cfg: *const Config,
+@@ -40,6 +44,8 @@ pub const Engine = struct {
+     steps: u64 = 0,
+     arena: std.heap.ArenaAllocator, // a round's temporaries
+     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
++    filling: std.ArrayList(*Stream) = .empty, // streams whose prompts fill between rounds (backends with fill_step)
++    fill_hook: ?FillHook = null, // told when a filling stream's prompt is in (null error) or its fill ended without it
+ 
+     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
+         return .{
+@@ -58,6 +64,8 @@ pub const Engine = struct {
+                 .mtp_step_ms = cfg.mtp_step_ms,
+                 .plain_guard = cfg.plain_guard,
+                 .node_probabilities = cfg.node_probabilities,
++                .head_stops = cfg.head_stops,
++                .head_stops_most = cfg.head_stops_most,
+                 .batch_rows = cfg.batch_rows,
+             },
+         };
+@@ -65,6 +73,7 @@ pub const Engine = struct {
+ 
+     pub fn deinit(e: *Engine) void {
+         e.live.deinit(e.gpa);
++        e.filling.deinit(e.gpa);
+         e.unread.deinit(e.gpa);
+         e.rule.deinit();
+         e.arena.deinit();
+@@ -82,6 +91,100 @@ pub const Engine = struct {
+     pub const fills = open.fills;
+     pub const fillStream = open.fillStream;
+ 
++    /// Whether the backend prefills a burst of prompts together.
++    pub fn batches(e: *const Engine) bool {
++        return e.backend.vtable.prefill_many != null and !e.slices();
++    }
++
++    /// Prefill several streams' prompts in one backend call (`batches`); each is then joined with `addPrefilled`.
++    /// `error.BurstRefused`: nothing ran, `addStream` them one at a time.
++    pub fn prefillBurst(e: *Engine, ss: []const *Stream) !void {
++        _ = e.arena.reset(.retain_capacity);
++        for (ss) |s| try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
++        const many = e.backend.vtable.prefill_many orelse return error.BurstRefused;
++        many(e.backend.ptr, ss) catch |err| {
++            if (err == error.Cancelled) for (ss) |s| e.backend.release(s);
++            return err;
++        };
++    }
++
++    /// A stream prefilled by `prefillBurst`: draw its first token and ask for its first drafts (addStream's second half).
++    pub fn addPrefilled(e: *Engine, s: *Stream) !void {
++        return e.opened(s);
++    }
++
++    /// Whether the backend fills prompts in slices between rounds (prefill_begin and fill_step).
++    pub fn slices(e: *const Engine) bool {
++        return e.backend.vtable.prefill_begin != null and e.backend.vtable.fill_step != null;
++    }
++
++    /// Admit a stream: with incremental fills its prompt starts filling (true; `fill_hook` hears when it is in),
++    /// else addStream prefills it now (false).
++    pub fn beginStream(e: *Engine, s: *Stream) !bool {
++        if (!e.slices()) {
++            try e.addStream(s);
++            return false;
++        }
++        _ = e.arena.reset(.retain_capacity);
++        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
++        e.backend.vtable.prefill_begin.?(e.backend.ptr, s) catch |err| {
++            if (err == error.Cancelled) e.backend.release(s);
++            return err;
++        };
++        e.filling.append(e.gpa, s) catch |err| {
++            e.backend.release(s);
++            return err;
++        };
++        return true;
++    }
++
++    /// Streams whose prompts are still filling.
++    pub fn fillingCount(e: *const Engine) usize {
++        return e.filling.items.len;
++    }
++
++    /// One slice of every filling prompt; a prompt that is in joins the rounds (its first token, first drafts).
++    fn advanceFills(e: *Engine) !void {
++        const n = e.filling.items.len;
++        const streams = try e.gpa.dupe(*Stream, e.filling.items);
++        defer e.gpa.free(streams);
++        const states = try e.gpa.alloc(be.FillState, n);
++        defer e.gpa.free(states);
++        @memset(states, .filling);
++        e.backend.vtable.fill_step.?(e.backend.ptr, streams, states) catch |err| {
++            e.filling.clearRetainingCapacity();
++            for (streams) |s| e.endFill(s, err, false);
++            return;
++        };
++        var kept: usize = 0;
++        for (streams, states) |s, st| {
++            if (st == .filling) {
++                e.filling.items[kept] = s;
++                kept += 1;
++            }
++        }
++        e.filling.shrinkRetainingCapacity(kept);
++        for (streams, states) |s, st| switch (st) {
++            .filling => {},
++            .cancelled => e.endFill(s, error.Cancelled, false),
++            .done => {
++                if (e.opened(s)) |_| {
++                    if (e.fill_hook) |h| h.done(h.ptr, s, null);
++                } else |err| e.endFill(s, err, err == error.Cancelled); // a cancel at its end released it already
++            },
++        };
++    }
++
++    /// A fill that ended without its stream joining: the stream is released and the host told why.
++    fn endFill(e: *Engine, s: *Stream, err: anyerror, released: bool) void {
++        if (!s.finished) {
++            s.finished = true;
++            s.reason = if (err == error.Cancelled) .cancelled else .@"error";
++            if (!released) e.backend.release(s);
++        }
++        if (e.fill_hook) |h| h.done(h.ptr, s, err);
++    }
++
+     /// A stream another driver prefilled and drew `token` for: drafts asked, the token committed, rounds from here.
+     pub fn adoptPrefilled(e: *Engine, s: *Stream, token: u32) !void {
+         _ = e.arena.reset(.retain_capacity);
+@@ -104,6 +207,35 @@ pub const Engine = struct {
+         try e.live.append(e.gpa, s);
+     }
+ 
++    /// The first drafts of every stream that joined since the last round, in one request batch: the head reads each
++    /// prompt's last row and its first token (already sent) and drafts the ones after it.
++    fn joinDrafts(e: *Engine) !void {
++        var reqs: std.ArrayList(be.DraftRequest) = .empty;
++        defer reqs.deinit(e.gpa);
++        for (e.live.items) |s| {
++            if (!s.join_draft) continue;
++            s.join_draft = false;
++            if (s.finished or s.paused) continue;
++            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
++            try reqs.append(e.gpa, .{ .stream = s, .follow = &.{}, .first = .{ .value = s.pending.? }, .rows = null, .start = s.prompt_len, .position = s.prompt_len + 1, .depth = d });
++        }
++        if (reqs.items.len == 0) return;
++        // in batches of the streams one head step takes (one at a time for a backend without shared rounds)
++        const per: usize = @max(1, e.cfg.batch_streams);
++        var at: usize = 0;
++        while (at < reqs.items.len) : (at += per) try e.backend.draft(reqs.items[at..@min(reqs.items.len, at + per)]);
++        for (reqs.items) |r| {
++            const s = r.stream;
++            s.dropHeld(e.gpa);
++            s.next = .{ .count = r.depth };
++            // the drafts the head holds (a stop rule may end the chain short of the ask), as askDrafts reads them
++            if (e.backend.vtable.tree) |tree| {
++                if (try tree(e.backend.ptr, s, e.gpa)) |held| s.next = held;
++            }
++            try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = &.{s.pending.?} }), f("rows", .null) });
++        }
++    }
++
+     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
+     pub fn adopt(e: *Engine, s: *Stream) !void {
+         try e.live.append(e.gpa, s);
+@@ -113,6 +245,12 @@ pub const Engine = struct {
+     pub fn discard(e: *Engine, s: *Stream) void {
+         s.finished = true;
+         s.reason = .cancelled;
++        for (e.filling.items, 0..) |x, i| {
++            if (x == s) {
++                _ = e.filling.orderedRemove(i);
++                break;
++            }
++        }
+         for (e.live.items, 0..) |x, i| {
+             if (x == s) {
+                 _ = e.live.orderedRemove(i);
+@@ -124,6 +262,14 @@ pub const Engine = struct {
+ 
+     /// One round for every live stream (Python `_family_step`).
+     pub fn step(e: *Engine) !void {
++        // prompts filling between rounds take their slice first; one that is in joins this round
++        if (e.filling.items.len > 0) {
++            _ = e.arena.reset(.retain_capacity);
++            try e.advanceFills();
++        }
++        // the stop rule the head uses may depend on how many streams are live (cuda_lanes' served hybrid)
++        e.rule.live = e.live.items.len;
++        try e.joinDrafts();
+         _ = e.arena.reset(.retain_capacity);
+         const a = e.arena.allocator();
+         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index 2100cc37..2f43b921 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -460,3 +460,110 @@ test "a family that keeps copies to shared rounds proposes none for a lone strea
+         try std.testing.expectEqual(lone_copies, (try win.copyProposal(&engine, &s)).len >= 2);
+     }
+ }
++
++/// Every case's emitted tokens on the sliced-fill backend: the first `first_n` cases admitted together, the rest
++/// one at a time `gap` steps apart while the earlier ones decode (their prompts fill between those rounds).
++fn runSliced(cases: []const Case, first_n: usize, gap: usize, slice: usize, widest: *usize) ![][]u32 {
++    var cfg = try model();
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa, .slice = slice };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backendSliced(), clock.clock());
++    defer engine.deinit();
++    const Joined = struct {
++        n: usize = 0,
++        fn done(ptr: *anyopaque, _: *sm.Stream, err: ?anyerror) void {
++            const j: *@This() = @ptrCast(@alignCast(ptr));
++            if (err == null) j.n += 1;
++        }
++    };
++    var joined: Joined = .{};
++    engine.fill_hook = .{ .ptr = &joined, .done = Joined.done };
++    const streams = try gpa.alloc(sm.Stream, cases.len);
++    defer gpa.free(streams);
++    const proposers = try gpa.alloc(SuffixLookup, cases.len);
++    defer gpa.free(proposers);
++    for (cases, streams, proposers) |c, *s, *p| {
++        p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
++        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91 });
++    }
++    defer for (streams, proposers) |*s, *p| {
++        s.deinit(gpa);
++        p.deinit();
++    };
++    for (streams[0..first_n]) |*s| try std.testing.expect(try engine.beginStream(s));
++    var next = first_n;
++    var steps: usize = 0;
++    while (engine.activeCount() > 0 or engine.fillingCount() > 0 or next < streams.len) {
++        if (next < streams.len and steps % gap == 0) {
++            try std.testing.expect(try engine.beginStream(&streams[next]));
++            next += 1;
++        }
++        try engine.step();
++        steps += 1;
++    }
++    try std.testing.expectEqual(cases.len, joined.n);
++    widest.* = target.widest_fill;
++    const out = try gpa.alloc([]u32, cases.len);
++    for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
++    return out;
++}
++
++test "prompts filled in slices between rounds equal prefills at admission: together, and arriving while others decode" {
++    const cases = [_]Case{
++        .{ .prompt = &.{ 5, 9, 2, 6, 5, 3, 5, 8, 9, 7 }, .max_new = 40 },
++        .{ .prompt = &.{ 1, 4, 1, 4, 2 }, .max_new = 30, .sampling = .{ .seed = 7, .temperature = 0.8 } },
++        .{ .prompt = &.{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9 }, .max_new = 35, .drafts = false },
++        .{ .prompt = &.{ 3, 3 }, .max_new = 20, .sampling = .{ .seed = 9 } },
++    };
++    // each alone, prefilled at admission
++    var solo: [cases.len][]u32 = undefined;
++    for (cases, &solo) |c, *o| {
++        const r = try run(&.{c});
++        o.* = r[0];
++        gpa.free(r);
++    }
++    defer for (solo) |o| gpa.free(o);
++    for ([_]struct { usize, usize, usize }{ .{ cases.len, 1, 3 }, .{ 1, 2, 2 }, .{ 2, 3, 1 }, .{ 1, 1, 50 } }) |shape| {
++        const first_n, const gap, const slice = shape;
++        var widest: usize = 0;
++        const got = try runSliced(&cases, first_n, gap, slice, &widest);
++        defer free(got);
++        for (solo, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
++        if (first_n > 1) try std.testing.expect(widest > 1); // prompts that arrived together filled in one call
++    }
++}
++
++test "a cancelled fill ends without its stream joining" {
++    var cfg = try model();
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa, .slice = 1 };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backendSliced(), clock.clock());
++    defer engine.deinit();
++    const C = struct {
++        var flag = false;
++        fn check(_: *anyopaque) bool {
++            return flag;
++        }
++        var ended: ?anyerror = null;
++        fn done(_: *anyopaque, _: *sm.Stream, err: ?anyerror) void {
++            ended = err;
++        }
++    };
++    C.flag = false;
++    C.ended = null;
++    engine.fill_hook = .{ .ptr = &engine, .done = C.done };
++    var s = try sm.Stream.init(gpa, .{ .id = "c", .prompt = &.{ 1, 2, 3, 4, 5, 6 }, .max_new = 5, .cancel_check = .{ .ptr = &engine, .check = C.check } });
++    defer s.deinit(gpa);
++    try std.testing.expect(try engine.beginStream(&s));
++    try engine.step();
++    C.flag = true;
++    try engine.step();
++    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), C.ended);
++    try std.testing.expectEqual(@as(usize, 0), engine.fillingCount());
++    try std.testing.expectEqual(@as(usize, 0), engine.activeCount());
++    try std.testing.expectEqual(@as(u32, 0), target.lanes.count());
++}
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index dd60ca7f..93ed09d2 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -55,11 +55,19 @@ pub const Fake = struct {
+     prefill_count: usize = 0,
+     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
+     prefill_hook_ctx: ?*anyopaque = null,
++    /// backendSliced: prompt tokens a fill takes a step (its pass runs when they reach the prompt's length)
++    slice: usize = 3,
++    fills: std.ArrayList(Fill) = .empty,
++    fill_steps: u64 = 0, // fill_step calls
++    widest_fill: usize = 0, // the most streams one fill_step filled
+     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+     ranked: bool = false, // the head gives its held chain back (alternatives)
+     memory_lanes: ?usize = null, // prefill past this many live lanes fails with error.LaneMemory (no room yet)
+ 
++    const Fill = struct { s: *Stream, done: usize };
++
+     pub fn deinit(x: *Fake) void {
++        x.fills.deinit(x.gpa);
+         var it = x.lanes.valueIterator();
+         while (it.next()) |l| freeLane(x.gpa, l);
+         x.lanes.deinit(x.gpa);
+@@ -81,6 +89,37 @@ pub const Fake = struct {
+         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow } };
+     }
+ 
++    /// The same target filling prompts in slices between rounds (prefill_begin / prefill_step).
++    pub fn backendSliced(x: *Fake) be.Backend {
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .prefill_begin = prefillBegin, .fill_step = fillStep } };
++    }
++
++    fn prefillBegin(ptr: *anyopaque, s: *Stream) anyerror!void {
++        const x = self(ptr);
++        try x.fills.append(x.gpa, .{ .s = s, .done = 0 });
++    }
++
++    fn fillStep(ptr: *anyopaque, streams: []const *Stream, states: []be.FillState) anyerror!void {
++        const x = self(ptr);
++        x.fill_steps += 1;
++        x.widest_fill = @max(x.widest_fill, streams.len);
++        for (streams, states) |s, *st| {
++            const i = for (x.fills.items, 0..) |fl, k| {
++                if (fl.s == s) break k;
++            } else return error.NotFilling;
++            if (s.isCancelled()) {
++                _ = x.fills.swapRemove(i);
++                st.* = .cancelled;
++                continue;
++            }
++            x.fills.items[i].done += x.slice;
++            if (x.fills.items[i].done < s.prompt_len) continue;
++            _ = x.fills.swapRemove(i);
++            try prefill(ptr, s); // the whole pass's effect once its slices are in
++            st.* = .done;
++        }
++    }
++
+     fn self(ptr: *anyopaque) *Fake {
+         return @ptrCast(@alignCast(ptr));
+     }
+@@ -318,6 +357,10 @@ pub const Fake = struct {
+ 
+     fn release(ptr: *anyopaque, s: *Stream) void {
+         const x = self(ptr);
++        for (x.fills.items, 0..) |fl, k| if (fl.s == s) {
++            _ = x.fills.swapRemove(k);
++            break;
++        };
+         if (x.lanes.fetchRemove(s)) |kv| {
+             var l = kv.value;
+             freeLane(x.gpa, &l);
+diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
+index 7cddf9a0..3fce51e5 100644
+--- a/zig/src/core/lanes/open.zig
++++ b/zig/src/core/lanes/open.zig
+@@ -38,7 +38,7 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+     var feed: Feed = .{ .handle = drawn };
+     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+     var asked: ?u32 = null;
+-    if (e.cfg.family_mtp and s.drafts) {
++    if (e.cfg.family_mtp and s.drafts and !e.cfg.join_batch) {
+         // the head reads the prompt's last row and the first token, and drafts the one after it
+         const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+         asked = d;
+@@ -48,11 +48,16 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+         if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
+             s.next = held; // a tree head's first drafts as host tokens, as every later round's
+         };
+-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
++    } else if (!(e.cfg.family_mtp and s.drafts) and e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
+         try e.queueNext(s, feed);
+     }
+     const value = try e.readFeed(feed);
+     if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
++    if (e.cfg.family_mtp and s.drafts and e.cfg.join_batch) {
++        // the first token goes out now; its first drafts come with the next round's other joiners (joinDrafts)
++        s.dropHeld(e.gpa);
++        s.join_draft = true;
++    }
+     if (e.log != null) {
+         const first = if (feed == .handle) value else try e.backend.read(drawn);
+         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index d43d01b1..4ff284d8 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -170,6 +170,7 @@ pub const Stream = struct {
+     picks: [plan_lanes.sizes.len + 1]u32 = @splat(0), // the planner's picks: each tree size, then chain + grafts
+     graft_room: ?u32 = null, // grafted rows the planner left this round's window (null: no planner)
+     held_levels: u32 = 0, // head levels drafted for the held window
++    join_draft: bool = false, // its first token is out; its first drafts come with the next round's (one batch)
+     round_over: ?f64 = null, // the stream's round time beyond its window and head levels (ms, recent): chains
+     tree_over: ?f64 = null, // and trees
+     measured: [plan_lanes.sizes.len + 1]plan_lanes.Measured = @splat(.{}), // each pick's round times past its table price
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index a608fd61..235be92e 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -153,6 +153,8 @@ pub const Api = struct {
+     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
+     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
+     cuCtxSynchronize: *const fn () callconv(.c) R,
++    cuProfilerStart: *const fn () callconv(.c) R,
++    cuProfilerStop: *const fn () callconv(.c) R,
+     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
+     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
+     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
+diff --git a/zig/src/cuda/aot.zig b/zig/src/cuda/aot.zig
+index b8e58d2e..bfbbd4f8 100644
+--- a/zig/src/cuda/aot.zig
++++ b/zig/src/cuda/aot.zig
+@@ -27,9 +27,9 @@ fn has(a: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+     return true;
+ }
+ 
+-const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
+-const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
+-const KernelJson = struct {
++pub const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
++pub const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
++pub const KernelJson = struct {
+     @"fn": []const u8,
+     hash: []const u8,
+     name: []const u8,
+@@ -43,7 +43,7 @@ const KernelJson = struct {
+     params: []ParamJson,
+     consts: std.json.ArrayHashMap(ConstJson),
+ };
+-const SetJson = struct { kernels: []KernelJson };
++pub const SetJson = struct { kernels: []KernelJson };
+ 
+ /// One argument of a launch, by the kernel's parameter name.
+ pub const Arg = struct {
+@@ -167,7 +167,7 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
+     return null;
+ }
+ 
+-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
++pub fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+     for (consts) |c| {
+         const got = k.consts.map.get(c.name) orelse return false;
+         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 19ba7db2..ab89845d 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -37,6 +37,23 @@ pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_point
+ pub const torch_indexing: []const u8 = if (available) &Blob("fatbin_torch_indexing").bytes else &.{};
+ pub const torch_movement: []const u8 = if (available) &Blob("fatbin_torch_movement").bytes else &.{};
+ pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_torch_nemotron_constants").bytes else &.{};
++pub const fn_gdn: []const u8 = if (available) &Blob("fatbin_fn_gdn").bytes else &.{};
++pub const fn_gdn_io: []const u8 = if (available) &Blob("fatbin_fn_gdn_io").bytes else &.{};
++pub const fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_fn_gdn_prefill").bytes else &.{};
++pub const fn_gdn_tree: []const u8 = if (available) &Blob("fatbin_fn_gdn_tree").bytes else &.{};
++pub const fn_nvfp4_experts: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_experts").bytes else &.{};
++pub const fn_qmm: []const u8 = if (available) &Blob("fatbin_fn_qmm").bytes else &.{};
++pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefill").bytes else &.{};
++pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes else &.{};
++pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
++pub const glm_msa: []const u8 = if (available) &Blob("fatbin_glm_msa").bytes else &.{};
++pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
++pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
++pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};
++pub const fn_int4: []const u8 = if (available) &Blob("fatbin_fn_int4").bytes else &.{};
++pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_cluster").bytes else &.{};
++pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
++pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
+ pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+ pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+@@ -75,3 +92,14 @@ pub fn treeVariant(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_
+     if (slots <= 16) return tree(16, 2, 2, false);
+     return tree(32, 2, 1, false);
+ }
++
++// GLM foundations and package-owned images (TensorFold glm5_next CUDA reference).
++pub const glm_foundations: []const u8 = if (available) &Blob("fatbin_glm_foundations").bytes else &.{};
++pub const glm_kda: []const u8 = if (options.glm_kda) &Blob("fatbin_glm_kda").bytes else &.{};
++pub const glm_kda_chunk: []const u8 = if (options.glm_kda_chunk) &Blob("fatbin_glm_kda_chunk").bytes else &.{};
++pub const glm_hc: []const u8 = if (options.glm_hc) &Blob("fatbin_glm_hc").bytes else &.{};
++pub const glm_exl3: []const u8 = if (options.glm_exl3) &Blob("fatbin_glm_exl3").bytes else &.{};
++pub const glm_qmm: []const u8 = if (options.glm_qmm) &Blob("fatbin_glm_qmm").bytes else &.{};
++pub const glm_qmm_prefill: []const u8 = if (options.glm_qmm_prefill) &Blob("fatbin_glm_qmm_prefill").bytes else &.{};
++
++pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
+diff --git a/zig/src/cuda/nccl.zig b/zig/src/cuda/nccl.zig
+index f742d625..dfe12300 100644
+--- a/zig/src/cuda/nccl.zig
++++ b/zig/src/cuda/nccl.zig
+@@ -21,12 +21,17 @@ pub const Api = struct {
+     ncclCommInitRank: *const fn (*Comm, c_int, UniqueId, c_int) callconv(.c) R,
+     ncclCommInitAll: *const fn ([*]Comm, c_int, ?[*]const c_int) callconv(.c) R,
+     ncclCommDestroy: *const fn (Comm) callconv(.c) R,
++    /// frees the communicator and ends its pending operations (a lost peer: NCCL then returns instead of waiting)
++    ncclCommAbort: *const fn (Comm) callconv(.c) R,
+     ncclGetErrorString: *const fn (R) callconv(.c) ?[*:0]const u8,
+     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
+     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
+     ncclBroadcast: *const fn (D, D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+     ncclGroupStart: *const fn () callconv(.c) R,
+     ncclGroupEnd: *const fn () callconv(.c) R,
++    /// point to point (NCCL 2.7+): `count` elements to / from `peer`, matched in issue order on both sides
++    ncclSend: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
++    ncclRecv: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+ };
+ 
+ pub const Library = struct {
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index ebbb12b9..60c8ee77 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -21,6 +21,7 @@ pub const Dim3 = launch.Dim3;
+ pub const graph = @import("graph.zig");
+ pub const cublaslt = @import("cublaslt.zig");
+ pub const nccl = @import("nccl.zig");
++pub const roce = @import("roce.zig");
+ pub const triton = @import("triton.zig");
+ pub const aot = @import("aot.zig");
+ pub const kernels = @import("kernels.zig");
+@@ -42,6 +43,7 @@ test {
+     _ = abi;
+     _ = aot;
+     _ = segments;
++    _ = roce;
+     _ = @import("qmmf.zig");
+     _ = @import("fp8.zig");
+     _ = carveout;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ac76da05..848a3bda 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -4,13 +4,15 @@ const cuda = @import("cuda");
+ const api = @import("engine_api");
+ const lanes = @import("lanes");
+ const nemotron = @import("nemotron");
++const flashnext = @import("flashnext");
++const glm_cuda = @import("glm_cuda");
+ const Allocator = std.mem.Allocator;
+ const budget = @import("cuda_memory.zig");
+ const nemotron_slide = @import("nemotron_slide.zig");
+ const Pool = budget.Pool;
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-const registry = .{nemotron.native};
++const registry = .{ nemotron.native, flashnext.native, glm_cuda.native };
+ 
+ /// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
+ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+@@ -21,6 +23,8 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+ };
+ 
+ pub const backends: []const []const u8 = &.{"cuda"};
++/// The serve flags past the common ones this build honours: two ranks (Flash Next, `--tp 2 --rank N --master`).
++pub const serves: []const []const u8 = &.{"--tp"};
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+@@ -161,6 +165,8 @@ const Host = struct {
+     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
+     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
+     dir: []u8 = &.{}, // the model folder the learner writes its lessons into
++    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // a following rank's loop (two-rank families)
++    store_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family-kept store's snapshot calls (Loaded.cache)
+ 
+     fn close(p: *anyopaque) void {
+         const h: *Host = @ptrCast(@alignCast(p));
+@@ -184,6 +190,11 @@ const Host = struct {
+         h.gpa.destroy(h);
+     }
+ 
++    fn follow(p: *anyopaque) anyerror!void {
++        const h: *Host = @ptrCast(@alignCast(p));
++        return h.follow_fn.?(h.family);
++    }
++
+     fn bind(p: *anyopaque) *Host {
+         const h: *Host = @ptrCast(@alignCast(p));
+         if (h.gpu) |g| if (bound != &g.ctx) {
+@@ -328,6 +339,24 @@ const Host = struct {
+                     return x.inner.vtable.held.?(x.inner.ptr, s, out);
+                 }
+             }.f else null,
++            .prefill_begin = if (v.prefill_begin != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_begin.?(x.inner.ptr, s);
++                }
++            }.f else null,
++            .fill_step = if (v.fill_step != null) struct {
++                fn f(p: *anyopaque, ss: []const *lanes.Stream, states: []lanes.backend.FillState) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.fill_step.?(x.inner.ptr, ss, states);
++                }
++            }.f else null,
++            .prefill_many = if (v.prefill_many != null) struct {
++                fn f(p: *anyopaque, ss: []const *lanes.Stream) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_many.?(x.inner.ptr, ss);
++                }
++            }.f else null,
+             .release = struct {
+                 fn f(p: *anyopaque, s: *lanes.Stream) void {
+                     const x = bind(p);
+@@ -348,7 +377,114 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+     return null;
+ }
+ 
++/// A tensor-parallel rank above 0: opens the engine as rank `o.rank` and runs rank 0's steps until it stops
++/// (two-rank families only); false with `problem` set when it cannot.
++pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
++    const opened = try open(a, gpa, io, o, problem) orelse return false;
++    defer opened.close(opened.ctx);
++    const run = opened.follow orelse {
++        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine serves {s} without a following rank", .{o.model_type});
++        return false;
++    };
++    try run(opened.ctx);
++    return true;
++}
++
++/// A family that sizes its own memory, keeps its own prompt states and may run on two ranks (Flash Next): it opens
++/// itself over the context and reports what the lane host needs, instead of the shared admission below.
++fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
++    // a family may serve past config.json's window (Flash Next with YaRN): its modelWindow says how far
++    const native = if (@hasDecl(F, "modelWindow")) F.modelWindow(a, io, o.dir) else modelContext(a, io, o.dir);
++    const window: i64 = o.context orelse @min(F.default_context, if (native > 0) native else F.default_context);
++    if (window <= 0 or (native > 0 and window > native)) {
++        problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ window, native });
++        return null;
++    }
++    if (o.slide) {
++        problem.* = try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on CUDA yet", .{o.model_type});
++        return null;
++    }
++    const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
++    const g = try gpa.create(Gpu);
++    var opened = false;
++    defer if (!opened) gpa.destroy(g);
++    g.driver = cuda.Driver.open() catch |e| {
++        problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
++        return null;
++    };
++    defer if (!opened) g.driver.close();
++    const count = try g.driver.deviceCount();
++    if (device >= count) {
++        const named = if (o.device != null) "--device " else "TF_CUDA_DEVICE=";
++        problem.* = try std.fmt.allocPrint(a, "{s}{d}: this machine has {d} CUDA device{s} (0 to {d})", .{ named, device, count, if (count == 1) "" else "s", @max(count, 1) - 1 });
++        return null;
++    }
++    g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
++    defer if (!opened) g.ctx.deinit();
++    bound = &g.ctx;
++    // the kernel set is the captured one: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary
++    const kernels: []const u8 = switch (try cuda.aot.pick(a, io, getenv("TENSORFOLD_CUDA_KERNELS"), try g.ctx.capability())) {
++        .captured => |dir| dir,
++        .native => {
++            problem.* = try std.fmt.allocPrint(a, "the native CUDA engine serves {s} with a captured kernel set (share/tensorfold/cuda/sm<capability> beside the binary, or TENSORFOLD_CUDA_KERNELS): none is installed", .{o.model_type});
++            return null;
++        },
++        .missing => |dir| {
++            problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_KERNELS={s} holds no aot.json: give a captured set's folder", .{dir});
++            return null;
++        },
++    };
++    // two ranks only for families whose options take them
++    const two_rank = @hasField(F.Options, "tp");
++    if (o.tp > 1 and !two_rank) {
++        problem.* = try std.fmt.allocPrint(a, "--tp {d}: the native CUDA engine serves {s} on one GPU only", .{ o.tp, o.model_type });
++        return null;
++    }
++    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts };
++    // a family whose backend shares forwards between streams sizes them by --parallel
++    if (@hasField(F.Options, "parallel")) fo.parallel = o.lanes;
++    if (@hasField(F.Options, "draft_dir")) fo.draft_dir = o.drafter;
++    if (@hasField(F.Options, "prompt_cache_gib")) fo.prompt_cache_gib = o.prompt_cache_gib;
++    if (two_rank) {
++        fo.tp = o.tp;
++        fo.rank = o.rank;
++        fo.master = o.master;
++        fo.master_port = o.master_port;
++    }
++    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, fo) catch |e| {
++        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
++        bound = null;
++        return null;
++    };
++    defer if (!opened) loaded.deinit(loaded.ctx);
++    const h = try gpa.create(Host);
++    errdefer gpa.destroy(h);
++    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
++    h.follow_fn = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
++    if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
++        // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
++        h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
++        const store = try gpa.create(api.prompt_cache.Store);
++        store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, if (@hasDecl(F, "cache_rules")) .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned, .min_prompt = if (@hasField(@TypeOf(F.cache_rules), "min_prompt")) F.cache_rules.min_prompt else (api.prompt_cache.Rules{}).min_prompt } else .{}, c.budget);
++        h.store = store;
++    };
++    errdefer if (h.store) |store| {
++        store.deinit();
++        gpa.destroy(store);
++    };
++    try h.serve(io, loaded.facts, loaded.rows, .{
++        .lanes = o.lanes,
++        .context_window = @intCast(window),
++        .prefill_step = F.prefill_step,
++        .prompt_cache = h.store != null,
++        .startup = h.startup,
++    }, null);
++    opened = true;
++    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = if (h.follow_fn != null) Host.follow else null };
++}
++
+ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
++    if (comptime @hasDecl(F, "own_memory") and F.own_memory) return openOwn(F, a, gpa, io, o, problem);
+     const native = modelContext(a, io, o.dir);
+     const window = contextWindow(o.context, native, F.default_context) catch |e| {
+         problem.* = switch (e) {
+@@ -427,7 +563,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     const after = try pool(a, io, &g.ctx, problem) orelse return null;
+     const room = after.room(model) -| loaded.learn_bytes;
+     const free = loaded.free_streams;
+-    const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
++    const streams = if (comptime @hasDecl(F, "preallocated_streams") and F.preallocated_streams) o.lanes else budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+         problem.* = switch (e) {
+             error.NoStream => try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve; lower --context, or free device memory", .{ window, toGib(loaded.stream_bytes), toGib(room), toGib(model), toGib(after.reserve) }),
+             error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * (o.lanes -| free)), window, toGib(room), free + room / loaded.stream_bytes }),
+@@ -501,6 +637,9 @@ test "chip classes name the compute capability as gate entries do" {
+ test "every registered family is listed for capabilities" {
+     try std.testing.expectEqual(@as(usize, registry.len), families.len);
+     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
++    try std.testing.expectEqualStrings("qwen4_exp", families[1].model_type);
++    try std.testing.expectEqualStrings("glm5_next", families[2].model_type);
++    try std.testing.expectEqualStrings("exl3", families[2].formats[0]);
+ }
+ 
+ test "variables: unset or empty means the default, anything but a whole number is refused" {
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 40ee1e0e..e0496b7c 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -218,6 +218,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+     }
+     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
+     try ranks(u, a, out);
++    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other rank", .{out.tp});
+     out.alias = alias.items;
+     out.api_key = keys.items;
+     return out;
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index 22e4b976..5a242d2d 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -12,6 +12,7 @@ pub const HfText = struct {
+     arena: std.heap.ArenaAllocator,
+     tok: tokenizer.Tokenizer,
+     source: []const u8 = "",
++    glm: bool = false,
+     tool_source: []const u8 = "",
+     compiled: ?template.Compiled = null,
+     tool_compiled: ?template.Compiled = null,
+@@ -34,6 +35,9 @@ pub const HfText = struct {
+         errdefer t.tok.deinit();
+         const config = readJson(io, a, dir, "tokenizer_config.json");
+         const model_config = readJson(io, a, dir, "config.json");
++        if (model_config == .object) if (model_config.object.get("model_type")) |mt| {
++            t.glm = mt == .string and (std.mem.eql(u8, mt.string, "glm5_next") or std.mem.eql(u8, mt.string, "glm5"));
++        };
+         if (template_override) |path| {
+             t.source = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| {
+                 problem.* = try std.fmt.allocPrint(pa, "cannot read chat template override ({s})", .{@errorName(e)});
+@@ -122,7 +126,8 @@ pub const HfText = struct {
+         return .{ .object = out };
+     }
+ 
+-    /// Model end ids plus the tokenizer's chat end, when both are declared.
++    /// config.json's eos_token_id (one or a list) and the tokenizer's eos_token, as Python's tokenizer wrapper
++    /// stops on both (Qwen3.8 Flash Next: config 248044 <|endoftext|>, tokenizer 248046 <|im_end|>).
+     fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
+         var out: std.ArrayList(u32) = .empty;
+         if (model_config == .object) {
+@@ -270,6 +275,7 @@ pub const HfText = struct {
+             var it = t.specials.object.iterator();
+             while (it.next()) |e| try context.put(a, e.key_ptr.*, e.value_ptr.*);
+         }
++        if (t.glm) try context.put(a, "clear_thinking", .{ .bool = false });
+         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
+         try context.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
+         if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+@@ -280,6 +286,7 @@ pub const HfText = struct {
+             problem.* = diag.msg;
+             return error.Template;
+         };
++        if (t.glm and !options.enable_thinking) return @import("glm_prompts.zig").thinkingOff(a, out);
+         return out;
+     }
+ };
+diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
+index a5ef71bd..dfa69497 100644
+--- a/zig/src/server/late_system_test.zig
++++ b/zig/src/server/late_system_test.zig
+@@ -21,8 +21,8 @@ const misplaced_body =
+ ;
+ 
+ /// Drops a system message after the first, so the late-system probe comes back as user.
+-const DropLate = struct {
+-    fn text(t: *@This()) model_text.Text {
++pub const DropLate = struct {
++    pub fn text(t: *@This()) model_text.Text {
+         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
+     }
+ 
+@@ -79,10 +79,10 @@ fn textOf(v: json.Value, key: []const u8) []const u8 {
+ }
+ 
+ /// Copies the prompt the server submits, then finishes at once.
+-const Capture = struct {
++pub const Capture = struct {
+     prompt: []u32 = &.{},
+ 
+-    fn engine(e: *@This()) api.Engine {
++    pub fn engine(e: *@This()) api.Engine {
+         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+     }
+ 
+@@ -110,14 +110,18 @@ const Capture = struct {
+     }
+ };
+ 
+-const Reply = struct { status: u16, body: []u8 };
++pub const Reply = struct { status: u16, body: []u8 };
+ 
+-fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
++pub fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
++    return exchangeMethod(srv, "POST", path, body);
++}
++
++pub fn exchangeMethod(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) !Reply {
+     var pair: [2]std.c.fd_t = undefined;
+     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+     defer _ = std.c.close(pair[0]);
+     defer _ = std.c.close(pair[1]);
+-    const head = try std.fmt.allocPrint(std.testing.allocator, "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ path, body.len });
++    const head = try std.fmt.allocPrint(std.testing.allocator, "{s} {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ method, path, body.len });
+     defer std.testing.allocator.free(head);
+     try writeAll(pair[0], head);
+     try writeAll(pair[0], body);
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index ecc81c57..6df4ea13 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -41,6 +41,8 @@ test {
+     _ = @import("stream_preflight_test.zig");
+     _ = @import("logprobs_test.zig");
+     _ = @import("late_system_test.zig");
++    _ = @import("glm_chat_test.zig");
++    _ = @import("glm_prompts.zig");
+     _ = @import("compact_test.zig");
+     _ = @import("completion_prompt_test.zig");
+     _ = @import("decisions.zig");

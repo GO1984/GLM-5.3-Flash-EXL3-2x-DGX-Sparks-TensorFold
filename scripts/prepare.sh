@@ -13,6 +13,8 @@
 #      WORKER_WEIGHTS=nfs, a read-only NFS volume of the head's cache on the worker, checked the same way
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
+# ENGINE=zig: step 2 builds (or pulls) the Zig engine's image from zig/Dockerfile instead (TensorFold v1.0.7, zig/patches,
+# the captured kernel set zig/aot; docs/zig-engine.md), and step 5 reads the checkpoint with tensorfold-native.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."     # the repository root
 source ./scripts/config.sh
@@ -167,6 +169,32 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]
     warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it locally"
   fi
 fi
+if [[ "$ENGINE" == zig ]]; then
+if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
+  [[ -s zig/aot/glm-aot-sm121.tar.xz && -d zig/patches ]] || die "zig/patches or zig/aot/glm-aot-sm121.tar.xz is missing from this checkout"
+  aot_sha=$(sha256sum zig/aot/glm-aot-sm121.tar.xz | cut -d' ' -f1)
+  [[ "$aot_sha" == "$(cut -d' ' -f1 zig/aot/glm-aot-sm121.tar.xz.sha256)" ]] || die "zig/aot/glm-aot-sm121.tar.xz does not match its .sha256"
+  for img in "$ZIG_BUILD_IMAGE" "$ZIG_RUN_IMAGE"; do
+    docker image inspect "$img" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $img"; docker pull "$img" >/dev/null; }
+  done
+  log "Building $IMAGE (TensorFold ${ZIG_TF_REF:0:12} with Zig $ZIG_VERSION, hash $PATCHES_HASH: $(compgen -G 'zig/patches/*.patch' | wc -l) patches, kernel set ${aot_sha:0:12}; the first build compiles the engine, ~10 min)"
+  # the build context: zig/Dockerfile, zig/patches and zig/aot only (never the rest of the repository), in a fresh private directory
+  ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
+  trap 'rm -rf -- "$ctx"' EXIT
+  mkdir -p "$ctx/zig/aot"
+  cp -r zig/patches "$ctx/zig/patches"; cp zig/aot/glm-aot-sm121.tar.xz "$ctx/zig/aot/"; cp zig/Dockerfile "$ctx/Dockerfile"
+  nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
+  docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" \
+    --build-arg BUILD_IMAGE="$ZIG_BUILD_IMAGE" --build-arg RUN_IMAGE="$ZIG_RUN_IMAGE" \
+    --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$ZIG_TF_REF" \
+    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" \
+    --build-arg NCCL_VERSION="$ZIG_NCCL_VERSION" --build-arg AOT_SHA256="$aot_sha" \
+    --build-arg PATCHES_HASH="$PATCHES_HASH" "$ctx"
+  rm -rf -- "$ctx"; trap - EXIT
+else
+  log "Image $IMAGE already built with hash $PATCHES_HASH (use --rebuild to force)"
+fi
+else
 if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
   log "Building $IMAGE (TensorFold $TF_VERSION, patches $PATCHES_HASH: $(compgen -G 'patches/*.patch' | wc -l) patches, plus $IMAGE_EXTRAS)"
@@ -191,7 +219,9 @@ DOCKERFILE
 else
   log "Image $IMAGE already built with patches $PATCHES_HASH (use --rebuild to force)"
 fi
-docker run --rm --entrypoint tensorfold "$IMAGE" --version 2>/dev/null | tail -1
+fi
+if [[ "$ENGINE" == zig ]]; then docker run --rm --network none --entrypoint tensorfold-native "$IMAGE" --version 2>/dev/null | tail -1
+else docker run --rm --entrypoint tensorfold "$IMAGE" --version 2>/dev/null | tail -1; fi
 
 # ---------------------------------------------------------------- 3. image (workers)
 image_id=$(image_ident "$IMAGE")                    # by content: .Id differs between image stores (issue #8)
@@ -222,6 +252,7 @@ download() {  # <repo id> <revision or empty>
     # Host CLI: resumable, parallel, writes the standard HF cache layout.
     hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
   else
+    [[ "$ENGINE" == python ]] || die "ENGINE=zig: the Zig image has no Python to download with; install the Hugging Face CLI on this host (pip install -U huggingface_hub; the 'hf' command)"
     # Keep downloads owned by the host user, in the same HF_CACHE/hub layout as the host CLI.
     docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
       -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
@@ -245,9 +276,9 @@ done
 
 # ---------------------------------------------------------------- 5. verify (head)
 # before the copy: the worker gets only a checkpoint TensorFold reads
-log "Verifying checkpoint with tensorfold info"
+log "Verifying checkpoint with $( [[ "$ENGINE" == zig ]] && echo tensorfold-native || echo tensorfold ) info"
 # (without its "EXL3 support is experimental" note: this recipe serves the EXL3 checkpoint on purpose)
-info=$(docker run --rm --entrypoint tensorfold -e HF_HUB_OFFLINE=1 -v "$HF_CACHE":/root/.cache/huggingface "$IMAGE" \
+info=$(docker run --rm --entrypoint "$( [[ "$ENGINE" == zig ]] && echo tensorfold-native || echo tensorfold )" -e HF_HUB_OFFLINE=1 -v "$HF_CACHE":/root/.cache/huggingface "$IMAGE" \
   info "/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev "$MODEL_ID")" 2>&1) ||
   die "tensorfold info cannot read the checkpoint: $info"
 printf '%s\n' "$info" | grep -v "EXL3 support is experimental" || true

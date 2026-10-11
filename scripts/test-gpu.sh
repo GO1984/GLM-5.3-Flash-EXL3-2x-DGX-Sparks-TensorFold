@@ -8,6 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
+[[ "$ENGINE" == python ]] || die "these tests are the Python engine's; ENGINE=zig has zig build test (docs/zig-engine.md)"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing: run scripts/prepare.sh first"
 [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" != true ]] ||
   die "$CONTAINER_NAME runs on this Spark: stop it first (./stop.sh)"

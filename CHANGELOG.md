@@ -3,6 +3,14 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased: `ENGINE=zig`, TensorFold v1.0.7's Zig engine (work in progress; `ENGINE=python` stays the default)
+
+`ENGINE=zig` makes the same scripts build and start `tensorfold-native` (TensorFold v1.0.7 plus `zig/patches/`, the captured
+kernel set `zig/aot/`, a CUDA runtime image: `zig/Dockerfile`) instead of the Python engine: `./start.sh`, `./stop.sh`,
+`scripts/prepare.sh`, `DRY_RUN=1`, the pinned revisions and NFS worker weights as before. Settings the Zig engine does not
+read yet are listed, with their status, in [`docs/zig-engine.md`](docs/zig-engine.md); the ones it cannot honour are refused.
+Credits: Ash Hart and the TensorFold contributors, jschmied (PR #443), b12x by local-inference-lab ([`CREDITS.md`](CREDITS.md)).
+
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
 Image: `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-7a37454d3238`, pinned by digest

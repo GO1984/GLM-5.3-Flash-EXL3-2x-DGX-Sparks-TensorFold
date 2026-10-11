@@ -49,6 +49,12 @@ fi
 MASTER_ADDR="${MASTER_ADDR:-$_ma}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 
+# The engine each rank runs: python (default), TensorFold v0.6.0's Python engine with this repository's patches/, or zig,
+# TensorFold v1.0.7's Zig engine (tensorfold-native) with the GLM port in zig/patches/ (docs/zig-engine.md: what it serves
+# so far, and every setting below that it does not read yet). The same scripts, ports, pins and health check serve both.
+ENGINE="${ENGINE:-python}"
+[[ "$ENGINE" == python || "$ENGINE" == zig ]] || { echo "config.sh: ENGINE is python or zig, not $ENGINE" >&2; exit 1; }
+
 # ABLIT=1 serves the Ablit weights, Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit (the same checkpoint,
 # abliterated; README "Ablit weights"), instead of the published checkpoint; 0 (default) the published one. The Ablit
 # repository is gated: HF_TOKEN must be set (a Hugging Face access token whose account accepted the terms on the
@@ -71,7 +77,7 @@ MODEL_REVISION="${MODEL_REVISION-$_rev}"
 TF_VERSION="${TF_VERSION:-v0.6.0}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
-IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
+IMAGE="${IMAGE:-tensorfold-glm53:$([[ "$ENGINE" == zig ]] && echo zig-v1.0.7 || echo "$TF_VERSION")}"
 # pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs);
 # they are part of the image's hash, so a change rebuilds it like a patch does
 IMAGE_EXTRAS="av==18.1.0 xgrammar>=0.2.8,<0.3"
@@ -81,11 +87,38 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
 # The same image serves two, three and four Sparks.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-7a37454d3238}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:eb17e092fa56ea23ca385c3aba0a4250d0cb46c705b9455f2e4c29d1ca4847e8}"
+if [[ "$ENGINE" == python ]]; then
+  IMAGE_TAG="${IMAGE_TAG:-v0.6.0-7a37454d3238}"
+  IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:eb17e092fa56ea23ca385c3aba0a4250d0cb46c705b9455f2e4c29d1ca4847e8}"
+else    # (empty until a Zig image is published: prepare.sh then pulls $GHCR_IMAGE:<tag> if there is one, else builds)
+  IMAGE_TAG="${IMAGE_TAG:-}"
+  IMAGE_DIGEST="${IMAGE_DIGEST:-}"
+fi
+TAG_BASE="$TF_VERSION"          # the image tag's prefix: <TAG_BASE>-<image hash>
+if [[ "$ENGINE" == zig ]]; then
+  # The Zig engine's image (zig/Dockerfile): tensorfold-native built from TensorFold at ZIG_TF_REF (v1.0.7) with
+  # zig/patches/*.patch applied (the Flash Next Zig CUDA base and the GLM engine; tools/make-zig-patches.sh writes them),
+  # Zig ZIG_VERSION, on a CUDA runtime image with NCCL ZIG_NCCL_VERSION; the captured Triton kernel set is
+  # zig/aot/glm-aot-sm121.tar.xz. The image's hash covers all of them, so a change rebuilds it (or pulls the published one).
+  ZIG_TF_REF="${ZIG_TF_REF:-e7c523ebfa16b8094cf9e35e3773a7d25befcc5b}"   # TensorFold v1.0.7
+  ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
+  ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"   # zig-aarch64-linux-0.17.0.tar.xz
+  ZIG_NCCL_VERSION="${ZIG_NCCL_VERSION:-2.30.7}"
+  ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-nvidia/cuda:13.0.2-devel-ubuntu24.04}"
+  ZIG_RUN_IMAGE="${ZIG_RUN_IMAGE:-nvidia/cuda:13.0.2-runtime-ubuntu24.04}"
+  TAG_BASE="zig-v1.0.7"
+  image_hash() {
+    ( cd "$_cfg_root" || exit 1
+      cat zig/patches/*.patch 2>/dev/null
+      sha256sum zig/aot/glm-aot-sm121.tar.xz 2>/dev/null
+      cat zig/Dockerfile
+      echo "$TF_REPO $ZIG_TF_REF zig-$ZIG_VERSION $ZIG_SHA256 nccl-$ZIG_NCCL_VERSION $ZIG_BUILD_IMAGE $ZIG_RUN_IMAGE"
+    ) | sha256sum | cut -c1-12
+  }
+fi
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
-  local tag="${TF_VERSION}-$(image_hash)"
+  local tag="${TAG_BASE}-$(image_hash)"
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
 }
 CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf}"           # the same name on both Sparks
@@ -101,7 +134,8 @@ export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
 # Image and video input (rank 0 runs GLM's vision tower: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). A picture
 # takes at most TENSORFOLD_GLM_IMAGE_TOKENS tokens (2048), a clip TENSORFOLD_GLM_VIDEO_TOKENS (16384) over at most
 # TENSORFOLD_GLM_VIDEO_FRAMES frames (128, 2 a second). VISION_URLS=1 also accepts public https URLs (default: data URLs).
-VISION="${VISION:-1}"
+# (ENGINE=zig: off by default, the Zig engine has no vision tower yet; VISION=1 there is refused by ./start.sh)
+VISION="${VISION:-$([[ "$ENGINE" == zig ]] && echo 0 || echo 1)}"
 VISION_URLS="${VISION_URLS:-0}"
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
 # a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only (mtp: 1). Default 4 on two Sparks, 8 on three (v1.5).
@@ -110,6 +144,8 @@ VISION_URLS="${VISION_URLS:-0}"
 # grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
 # Four Sparks: 8 as three (not measured there yet).
 if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" != 2 ]]; then _par=8; else _par=4; fi
+# ENGINE=zig: 8 (the captured decode kernels are keyed on the 8-stream arena: docs/zig-engine.md)
+[[ "$ENGINE" != zig || "$DRAFTER" != dflash2 ]] || _par=8
 PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
 # power-of-two scale each, half bf16's bytes: the 1M-token window with 4 streams fits (rank 0: 88.09 GiB estimated,
@@ -124,6 +160,8 @@ export TF_GLM_KV="$KV"
 DENSE="${DENSE:-q4}"
 if [[ "$KV" != bf16 ]]; then _ctx=1048576; elif [[ "$DRAFTER" != dflash2 ]]; then _ctx=524288
 elif [[ "$VISION" == 1 && "$DENSE" != q4 ]]; then _ctx=163840; else _ctx=196608; fi
+# ENGINE=zig: 131072 for now (the captured kernel set holds that arena's shapes; no prompts past ~32k tokens yet)
+[[ "$ENGINE" != zig ]] || _ctx=131072
 CONTEXT="${CONTEXT:-$_ctx}"
 DFLASH2_ID="${DFLASH2_ID:-incoai/GLM-5.3-Flash-DFlash2}"
 _rev=""; [[ "$DFLASH2_ID" == incoai/GLM-5.3-Flash-DFlash2 ]] && _rev=bf582e4eacc1810f76656d1811693ff6c6737d2a
@@ -434,6 +472,7 @@ prepared_state() {
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   wlabel=$(worker 1 docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   line="model=$MODEL_ID@$MODEL_REVISION drafter=$DRAFTER@$DFLASH2_REVISION image=$label worker=$wlabel patches=$hash worker_host=$WORKER weights=$WORKER_WEIGHTS"
+  [[ "$ENGINE" == python ]] || line+=" engine=$ENGINE"
   for (( i = 2; i < TP; i++ )); do
     wlabel=$(worker "$i" docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
     line+=" worker$i=$wlabel worker${i}_host=$(worker_host "$i") weights$i=$(worker_weights "$i") nfs$i=$(wval NFS_SERVER "$i")"

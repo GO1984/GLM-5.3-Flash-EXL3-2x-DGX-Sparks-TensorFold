@@ -35,6 +35,23 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   keeps its MIT notice): the engine that serves the model, including the two-rank CUDA engine for GLM-5.3-Flash, its
   EXL3 expert kernels, DFlash2 and MTP drafting with exact verification and the OpenAI-compatible server. Every file
   in `patches/` is a modification of TensorFold v0.6.0.
+- **TensorFold v1.0.7 and its Zig engine** (`tensorfold-native`; `ENGINE=zig`, [`docs/zig-engine.md`](docs/zig-engine.md))
+  by Ash Hart ([ashhart](https://github.com/ashhart)) and the TensorFold contributors
+  ([contributors](https://github.com/ashhart/TensorFold/graphs/contributors); Apache 2.0): the engine `zig/patches/` modify
+  and `zig/Dockerfile` builds, with its CUDA runtime, kernels, lane host and OpenAI-compatible server. The Flash Next
+  Zig CUDA engine (`0002`) that the GLM engine builds on is ported from TensorFold's Python Flash Next CUDA engine by
+  Ash Hart and the TensorFold contributors, as in MiaAI-Lab's Qwen recipe. The GLM engine (`0003`-`0005`) is Mia's AI
+  Lab's port of the Python engine in `patches/` (TensorFold's GLM-5.3-Flash engine and kernels, written by Ash Hart and
+  the contributors); it replays the Triton kernels captured from that engine (`zig/aot/`).
+- **The Zig CUDA serving path and the CUDA family registry** were authored by Jürgen Schmied
+  ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
+  (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):
+  `tensorfold-native` serving CUDA families through one registry, which the Zig engine here runs on.
+- **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache-2.0): the one-shot RoCE
+  all-gather of the Zig engine implements the RoCEnante protocol of b12x by local-inference-lab, as `0006-cuda-roce-allgather`
+  does for the Python engine (below).
+- **[Zig](https://ziglang.org)** by the Zig Software Foundation and the Zig contributors (MIT): the language and compiler
+  TensorFold's Zig engine is written in and built with (0.17.0).
 - TensorFold itself builds on, and credits in its
   [third-party notices](https://github.com/ashhart/TensorFold/blob/v0.6.0/THIRD_PARTY_NOTICES.md):
   [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT), whose EXL3 format the routed experts are
