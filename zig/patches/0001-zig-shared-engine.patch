@@ -1,4 +1,4 @@
-TensorFold v1.0.7..9446bc2a (r107-int): shared-engine
+TensorFold v1.0.7..ac66993d (r107-int): shared-engine
 Apply from the checkout root with: git apply 0001-zig-shared-engine.patch
 
 diff --git a/.gitignore b/.gitignore
@@ -504,7 +504,7 @@ index f72c13b2..f395c747 100644
  
  pub const SubmitError = error{ Closed, Busy, InvalidSpans };
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 09ff0fa2..56e3c1b1 100644
+index 09ff0fa2..fac425ac 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -38,6 +38,9 @@ pub const LaneHost = struct {
@@ -597,7 +597,7 @@ index 09ff0fa2..56e3c1b1 100644
          job.stream = lanes.Stream.init(h.gpa, .{
              .id = "request",
              .prompt = r.prompt,
-@@ -313,30 +334,122 @@ pub const LaneHost = struct {
+@@ -313,35 +334,155 @@ pub const LaneHost = struct {
              .think_close = r.think_close,
              .think_end = if (r.think_end) |t| t else -1,
              .logprobs = r.logprobs,
@@ -692,8 +692,35 @@ index 09ff0fa2..56e3c1b1 100644
 +                };
 +                continue;
 +            };
++            if (job.stream.reprefill) h.continueGate(job) catch |e| {
++                _ = h.drop(job, h.words(e));
++                continue;
++            };
 +            h.prefilled(job, began);
 +            if (h.deliver(job)) h.remove(job);
++        }
++    }
++
++    /// A call-gate fix is in the reply. Send it, then prefill the prompt plus that reply so the next token
++    /// matches Python's `generate_gated` (a new prefill, not a decode of the replaced token).
++    fn continueGate(h: *LaneHost, job: *Job) !void {
++        var n: u8 = 0;
++        while (job.stream.reprefill) {
++            n += 1;
++            if (n > 4) return error.GateRestart;
++            h.send(job);
++            job.stream.reuse = .{};
++            job.stream.cached = 0;
++            job.stream.reuse_failed = false;
++            h.core.release(&job.stream);
++            try job.stream.absorbIntoPrompt();
++            job.delivered = 0;
++            if (job.stream.max_new == 0) {
++                job.stream.finished = true;
++                job.stream.reason = .length;
++                return;
++            }
++            try h.core.addStream(&job.stream);
 +        }
 +    }
 +
@@ -723,7 +750,24 @@ index 09ff0fa2..56e3c1b1 100644
          h.core.addStream(&job.stream) catch |e| return switch (e) {
              error.Cancelled => h.cancel(job),
              error.LaneMemory => h.requeue(job),
-@@ -392,6 +505,7 @@ pub const LaneHost = struct {
+             else => h.drop(job, h.words(e)),
+         };
++        if (job.stream.reprefill) h.continueGate(job) catch |e| return h.drop(job, h.words(e));
+         h.prefilled(job, began);
+         if (h.deliver(job)) h.remove(job);
+         return true;
+@@ -366,6 +507,10 @@ pub const LaneHost = struct {
+         };
+         if (!done) return;
+         _ = h.filling.orderedRemove(0);
++        if (job.stream.reprefill) h.continueGate(job) catch |e| {
++            _ = h.drop(job, h.words(e));
++            return;
++        };
+         h.prefilled(job, job.began);
+         if (h.deliver(job)) h.remove(job);
+     }
+@@ -392,6 +537,7 @@ pub const LaneHost = struct {
          h.unlock();
          job.reported();
          if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
@@ -731,7 +775,7 @@ index 09ff0fa2..56e3c1b1 100644
          emit(job, .{ .prefilled = job.stream.cached });
      }
  
-@@ -410,6 +524,7 @@ pub const LaneHost = struct {
+@@ -410,6 +556,7 @@ pub const LaneHost = struct {
          };
          h.prefilled(job, began);
          if (h.cache) |store| _ = store.keep(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request));
@@ -739,7 +783,7 @@ index 09ff0fa2..56e3c1b1 100644
          be.release(&job.stream);
          h.remove(job);
          h.finish(job, .length, "");
-@@ -420,10 +535,10 @@ pub const LaneHost = struct {
+@@ -420,10 +567,10 @@ pub const LaneHost = struct {
      fn loneFits(h: *LaneHost, job: *Job) bool {
          const r = job.request;
          const lone = h.lone orelse return false;
@@ -752,7 +796,7 @@ index 09ff0fa2..56e3c1b1 100644
      }
  
      /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
-@@ -525,7 +640,7 @@ pub const LaneHost = struct {
+@@ -525,7 +672,7 @@ pub const LaneHost = struct {
      fn run(h: *LaneHost) void {
          while (true) {
              h.takeCancels();
@@ -761,7 +805,7 @@ index 09ff0fa2..56e3c1b1 100644
              h.fillOne();
              status.noteLive(h);
              h.lock();
-@@ -540,7 +655,7 @@ pub const LaneHost = struct {
+@@ -540,7 +687,7 @@ pub const LaneHost = struct {
                  h.closeAll();
                  continue;
              }
@@ -770,6 +814,17 @@ index 09ff0fa2..56e3c1b1 100644
                  if (h.filling.items.len > 0) {
                      h.unlock();
                      continue;
+@@ -563,6 +710,10 @@ pub const LaneHost = struct {
+             var i: usize = 0;
+             while (i < h.admitted.items.len) {
+                 const job = h.admitted.items[i];
++                if (job.stream.reprefill) h.continueGate(job) catch |e| {
++                    _ = h.drop(job, h.words(e));
++                    continue;
++                };
+                 if (h.deliver(job)) {
+                     h.lock();
+                     _ = h.admitted.orderedRemove(i);
 diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
 index 549121dd..997d9049 100644
 --- a/zig/src/core/lane_host_reuse_test.zig
@@ -976,7 +1031,7 @@ index 78185920..0637002b 100644
              for (whos, out) |*w, *o| {
                  const inner = try r.headDepth(w, null, probe);
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index 4339af40..799869c3 100644
+index 4339af40..2e0c71dd 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
 @@ -25,6 +25,10 @@ const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follo
@@ -1190,7 +1245,33 @@ index 4339af40..799869c3 100644
                  const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
                  s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
              }
-@@ -374,8 +520,15 @@ pub const Engine = struct {
+@@ -167,6 +313,7 @@ pub const Engine = struct {
+                 e.release(s);
+                 continue;
+             }
++            if (s.reprefill) continue; // the host prefills the prompt plus the fix; this cache is not decoded on
+             e.live.items[kept] = s;
+             kept += 1;
+         }
+@@ -231,7 +378,7 @@ pub const Engine = struct {
+         const o = try e.conclude(s, plan, out[0].sampled, out[0].rows, tokens, parents, windows[0].positions);
+         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
+         const held_levels = s.held_levels;
+-        if (e.cfg.family_mtp and s.drafts) {
++        if (!s.reprefill and e.cfg.family_mtp and s.drafts) {
+             if (early and o.cut == null) {
+                 var w = win.who(s);
+                 const d: u32 = @intCast(try e.rule.headDepth(&w, null, win.probe(e)));
+@@ -293,7 +440,7 @@ pub const Engine = struct {
+         }
+         var heads: std.ArrayList(usize) = .empty;
+         for (plans, 0..) |p, i| {
+-            if (e.cfg.family_mtp and p.stream.drafts) try heads.append(a, i);
++            if (e.cfg.family_mtp and p.stream.drafts and !p.stream.reprefill) try heads.append(a, i);
+         }
+         const whos = try a.alloc(depth.Who, heads.items.len);
+         for (whos, heads.items) |*w, i| w.* = win.who(plans[i].stream);
+@@ -374,8 +521,15 @@ pub const Engine = struct {
          const budget_cut = s.thinkCut(committed.items);
          const loop_cut = sm.loopCut(s, committed.items);
          const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
@@ -1207,6 +1288,14 @@ index 4339af40..799869c3 100644
              cut = loop_cut;
              path = path[0 .. loop_cut.? + 1];
              committed.shrinkRetainingCapacity(loop_cut.? + 1);
+@@ -397,6 +551,7 @@ pub const Engine = struct {
+         const keep = path.len;
+         s.cache_len += keep;
+         s.pending = committed.items[keep - 1];
++        if (gate_wins and !s.finished) s.reprefill = true;
+         const chain = accept.isChain(parents);
+         try trail.event(e, &.{
+             f("ev", str("round")),                                    f("stream", str(s.id)),
 diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
 index 2100cc37..2f43b921 100644
 --- a/zig/src/core/lanes/engine_test.zig
@@ -1417,16 +1506,30 @@ index 910f5016..8701d5b8 100644
  
  pub const learned_disk = @import("learned_disk.zig");
 diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
-index 7cddf9a0..5b4e577f 100644
+index 7cddf9a0..2382b10e 100644
 --- a/zig/src/core/lanes/open.zig
 +++ b/zig/src/core/lanes/open.zig
-@@ -37,8 +37,12 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+@@ -37,8 +37,26 @@ pub fn opened(e: *Engine, s: *Stream) !void {
      const drawn = try e.drawFirst(s, position);
      var feed: Feed = .{ .handle = drawn };
      if (try e.forcedNext(s)) |t| feed = .{ .value = t };
 +    if (s.gateWatching() and feed == .handle) { // the call gate reads the first draw: a reply that skips the opener opens it
 +        const drawn_token = try e.backend.read(drawn);
-+        feed = .{ .value = if (s.gateCut(&.{drawn_token}) != null) s.gate.?.spec.opener else drawn_token };
++        if (s.gateCut(&.{drawn_token}) != null) {
++            // The opener replaces the draw. Python's generate_gated then prefills the prompt plus that fix;
++            // decoding the opener on this cache samples the next token from a different kernel.
++            const value = s.gate.?.spec.opener;
++            _ = try s.commit(e.gpa, &.{value}, &.{});
++            s.pending = value;
++            s.reprefill = !s.finished;
++            try trail.resolve(e);
++            if (s.finished) {
++                try trail.finish(e, s);
++                e.release(s);
++            }
++            return;
++        }
++        feed = .{ .value = drawn_token };
 +    }
      var asked: ?u32 = null;
 -    if (e.cfg.family_mtp and s.drafts) {
@@ -1434,7 +1537,7 @@ index 7cddf9a0..5b4e577f 100644
          // the head reads the prompt's last row and the first token, and drafts the one after it
          const d: u32 = @intCast(try e.rule.depth(win.who(s)));
          asked = d;
-@@ -48,11 +52,16 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+@@ -48,11 +66,16 @@ pub fn opened(e: *Engine, s: *Stream) !void {
          if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
              s.next = held; // a tree head's first drafts as host tokens, as every later round's
          };
@@ -1453,7 +1556,7 @@ index 7cddf9a0..5b4e577f 100644
          const first = if (feed == .handle) value else try e.backend.read(drawn);
          try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
-index d43d01b1..c365adc0 100644
+index d43d01b1..be004fb6 100644
 --- a/zig/src/core/lanes/stream.zig
 +++ b/zig/src/core/lanes/stream.zig
 @@ -23,6 +23,9 @@ pub const Reason = enum {
@@ -1676,15 +1779,16 @@ index d43d01b1..c365adc0 100644
      cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
      reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
      context: std.ArrayList(u32) = .empty,
-@@ -170,6 +322,7 @@ pub const Stream = struct {
+@@ -170,6 +322,8 @@ pub const Stream = struct {
      picks: [plan_lanes.sizes.len + 1]u32 = @splat(0), // the planner's picks: each tree size, then chain + grafts
      graft_room: ?u32 = null, // grafted rows the planner left this round's window (null: no planner)
      held_levels: u32 = 0, // head levels drafted for the held window
 +    join_draft: bool = false, // its first token is out; its first drafts come with the next round's (one batch)
++    reprefill: bool = false, // a call-gate fix: prefill the prompt plus the reply again (Python generate_gated)
      round_over: ?f64 = null, // the stream's round time beyond its window and head levels (ms, recent): chains
      tree_over: ?f64 = null, // and trees
      measured: [plan_lanes.sizes.len + 1]plan_lanes.Measured = @splat(.{}), // each pick's round times past its table price
-@@ -201,6 +354,7 @@ pub const Stream = struct {
+@@ -201,6 +355,7 @@ pub const Stream = struct {
              .think_end = spec.think_end,
              .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
              .loop_guard = spec.loop_guard,
@@ -1692,7 +1796,7 @@ index d43d01b1..c365adc0 100644
              .chunks = spec.chunks,
              .history_len = spec.history_len,
              .shared_prefixes = spec.shared_prefixes,
-@@ -208,7 +362,9 @@ pub const Stream = struct {
+@@ -208,7 +363,9 @@ pub const Stream = struct {
              .decide = spec.decide,
              .logprobs = spec.logprobs,
              .grammar = spec.grammar,
@@ -1702,7 +1806,26 @@ index d43d01b1..c365adc0 100644
          };
          // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
          if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
-@@ -338,6 +494,7 @@ pub const Stream = struct {
+@@ -247,6 +404,18 @@ pub const Stream = struct {
+         s.lanes = null;
+     }
+ 
++    /// The committed reply becomes the prompt's tail. Python's `generate_gated` stops at a call-gate fix and
++    /// prefills `prompt + reply` so the next token is a prefill sample, not a decode of the replaced token.
++    pub fn absorbIntoPrompt(s: *Stream) !void {
++        const extra = s.emitted().len;
++        if (extra == 0 or extra > s.max_new) return error.GateRestart;
++        s.prompt_len += extra;
++        s.max_new -= @intCast(extra);
++        s.pending = null;
++        s.cache_len = 0;
++        s.reprefill = false;
++    }
++
+     pub fn prompt(s: *const Stream) []const u32 {
+         return s.context.items[0..s.prompt_len];
+     }
+@@ -338,6 +507,7 @@ pub const Stream = struct {
              if (rows.len > 0) try s.rows.append(gpa, rows[i]);
              landed += 1;
              if (@as(i64, t) == s.think_end) s.think_open = false;
@@ -1710,7 +1833,7 @@ index d43d01b1..c365adc0 100644
              if (s.grammar) |g| {
                  if (!try g.follow(t)) {
                      s.finished = true;
-@@ -351,7 +508,7 @@ pub const Stream = struct {
+@@ -351,7 +521,7 @@ pub const Stream = struct {
                      break;
                  }
              }
@@ -1719,7 +1842,7 @@ index d43d01b1..c365adc0 100644
              if (s.isEos(t) or s.stopped()) {
                  s.finished = true;
                  s.reason = .stop;
-@@ -382,6 +539,18 @@ pub const Stream = struct {
+@@ -382,6 +552,18 @@ pub const Stream = struct {
          return c.check(c.ptr, s.emitted());
      }
  
@@ -1738,7 +1861,7 @@ index d43d01b1..c365adc0 100644
      pub fn popForce(s: *Stream) ?u32 {
          if (s.force.items.len == 0) return null;
          return s.force.orderedRemove(0);
-@@ -434,3 +603,53 @@ test "loop guard fires, closes thinking, and latches once" {
+@@ -434,3 +616,66 @@ test "loop guard fires, closes thinking, and latches once" {
      _ = try s.commit(gpa, &.{8}, &.{});
      try std.testing.expect(!s.finished and s.loop_period.? == 1);
  }
@@ -1763,6 +1886,19 @@ index d43d01b1..c365adc0 100644
 +    try std.testing.expect(h.armed and !h.done);
 +    // a think block opened in the reply holds the gate again
 +    try std.testing.expectEqual(@as(?usize, null), (Gate.init(spec, &.{1})).cut(&.{ 60, 7, 8 }));
++}
++
++test "a call-gate fix folds the committed opener into the prompt" {
++    const gpa = std.testing.allocator;
++    var s = try Stream.init(gpa, .{ .id = "g", .prompt = &.{ 1, 2 }, .max_new = 12, .call = .{ .opener = 50 } });
++    defer s.deinit(gpa);
++    _ = try s.commit(gpa, &.{50}, &.{});
++    s.reprefill = true;
++    try s.absorbIntoPrompt();
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 50 }, s.prompt());
++    try std.testing.expectEqual(@as(usize, 0), s.emitted().len);
++    try std.testing.expectEqual(@as(u32, 11), s.max_new);
++    try std.testing.expect(!s.reprefill);
 +}
 +
 +test "call gate in commit: observe follows committed tokens" {

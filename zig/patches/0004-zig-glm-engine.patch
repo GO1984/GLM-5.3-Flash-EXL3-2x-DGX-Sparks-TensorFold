@@ -1,4 +1,4 @@
-TensorFold v1.0.7..9446bc2a (r107-int): glm-engine
+TensorFold v1.0.7..ac66993d (r107-int): glm-engine
 Apply from the checkout root with: git apply 0004-zig-glm-engine.patch
 
 diff --git a/zig/src/cli/glm_cuda.zig b/zig/src/cli/glm_cuda.zig
@@ -17270,10 +17270,10 @@ index 00000000..60abcfa8
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_state.zig b/zig/src/families/glm_cuda/cuda_state.zig
 new file mode 100644
-index 00000000..46e7cc94
+index 00000000..7875209f
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_state.zig
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,254 @@
 +//! Device layouts from glm5_next/cuda/forward.py: Slots, Caches, State; kda.py: KDAScratchSet.
 +//! FP8 cache rows follow glm5_next/cuda/kv8.py. No arithmetic or quantization is performed here.
 +const std = @import("std");
@@ -17325,8 +17325,8 @@ index 00000000..46e7cc94
 +        const h = g.lin_heads;
 +        const l = G.kda_layers;
 +        const r = count * l * rows;
-+        // pos_dev and mtp_pos_dev, one int32 each, in a 16-byte stride: the captured Triton kernels are specialised on 16-byte-aligned pointers (slot 1 at +8 hit MissingTritonVariant).
-+        return .{ count * 2 * l * h * 128 * 128 * 4, count * l * 3 * g.convDim() * 2, r * g.projWidth() * 2, r * h * 128 * 2, r * h * 128 * 4, r * h * 128 * 2, r * h * 128 * 4, r * h * 4, count * 16 };
++        // pos_dev and mtp_pos_dev, one int32 each, on their own 16-byte stride: the captured Triton kernels are specialised on 16-byte-aligned pointers (mtp at +4 missed _dense_chunks).
++        return .{ count * 2 * l * h * 128 * 128 * 4, count * l * 3 * g.convDim() * 2, r * g.projWidth() * 2, r * h * 128 * 2, r * h * 128 * 4, r * h * 128 * 2, r * h * 128 * 4, r * h * 4, count * 32 };
 +    }
 +    pub fn bytes(g: Geometry, count: usize, rows: usize) usize {
 +        return aligned(&layout(g, count, rows));
@@ -17346,8 +17346,8 @@ index 00000000..46e7cc94
 +    pub fn view(s: Slots, slot: usize) !Slot {
 +        if (slot >= s.count) return error.BadSlot;
 +        const n = layout(s.g, 1, s.rows);
-+        const pos = s.pos_dev + slot * 16;
-+        return .{ .rec = s.rec + slot * n[0], .conv = s.conv + slot * n[1], .proj = s.proj + slot * n[2], .out = s.out + slot * n[3], .k = s.k + slot * n[4], .v = s.v + slot * n[5], .g = s.gates + slot * n[6], .b = s.b + slot * n[7], .pos_dev = pos, .mtp_pos_dev = pos + 4 };
++        const pos = s.pos_dev + slot * 32;
++        return .{ .rec = s.rec + slot * n[0], .conv = s.conv + slot * n[1], .proj = s.proj + slot * n[2], .out = s.out + slot * n[3], .k = s.k + slot * n[4], .v = s.v + slot * n[5], .g = s.gates + slot * n[6], .b = s.b + slot * n[7], .pos_dev = pos, .mtp_pos_dev = pos + 16 };
 +    }
 +};
 +pub const CacheView = struct { latent: [11]u64, pooled: [11]u64, keys: [11]u64, gates: [11]u64, ring_base: usize, capacity: usize };
@@ -17494,7 +17494,7 @@ index 00000000..46e7cc94
 +    try std.testing.expectEqual(@as(usize, 142606336), n[0]);
 +    try std.testing.expectEqual(@as(usize, 34 * 3 * 12288 * 2), n[1]);
 +    try std.testing.expectEqual(@as(usize, 34 * 32 * 12576 * 2), n[2]);
-+    try std.testing.expectEqual(@as(usize, 16), n[8]);
++    try std.testing.expectEqual(@as(usize, 32), n[8]);
 +    const c = Caches.layout(4096, 2, 64);
 +    try std.testing.expectEqual(@as(usize, 4096 * 528), c[0]);
 +    try std.testing.expectEqual(@as(usize, 1026 * 144), c[1]);
@@ -17508,7 +17508,8 @@ index 00000000..46e7cc94
 +    for (0..8) |i| {
 +        const v = try slots.view(i);
 +        try std.testing.expectEqual(@as(u64, 0), v.pos_dev % 16);
-+        try std.testing.expect(v.mtp_pos_dev == v.pos_dev + 4);
++        try std.testing.expectEqual(@as(u64, 0), v.mtp_pos_dev % 16);
++        try std.testing.expect(v.mtp_pos_dev == v.pos_dev + 16);
 +    }
 +}
 +
@@ -17518,8 +17519,8 @@ index 00000000..46e7cc94
 +    const caches: Caches = .{ .arena = undefined, .rows = 8192, .streams = 2, .ring = 64, .latent = @splat(0x100000), .pooled = @splat(0x200000), .keys = @splat(0x300000), .gates = @splat(0x400000) };
 +    const s = try State.bind(slots, caches, 1, 2048, 4096);
 +    try std.testing.expectEqual(@as(u64, 0x1000 + 142606336), s.fixed.rec);
-+    try std.testing.expectEqual(@as(u64, 0x9000 + 16), s.fixed.pos_dev);
-+    try std.testing.expectEqual(@as(u64, 0x9000 + 20), s.fixed.mtp_pos_dev);
++    try std.testing.expectEqual(@as(u64, 0x9000 + 32), s.fixed.pos_dev);
++    try std.testing.expectEqual(@as(u64, 0x9000 + 48), s.fixed.mtp_pos_dev);
 +    try std.testing.expectEqual(@as(u64, 0x100000 + 2048 * 528), s.cache.latent[0]);
 +    try std.testing.expectEqual(@as(u64, 0x200000 + 512 * 144), s.cache.pooled[0]);
 +    try std.testing.expectEqual(@as(u64, 0x300000 + 64 * 256), s.cache.keys[0]);
@@ -18186,10 +18187,10 @@ index 00000000..e4db7167
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_triton_generated.zig b/zig/src/families/glm_cuda/cuda_triton_generated.zig
 new file mode 100644
-index 00000000..6be5ba50
+index 00000000..2b16e4d3
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_triton_generated.zig
-@@ -0,0 +1,2523 @@
+@@ -0,0 +1,2535 @@
 +//! Generated by tools/zig/glm_aot.py from real TP=2 GLM Python launches.
 +//! TensorFold/Ash Hart glm5_next/cuda; constexprs and pointer ABI are unmodified.
 +const std = @import("std");
@@ -18199,6 +18200,7 @@ index 00000000..6be5ba50
 +pub const variants = [_]Variant{
 +    .{ .name = "_absorb_mma", .hash = "1a4b53b052b929b141e2cf1ceb5595c8367f73e3de1efaae30b7f283a0cb463a", .warps = 4 },
 +    .{ .name = "_absorb_mma", .hash = "93a28456428a3266c9d809b518164fb0ab9b6973d515a3d3af8a4d321da29736", .warps = 4 },
++    .{ .name = "_absorb_mma", .hash = "a2e3e7cc687f48bacbe52d6366bd88000e1e3fa5decb0f8d4f02eccc4799927e", .warps = 4 },
 +    .{ .name = "_absorb_q", .hash = "615a14c0066d8e1cc728fda15c83415cfe8c4c23fbb1679cbe0b6abe92257f8c", .warps = 4 },
 +    .{ .name = "_absorb_q", .hash = "c251823ed011f1fdb21bd63ecaae3a212ff6fb76f940de51f7af60d12de28eae", .warps = 4 },
 +    .{ .name = "_absorb_q", .hash = "eb916743d9d5ab192c0731e0a79ed22448bb33d0c911cda10fdd17de46690d15", .warps = 4 },
@@ -18226,6 +18228,7 @@ index 00000000..6be5ba50
 +    .{ .name = "_embed_b16", .hash = "43d676f97a1432cdbf2693b84dd4ddf10f865bb3ea6c8bd0831359187f1c072e", .warps = 1 },
 +    .{ .name = "_expand_mma", .hash = "0e7ca7ba6ae3dc9eebd16da09bee6f409ee7f956331f7a0167c1d72762c2dddd", .warps = 4 },
 +    .{ .name = "_expand_mma", .hash = "d96c477c8afe4a4a8b65ff39ec5311e96260ee7cf32089445d1e499dcb7d2f95", .warps = 4 },
++    .{ .name = "_expand_mma", .hash = "e434112b460319f87c58a1eb5e5ade0b0b309c88d3df215be237a7bea9ebd05f", .warps = 4 },
 +    .{ .name = "_expand_v", .hash = "8b5ab94405526e6bab37ff335d901dec7f9fe0fe62048d44929717166f8b7002", .warps = 4 },
 +    .{ .name = "_expand_v", .hash = "a20e7fa4717f686557e473c530c7e373b956a0e3f66efafb35258c462b3e3c21", .warps = 4 },
 +    .{ .name = "_expand_v", .hash = "d3448fd3b18214c4a5c9626a822b7692bc4bd208643ed52a23b4a2acb311206a", .warps = 4 },
@@ -18252,6 +18255,7 @@ index 00000000..6be5ba50
 +    .{ .name = "_lat_write", .hash = "fd6ef72c783db192a7e320b7009beb3393110f7763c93eb043a27393a1661d2e", .warps = 4 },
 +    .{ .name = "_merge", .hash = "03954f583b33814f46f78b3d95c905d42b0911694c00dd90ea62744c4f9f3d71", .warps = 4 },
 +    .{ .name = "_merge", .hash = "1b591df9cb2a36b8781c8c52d287a476bbb3891464018703257e839253fa8c3a", .warps = 4 },
++    .{ .name = "_merge", .hash = "269ccb405f9181e54d01b8a1ace6959c7b4f6ba66e45d2f69c8a76df1d32a452", .warps = 4 },
 +    .{ .name = "_merge", .hash = "464eea3b7928bc75213c996616214a2c967dd9fbab5e1f85105b305823684119", .warps = 4 },
 +    .{ .name = "_merge", .hash = "55b907786083eaad20805a9d906ffa0305b386a4709a7816a2c6e02d597d1590", .warps = 4 },
 +    .{ .name = "_merge", .hash = "604efbadfc501050fde1e0f18ba1039f30e04149557944879cf42360e4e2b87c", .warps = 4 },
@@ -18273,11 +18277,14 @@ index 00000000..6be5ba50
 +    .{ .name = "_prep_kernel", .hash = "7d3cdc8e1cb17a6824a84a230c0e12ad89984af8910f238b75a7a613a3ee83d6", .warps = 1 },
 +    .{ .name = "_prep_kernel", .hash = "a1e02f512f8ba725366024ba1c2e61f32b3a612a5371dff7df8af47b2872b08f", .warps = 1 },
 +    .{ .name = "_prep_kernel", .hash = "c46158e9ca06ae269d40516d6a6110b322a1384175e7d25adbe956dc06067359", .warps = 1 },
++    .{ .name = "_residual_add", .hash = "eb3e5226feb064ba974c6f5037d11d447079289dea9fdcd3bd50ef6746b6aa84", .warps = 4 },
++    .{ .name = "_rmsnorm", .hash = "14e582a8230e78e0bc11992687f511e77c13782014c6f7eb4b54142065002438", .warps = 8 },
 +    .{ .name = "_rmsnorm", .hash = "6c10dc68271c091c29c5544c28c2432e708552662261defeff8797ba4538da91", .warps = 8 },
 +    .{ .name = "_rmsnorm", .hash = "917b8fd568079cc8ab3300feea1bd3a33fa56d9212598505fd69c1841956a3c9", .warps = 4 },
 +    .{ .name = "_rmsnorm", .hash = "b8997b95bd2893357669a89d641936b7a19b09b42a85ca927c68a7ff918c3e04", .warps = 4 },
 +    .{ .name = "_router_part", .hash = "001d89a61092f0069ce2d066216c758a015e79f63bdffda3dde2625646c65128", .warps = 4 },
 +    .{ .name = "_router_part", .hash = "15cb40b57512a4da37616cc51a75bbb0f7d2b4af59430040bfa040cc4cb2adc8", .warps = 4 },
++    .{ .name = "_router_part", .hash = "1e779ae71f98a66a51d7237977b155560c33fbc5bcc0e36a6af324ce8e2481c3", .warps = 4 },
 +    .{ .name = "_router_part", .hash = "39227e8519af9e721f3887cc6c23b107a3f087def12e6106e5a8df2daf7f8eca", .warps = 4 },
 +    .{ .name = "_router_part", .hash = "424365573cdaa1378fb40c0b9b9e14cf09f3978283367d01a187a27ff5e28ad2", .warps = 4 },
 +    .{ .name = "_router_part", .hash = "4fcba5d6043e1037b5f62f3a6a89277d9654f3d6bdcb76796b8790d80a47a6b5", .warps = 4 },
@@ -18294,6 +18301,7 @@ index 00000000..6be5ba50
 +    .{ .name = "_router_part", .hash = "dfb62ade90634731a0fac7625fc4a5def4fe43ba37be42f8210d579ad9b87bd8", .warps = 4 },
 +    .{ .name = "_router_part", .hash = "f615bb517fe234c435673e0e14a329af4691622e22922c1674f3d00ed8b1a342", .warps = 4 },
 +    .{ .name = "_router_sum", .hash = "e161440004040c2c56bb5056ee1ba3b24bfabd98f1e1103c67e26a9b49a328df", .warps = 4 },
++    .{ .name = "_scores", .hash = "09ae74dc78089d96ae8e9acab4e288a4f93574403616978423ed4064637e7b5c", .warps = 4 },
 +    .{ .name = "_scores", .hash = "47b7c85d4def5c6a2eaeaf7af3fc20f858cc2bd5a69ea20a1d2e41f3b38c9dcc", .warps = 4 },
 +    .{ .name = "_scores_rows", .hash = "1a534a1854999ff69b88994b806d1794d2b770eb90ba5162993d4113e840b7bd", .warps = 4 },
 +    .{ .name = "_scores_rows", .hash = "33eb9d053f55595c63b3ee3a580f7cc5355a29151ec715a168fd3ad7d7bf64c8", .warps = 4 },
@@ -18333,6 +18341,7 @@ index 00000000..6be5ba50
 +    .{ .name = "_select_split", .hash = "21b9aefa8e3faf160fa85b03bde27afbb3b4f007f1c8ed01f29b4ba0d87d365d", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "24747e99180bbd73a5abf0f9f8f31e46a0ad4eae588bb33c2fd4b91aa454a926", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "2f715d536cf8ed1076fe9c6491a3fc7e50bd667cd55a74fc42cd95abf1ed38fc", .warps = 4 },
++    .{ .name = "_select_split", .hash = "346686c3023eae7fa5ff7b122246d999c1e15cb7c8e847265fbd490e63f5db6a", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "3524af6100d6868ad1f38ea94e55490a0d064f55b1e7abb7ba162d99625cd211", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "36b0a8704beb15a5f5d6d7617dc1af56fb756e48aa2977293d61af6d1b1cafbd", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "3b25c96d92e3d7d0847523aa27a581aa30f947ab06c46db902364639f657bf23", .warps = 4 },
@@ -18345,6 +18354,7 @@ index 00000000..6be5ba50
 +    .{ .name = "_select_split", .hash = "53e1e2a593d5cfc3e7117d070912676ccba4dd61fb8e7a53d86c08f1448b0f2a", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "55200dba8f432c69972cfe7b7a97b4bac7c4cb36dd35b7c4dffc883d2a71b9ee", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "57be97d150c4a6d755784eec6c9970328fa0d12108d8f194bf3696518f82e274", .warps = 4 },
++    .{ .name = "_select_split", .hash = "5bac9d3d0cb4cca5dbfadba71eac5106764e13ae9f2e83e4cf828e53742b0d04", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "609dd6fb289d4dbf78f9952d56ea79f3b0fd0445e0e7bcda27b46189d720e023", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "63139d51166cc851cbbea86fc8461392c459ccaa1198e76cf8c9308bc88efbf5", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "68cdf33fe0476dad44719e874a7c48dd715f9a9694f268925ac46732456f20fe", .warps = 4 },
@@ -18354,6 +18364,7 @@ index 00000000..6be5ba50
 +    .{ .name = "_select_split", .hash = "7d41e5ca9390e774f68ccdbae67b29229ec9546507acb2d589446abcfaec5961", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "7dbf1c401c7be3a2d4611a3327080a6905bd56015c54788ceeb394787cfb13fb", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "7e850688ffd5255a8a09164270f424fe7048b0d00d42dd26fc1bceb1499ed3fb", .warps = 4 },
++    .{ .name = "_select_split", .hash = "85656b6e656eefb576bfc13427dabd3cb1eec01f075aea45dec2225f85a647fa", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "896cd3e927e7bda152961551afffedc36fac1d5c4dbcae4f8b71e18505f5d694", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "8e6395042ac36cec6335c7cccea4ceedd6b32d1ab2fc2f69cabc826a74b54b95", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "906de0291f53e1496d71982e8108637907a851a36f0176bbefeade258b7e3812", .warps = 4 },
@@ -18364,11 +18375,13 @@ index 00000000..6be5ba50
 +    .{ .name = "_select_split", .hash = "aadca97a8efebd844a2affe0bcabcac45f6f3d103d62d8cc6a0fc9022902ce80", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "b481ed0e8179735dd9bb282eb9a981e5dcfa5254508d7184f13beaf23a740558", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "b7fb5f0fdb3d8d523b283ec10efd1e7363c4d22c7534794466459058da6904f8", .warps = 4 },
++    .{ .name = "_select_split", .hash = "b9b309ea45068b01aa7b4547405bf3afe0ccec2857653f53c016fbb1f66ee178", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "bcbba8d586e339e8438b8c3c1cc0f2dd3c5034376e11c70f6f9c41712f78db90", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "be3a387750ec121425f8f2f9ff7869c7a92be0d10d80130364b99207b2919fb2", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "beb64d24162111e65bb522461344f61be2a2b85b9b5ab29effb1d6379b3438dd", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "c3ca589c68519b5be7347389a512a7e686d7b89d69f1301173c372c2e4a2fd6f", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "c777333605e3462a46a4b1a8fa10957f0a5fa562e2a5dd18ceb09b68369ce2c1", .warps = 4 },
++    .{ .name = "_select_split", .hash = "c879804c5b4d728c277234caab70fb186589c95d233d4268d2f9f4f22bbc4918", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "cb2fa07adf83207631a0a4e449e08269bd09bae570ded2bc321d915db3f50a5d", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "cb57f037867ed970a90ace37fd54221515173468c0c7082bebc2c5e716465dfe", .warps = 4 },
 +    .{ .name = "_select_split", .hash = "cbd83966875b37b267862eefb5b44d655c2e861b7ed59ee2764880a9df6a591d", .warps = 4 },

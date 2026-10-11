@@ -1,4 +1,4 @@
-TensorFold v1.0.7..9446bc2a (r107-int): glm-kernels
+TensorFold v1.0.7..ac66993d (r107-int): glm-kernels
 Apply from the checkout root with: git apply 0003-zig-glm-kernels.patch
 
 diff --git a/zig/kernels/cuda/glm_exl3.cu b/zig/kernels/cuda/glm_exl3.cu
