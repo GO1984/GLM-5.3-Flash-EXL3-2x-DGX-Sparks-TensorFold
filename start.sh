@@ -111,19 +111,26 @@ if [[ "$ENGINE" == zig ]]; then
   # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
   # cannot do yet is refused here, before anything is stopped, never silently dropped
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); use ENGINE=python or leave it at its default"; }
-  # features whose Zig ports are not in zig/patches yet are refused until ZIG_HAS names them (space-separated: mtp displaykv)
-  ZIG_HAS="${ZIG_HAS:-}"
-  [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (the MTP head is not in zig/patches yet; ZIG_HAS=mtp when it is)"
+  # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image.
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv}"
+  [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
-  [[ "$VISION" == 0 ]]                   || zig_unsupported "VISION=1 (image and video input)"
-  [[ "$SPILL_GIB" == 0 ]]                || zig_unsupported "the spill tier (SPILL_GIB)"
-  (( DISPLAY_KV_MIB == 0 )) || [[ " $ZIG_HAS " == *" displaykv "* ]] || zig_unsupported "DISPLAY_KV_MIB (not in zig/patches yet; ZIG_HAS=displaykv when it is)"
-  if (( TP == 3 )); then (( DRY )) || zig_unsupported "TP=3"; warn "ENGINE=zig: TP=3 is not in the Zig engine yet (its parser refuses --tp 3); printing the commands only"; fi
-  if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4"; warn "ENGINE=zig: TP=4 is not in the Zig engine yet (no split, ring or relay); printing the commands only"; fi
+  (( DISPLAY_KV_MIB == 0 )) || [[ " $ZIG_HAS " == *" displaykv "* ]] || zig_unsupported "DISPLAY_KV_MIB (set ZIG_HAS=displaykv)"
+  # TP=3/4 control plane is in the engine. This project does not run those GPUs; split prefill is two ranks only.
+  if (( TP == 3 )); then (( DRY )) || zig_unsupported "TP=3 (spark3 is not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=3 commands only (spark3 is not in this project)"; fi
+  if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4 (spark3/spark4 are not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=4 commands only (spark3/spark4 are not in this project)"; fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
-    warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL fail with MissingTritonVariant until more shapes are captured"
-  SERVE_ARGS+=(--backend cuda --prompt-cache-gib 0)  # (no prompt cache in the GLM Zig engine yet: kept prompt states are TODO)
+    warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
+  [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
+  [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+  if [[ "$SPILL_GIB" != 0 ]]; then
+    [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
+    SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
+                 --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
+  fi
+  # 0 is the qualified path. The engine keeps prompt states when this is raised.
+  SERVE_ARGS+=(--backend cuda --prompt-cache-gib 0)
 else
   [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
   [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)

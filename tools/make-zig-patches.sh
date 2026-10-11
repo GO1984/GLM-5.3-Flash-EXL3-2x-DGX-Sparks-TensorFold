@@ -45,7 +45,7 @@ for n in 1 2 3 4 5; do
   [[ -s "$tmp/g$n" ]] || { echo "group $n is empty" >&2; exit 1; }
   { printf 'TensorFold %s..%s (%s): %s\nApply from the checkout root with: git apply %s\n\n' "$base" "$(git -C "$repo" rev-parse --short "$branch")" "$branch" "${names[n-1]}" "$(basename "$f")"
     mapfile -t paths < "$tmp/g$n"
-    git -C "$repo" diff --no-renames --src-prefix=a/ --dst-prefix=b/ "$base" "$branch" -- "${paths[@]}"; } > "$f"
+    git -C "$repo" diff --binary --no-renames --src-prefix=a/ --dst-prefix=b/ "$base" "$branch" -- "${paths[@]}"; } > "$f"
   echo "$f ($(wc -l < "$tmp/g$n") files)"
 done
 # the captured kernel set: a deterministic tarball (sorted names, fixed owner and time)

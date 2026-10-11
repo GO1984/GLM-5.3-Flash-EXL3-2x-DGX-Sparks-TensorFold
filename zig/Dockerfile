@@ -12,7 +12,7 @@ FROM ${BUILD_IMAGE} AS build
 ARG ZIG_VERSION
 ARG ZIG_SHA256
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      ca-certificates curl git xz-utils python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
+      ca-certificates curl git xz-utils python3-pip python3-venv libibverbs-dev && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" && \
     echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
     mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz && \

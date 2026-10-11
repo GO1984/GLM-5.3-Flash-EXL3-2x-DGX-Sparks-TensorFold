@@ -1,4 +1,4 @@
-TensorFold v1.0.7..7684ca52 (r107-int): shared-engine
+TensorFold v1.0.7..9446bc2a (r107-int): shared-engine
 Apply from the checkout root with: git apply 0001-zig-shared-engine.patch
 
 diff --git a/.gitignore b/.gitignore
@@ -13,12 +13,88 @@ index ed482c2e..4a3024f3 100644
  
  # Native Qwen CPU-only Metal compiler receipts.
  .q27-metal-check/
+diff --git a/README.md b/README.md
+index 4b45c06b..aa96d8b4 100644
+--- a/README.md
++++ b/README.md
+@@ -2,7 +2,14 @@
+ 
+ TensorFold 1.0.7 serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.
+ The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
+-Serving needs no Python or MLX installation.
++Default serving needs no Python or MLX installation. The optional GLM display-memory
++`dispram` backend uses the installed kindling Python client and a shared CPython library.
++
++[Ash Hart (ashhart)](https://github.com/ashhart) and the TensorFold contributors authored TensorFold.
++[jschmied](https://github.com/jschmied) authored the Zig CUDA serving path and family registry
++([PR #443](https://github.com/ashhart/TensorFold/pull/443)).
++[b12x / local-inference-lab](https://github.com/local-inference-lab) authored the RoCEnante protocol
++used by the GLM RoCE transport (Apache-2.0).
+ 
+ ## Install and serve
+ 
+diff --git a/build.zig b/build.zig
+index 054e6882..ef9f7b9c 100644
+--- a/build.zig
++++ b/build.zig
+@@ -1,4 +1,5 @@
+ const std = @import("std");
++const vision_build = @import("zig/build/vision.zig");
+ const builtin = @import("builtin");
+ const cuda_build = @import("zig/build/cuda.zig");
+ const dist_build = @import("zig/build/dist.zig");
+@@ -174,6 +175,20 @@ pub fn build(b: *std.Build) void {
+     const warning_run = b.addRunArtifact(warning);
+     test_step.dependOn(&warning_run.step);
+     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
++    // GLM-5.3-Flash picture and clip input, the CPU side: decoders, resize, geometry, prompt expansion (zig/src/vision)
++    const vision_json = b.createModule(.{ .root_source_file = b.path("zig/src/server/json.zig"), .target = b.graph.host, .optimize = .safe });
++    const vision_tests = b.addTest(.{ .root_module = b.createModule(.{
++        .root_source_file = b.path("zig/src/vision/vision.zig"),
++        .target = b.graph.host,
++        .optimize = .safe,
++        .link_libc = true,
++        .imports = &.{.{ .name = "json", .module = vision_json }},
++    }) });
++    const vision_run = b.addRunArtifact(vision_tests);
++    vision_run.setCwd(b.path("."));
++    vision_run.has_side_effects = true; // reads fixtures and (optionally) FFmpeg libraries the build graph cannot see
++    test_step.dependOn(&vision_run.step);
++    b.step("test-vision", "GLM image/video input, the CPU side").dependOn(&vision_run.step);
+     grammar_build.steps(b, target, xgrammar);
+ }
+ 
+@@ -190,6 +205,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
+         .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = engines }, .{ .name = "checkpoint_cli", .module = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "native_engines", .module = engines }} }) } },
+     }) });
+     exe.root_module.addOptions("build_options", build_options);
++    vision_build.attach(b, exe.root_module, target, .ReleaseSafe);
+     if (test_step == null) {
+         exe.root_module.strip = true;
+         return exe;
+@@ -207,9 +223,12 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
+         .link_libc = true,
+         .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } },
+     });
++    vision_build.attach(b, server_tests, target, .Debug);
+     test_step.?.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests })).step);
+     // the parse half's tests, as their own test binary (zig/src/server/tool_parse_test.zig)
+-    const tool_parse_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } } }) });
++    const tool_parse_mod = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } } });
++    vision_build.attach(b, tool_parse_mod, target, .Debug);
++    const tool_parse_tests = b.addTest(.{ .root_module = tool_parse_mod });
+     test_step.?.dependOn(&b.addRunArtifact(tool_parse_tests).step);
+     // the engine seam's own tests (lane_host.zig), as zig/tests/server/zig_test.sh runs them
+     test_step.?.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api })).step);
 diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
-index 7f19ad92..3db9dfbe 100644
+index 7f19ad92..3cdcb161 100644
 --- a/zig/build/cuda.zig
 +++ b/zig/build/cuda.zig
-@@ -3,7 +3,7 @@
+@@ -1,9 +1,10 @@
+ //! The CUDA half of the root build: kernel fatbins with each Python extension's nvcc flags, the runtime, Nemotron, the CLI.
+ 
  const std = @import("std");
++const vision_build = @import("vision.zig");
  
  /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
 -const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
@@ -26,7 +102,7 @@ index 7f19ad92..3db9dfbe 100644
  
  /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
  const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
-@@ -12,6 +12,15 @@ const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
+@@ -12,6 +13,16 @@ const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
  const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=true", "--prec-sqrt=true" };
  
  const kernels = [_]Kernel{
@@ -36,13 +112,14 @@ index 7f19ad92..3db9dfbe 100644
 +    .{ .name = "glm_kda", .optional = true, .flags = &.{ "-O3", "--fmad=false" } },
 +    .{ .name = "glm_kda_chunk", .optional = true, .flags = &.{ "-O3", "--fmad=false" } },
 +    .{ .name = "glm_hc", .optional = true, .flags = &.{"-O3"} },
++    .{ .name = "glm_vision", .optional = true, .flags = &.{"-O3"} }, // the vision tower's norms, rotary, LayerNorm+GELU, conv GEMM chain, flash-attention order
 +    .{ .name = "glm_exl3", .optional = true, .flags = &.{"-O3"} },
 +    .{ .name = "glm_qmm", .optional = true, .flags = &.{"-O3"} },
 +    .{ .name = "glm_qmm_prefill", .optional = true, .flags = &.{"-O3"} },
      .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
      .{ .name = "probe", .flags = &.{"-O3"} },
      .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
-@@ -42,6 +51,26 @@ const kernels = [_]Kernel{
+@@ -42,6 +53,26 @@ const kernels = [_]Kernel{
      .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
      .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
      .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
@@ -69,7 +146,7 @@ index 7f19ad92..3db9dfbe 100644
  };
  
  /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
-@@ -63,16 +92,27 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+@@ -63,16 +94,27 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
  fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
      const options = b.addOptions();
      var with = images.len > 0;
@@ -100,7 +177,7 @@ index 7f19ad92..3db9dfbe 100644
      const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
      const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
      core.addImport("tokenizer", tokenizer);
-@@ -84,7 +124,20 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
+@@ -84,7 +126,20 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
      nemotron.addImport("lanes", lanes);
      nemotron.addImport("heat", heat);
      nemotron.addImport("nemotron_draft_ids", draft_ids);
@@ -122,7 +199,7 @@ index 7f19ad92..3db9dfbe 100644
  }
  
  /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
-@@ -103,20 +156,29 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+@@ -103,20 +158,29 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
      const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
      for (kernels, &images) |k, *image| {
          if (prebuilt) |dir| {
@@ -155,7 +232,7 @@ index 7f19ad92..3db9dfbe 100644
      cli.addOptions("build_options", build_options);
      cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines));
      b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
-@@ -125,18 +187,32 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+@@ -125,18 +189,35 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
      runner.addImport("lanes", mods.lanes);
      runner.addImport("nemotron", mods.nemotron);
      b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
@@ -168,6 +245,9 @@ index 7f19ad92..3db9dfbe 100644
 +    const weights_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
 +    const hc_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_hc_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
 +    b.step("glm-hc-check", "Build tf-glm-hc-check: HC partial byte oracle (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-hc-check", .root_module = hc_check }), .{}).step);
++    // GLM vision tower: the GPU tower against the Python reference's stages (zig/tests/vision/tower)
++    const vision_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_vision_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
++    b.step("glm-vision-check", "Build tf-glm-vision-check: the vision tower stage by stage against the Python tower (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-vision-check", .root_module = vision_check }), .{}).step);
 +    // GLM P5: glm_msa.cu on the GPU against the host attention (zig/tests/cuda/glm_p5/msa_check.zig): its own step
 +    const msa_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_p5/msa_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
 +    b.step("glm-p5-msa", "tf-glm-p5-msa [ROWS] [CACHE_ROWS]: glm_msa.cu against the host attention, row independence").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-p5-msa", .root_module = msa_check }), .{}).step);
@@ -191,7 +271,7 @@ index 7f19ad92..3db9dfbe 100644
      });
      return .{ .api = api, .engines = mod };
  }
-@@ -147,8 +223,8 @@ fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
+@@ -147,8 +228,8 @@ fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
  }
  
  /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
@@ -202,7 +282,15 @@ index 7f19ad92..3db9dfbe 100644
      // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
      const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
      const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
-@@ -176,7 +252,30 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+@@ -159,6 +240,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
+         .imports = &.{ .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines }, .{ .name = "checkpoint_cli", .module = checkpointCli(b, target, .ReleaseSafe, null, m.engines) } },
+     }) });
+     exe.root_module.addOptions("build_options", build_options);
++    vision_build.attach(b, exe.root_module, target, .ReleaseSafe);
+     if (!install_native) {
+         exe.root_module.strip = true;
+         return exe;
+@@ -176,7 +258,30 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
      step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
      const cuda = runtime(b, host, .debug, &.{});
      const mods = family(b, host, .debug, cuda, draft_ids);
@@ -234,8 +322,11 @@ index 7f19ad92..3db9dfbe 100644
      const native = native_modules.engines;
      // the HTTP server's unit tests (zig/src/server/root.zig), which the macOS build runs, on Linux hosts too
      const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .debug, .link_libc = true });
-@@ -189,13 +288,29 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+@@ -187,15 +292,32 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+         .link_libc = true,
+         .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } },
      });
++    vision_build.attach(b, server_tests, host, .debug);
      const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
      step.dependOn(&server_test.step);
 +    serve_test.dependOn(&server_test.step);
@@ -251,7 +342,7 @@ index 7f19ad92..3db9dfbe 100644
 +    const glm_weights = b.addRunArtifact(b.addTest(.{ .root_module = glm_weights_mod }));
 +    b.step("test-glm-weights", "GLM-5.3-Flash CUDA config and EXL3 weight-plan tests (CPU, headers only)").dependOn(&glm_weights.step);
 +    step.dependOn(&glm_weights.step);
-+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, mods.glm, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, mods.glm_cuda, mods.glm, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
 +    const glm_mm = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_cuda/cuda_matmuls.zig"), .target = host, .optimize = .debug, .link_libc = true });
 +    glm_mm.addImport("cuda", cuda);
 +    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm_mm })).step);
@@ -265,7 +356,7 @@ index 7f19ad92..3db9dfbe 100644
      cli.addOptions("build_options", build_options);
      cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines));
      step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
-@@ -222,11 +337,12 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
+@@ -222,11 +344,12 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
  pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, prebuilt: ?[]const u8) *std.Build.Step.Compile {
      var images: [kernels.len]?std.Build.LazyPath = @splat(null);
      if (prebuilt) |dir| for (kernels, &images) |k, *image| {
@@ -280,7 +371,7 @@ index 7f19ad92..3db9dfbe 100644
  }
  
  /// SASS targets every release fatbin holds: Ampere (sm_86), RTX 50 and RTX PRO Blackwell (sm_120), GB10 (sm_121).
-@@ -237,6 +353,14 @@ pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
+@@ -237,6 +360,14 @@ pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
      const tool = b.addExecutable(.{ .name = "check-fatbins", .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = b.graph.host }) });
      const check = b.addRunArtifact(tool);
      check.addArg(release_sms);
@@ -321,10 +412,30 @@ index 88a205f7..63dee906 100644
      var positional: std.ArrayList([]const u8) = .empty;
      defer positional.deinit(gpa);
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index f72c13b2..a3455576 100644
+index f72c13b2..f395c747 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -78,6 +78,9 @@ pub const Request = struct {
+@@ -31,6 +31,8 @@ pub const CallGate = struct {
+     names: []const []const u8 = &.{},
+     think_open: ?u32 = null,
+     think_end: ?u32 = null,
++    /// Ids of the tokens that are only whitespace, sorted: they may precede the opener (the server scans the vocabulary).
++    blank: []const u32 = &.{},
+ };
+ 
+ /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
+@@ -46,6 +48,10 @@ pub const Structure = struct {
+ 
+ pub const grammar = lanes.grammar;
+ 
++/// A prompt's pictures and clips, prepared by the vision frontend (rows, canvases or features).
++pub const Media = lanes.Media;
++pub const MediaItem = lanes.MediaItem;
++
+ /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
+ pub const Request = struct {
+     prompt: []const u32,
+@@ -78,10 +84,15 @@ pub const Request = struct {
      structure: ?Structure = null,
      /// Stop a short exact cycle while the think block is open.
      loop_guard: bool = false,
@@ -334,7 +445,43 @@ index f72c13b2..a3455576 100644
      /// The prompt row (the assistant header's last) where routed lessons decide whether they act (null: none acts).
      decide: ?u32 = null,
      /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
-@@ -216,7 +219,8 @@ pub const Open = struct {
+     logprobs: ?u8 = null,
++    /// The prompt's pictures and clips (``Info.media`` engines only); such a prompt is never kept or resumed.
++    media: ?*const Media = null,
+ };
+ 
+ pub const Reason = enum { stop, length, cancelled, failed };
+@@ -138,6 +149,8 @@ pub const Info = struct {
+     prefill_step: u32 = 0,
+     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
+     prompt_cache: bool = false,
++    /// The engine takes ``Request.media`` (picture and clip rows).
++    media: bool = false,
+     /// The policy the engine runs under, one line (`/health` shows it); empty: none.
+     policy: []const u8 = "",
+     /// A line the server prints once at startup (the engine's memory plan); empty: none.
+@@ -190,6 +203,13 @@ pub const Open = struct {
+     speed_up: ?[]const u8 = null,
+     prompt_cache_gib: ?f64 = null,
+     prompt_cache_over_cap: bool = false,
++    /// The spill tier (--snapshot-dir, --spill-*; GLM CUDA): kept states written to disk and read back. gib 0: off.
++    spill_dir: ?[]const u8 = null,
++    spill_gib: f64 = 0,
++    spill_highwater: f64 = 0.70,
++    spill_min_tokens: u32 = 8192,
++    spill_min_free_gib: f64 = 50,
++    spill_flush_s: ?f64 = null,
+     /// --learn: where shared prompt states are kept on disk for later sessions and servers (null: off).
+     learn: ?[]const u8 = null,
+     /// --learn-min-free-gib: filesystem space kept free before any learned-state write.
+@@ -213,10 +233,15 @@ pub const Open = struct {
+     master_port: u16 = 29551,
+     /// --policy: the engine's policy as `key=value,...`; empty: its defaults.
+     policy: []const u8 = "",
++    /// --vision (rank 0): picture and clip input, the engine hosts the vision tower.
++    vision: bool = false,
++    /// --vision-backend zig: rank 0's engine loads the vision tower itself
++    vision_zig: bool = false,
  };
  
  /// An opened engine; ``close`` stops its thread and frees its backend.
@@ -344,21 +491,45 @@ index f72c13b2..a3455576 100644
  
  pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
  
-@@ -245,6 +249,9 @@ pub const Status = struct {
+@@ -245,6 +270,11 @@ pub const Status = struct {
      streams: usize = 0,
      /// Generated tokens held by live streams, excluding their prompts.
      generation_tokens: u64 = 0,
 +    /// The shared cache pool's rows and the free ones, for an engine that pools them (null: no pool to report).
 +    pool_tokens: ?u64 = null,
 +    pool_free_tokens: ?u64 = null,
++    /// The kept prompt states (/health's kept_prompts, kept_bytes, kept_mix); null without a prompt cache.
++    kept: ?prompt_cache.KeptStats = null,
  };
  
  pub const SubmitError = error{ Closed, Busy, InvalidSpans };
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 09ff0fa2..b3373780 100644
+index 09ff0fa2..56e3c1b1 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -91,7 +91,18 @@ pub const LaneHost = struct {
+@@ -38,6 +38,9 @@ pub const LaneHost = struct {
+     /// A Metal engine's keepalive target, set by the family that owns the queue; null keeps the ticker off.
+     keepalive_target: ?api.keepalive.Target = null,
+     live_generated: u64 = 0,
++    /// the prompt cache's numbers as of its last change (status.noteKept), for /health
++    kept_view: ?pc.KeptStats = null,
++    extra_status: ?struct { ctx: *anyopaque, read: *const fn (*anyopaque, *api.Status) void } = null,
+     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
+     lone_job: ?*Job = null, // the job that driver holds now
+     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+@@ -71,7 +74,10 @@ pub const LaneHost = struct {
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request));
++            if (job.host.cache) |store| {
++                _ = store.keep(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request));
++                status.noteKept(job.host);
++            }
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -91,7 +97,18 @@ pub const LaneHost = struct {
          return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
      }
  
@@ -377,7 +548,7 @@ index 09ff0fa2..b3373780 100644
          h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
      }
  
-@@ -267,25 +278,28 @@ pub const LaneHost = struct {
+@@ -267,37 +284,41 @@ pub const LaneHost = struct {
          h.mutex.unlock(h.io);
      }
  
@@ -411,7 +582,13 @@ index 09ff0fa2..b3373780 100644
          };
          h.unlock();
          const r = job.request;
-@@ -297,7 +311,7 @@ pub const LaneHost = struct {
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
++        // a prompt with pictures or clips is neither resumed nor kept
++        if (r.media == null) if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
              job.marks = l.marks;
              reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
          } else |_| {};
@@ -420,9 +597,11 @@ index 09ff0fa2..b3373780 100644
          job.stream = lanes.Stream.init(h.gpa, .{
              .id = "request",
              .prompt = r.prompt,
-@@ -314,29 +328,119 @@ pub const LaneHost = struct {
+@@ -313,30 +334,122 @@ pub const LaneHost = struct {
+             .think_close = r.think_close,
              .think_end = if (r.think_end) |t| t else -1,
              .logprobs = r.logprobs,
++            .call = if (r.call) |c| .{ .opener = c.opener, .think_open = if (c.think_open) |t| t else -1, .think_end = if (c.think_end) |t| t else -1, .blank = c.blank } else null,
              .loop_guard = r.loop_guard,
 +            .loop_rule = if (r.loop_recipe) .recipe else .mac,
              .chunks = r.chunks,
@@ -436,6 +615,7 @@ index 09ff0fa2..b3373780 100644
              } else null,
              .decode_spans = h.spans(r),
              .decide = r.decide,
++            .media = r.media,
          }) catch {
              job.proposer.deinit();
 -            return h.drop(job, "out of memory");
@@ -473,7 +653,7 @@ index 09ff0fa2..b3373780 100644
 +                if (r.max_tokens == 0 or h.loneFits(job)) {
 +                    _ = h.startJob(job);
 +                } else if (n < burst.len and h.core.batches() and job.stream.reuse.at == 0 and
-+                    job.stream.reuse.marks.len == 0 and r.logprobs == null and r.structure == null)
++                    job.stream.reuse.marks.len == 0 and r.media == null and r.logprobs == null and r.structure == null)
 +                {
 +                    burst[n] = job;
 +                    n += 1;
@@ -543,8 +723,28 @@ index 09ff0fa2..b3373780 100644
          h.core.addStream(&job.stream) catch |e| return switch (e) {
              error.Cancelled => h.cancel(job),
              error.LaneMemory => h.requeue(job),
-@@ -423,7 +527,7 @@ pub const LaneHost = struct {
-         if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
+@@ -392,6 +505,7 @@ pub const LaneHost = struct {
+         h.unlock();
+         job.reported();
+         if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
++        status.noteKept(h);
+         emit(job, .{ .prefilled = job.stream.cached });
+     }
+ 
+@@ -410,6 +524,7 @@ pub const LaneHost = struct {
+         };
+         h.prefilled(job, began);
+         if (h.cache) |store| _ = store.keep(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request));
++        status.noteKept(h);
+         be.release(&job.stream);
+         h.remove(job);
+         h.finish(job, .length, "");
+@@ -420,10 +535,10 @@ pub const LaneHost = struct {
+     fn loneFits(h: *LaneHost, job: *Job) bool {
+         const r = job.request;
+         const lone = h.lone orelse return false;
+-        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
++        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null or r.media != null) return false;
          h.lock();
          defer h.unlock();
 -        return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0;
@@ -552,7 +752,7 @@ index 09ff0fa2..b3373780 100644
      }
  
      /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
-@@ -525,7 +629,7 @@ pub const LaneHost = struct {
+@@ -525,7 +640,7 @@ pub const LaneHost = struct {
      fn run(h: *LaneHost) void {
          while (true) {
              h.takeCancels();
@@ -561,7 +761,7 @@ index 09ff0fa2..b3373780 100644
              h.fillOne();
              status.noteLive(h);
              h.lock();
-@@ -540,7 +644,7 @@ pub const LaneHost = struct {
+@@ -540,7 +655,7 @@ pub const LaneHost = struct {
                  h.closeAll();
                  continue;
              }
@@ -639,6 +839,29 @@ index 549121dd..997d9049 100644
 +    }
 +    try std.testing.expect(target.fill_steps > 0);
 +}
+diff --git a/zig/src/core/lane_host_status.zig b/zig/src/core/lane_host_status.zig
+index a92bf19a..cb5a8357 100644
+--- a/zig/src/core/lane_host_status.zig
++++ b/zig/src/core/lane_host_status.zig
+@@ -27,7 +27,18 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
+         .preemptions = 0,
+         .streams = n,
+         .generation_tokens = h.live_generated,
++        .kept = h.kept_view,
+     };
++    if (h.extra_status) |source| source.read(source.ctx, out);
++}
++
++/// The store's numbers for /health, copied under the lock (the store itself is the engine thread's alone).
++pub fn noteKept(h: *LaneHost) void {
++    const store = h.cache orelse return;
++    const view = store.keptStats();
++    h.mutex.lockUncancelable(h.io);
++    defer h.mutex.unlock(h.io);
++    h.kept_view = view;
+ }
+ 
+ /// `n` tokens delivered now; marks older than the window drop.
 diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
 index 9d8d9d33..5957466d 100644
 --- a/zig/src/core/lanes/backend.zig
@@ -753,7 +976,7 @@ index 78185920..0637002b 100644
              for (whos, out) |*w, *o| {
                  const inner = try r.headDepth(w, null, probe);
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index 4339af40..3c384bd8 100644
+index 4339af40..799869c3 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
 @@ -25,6 +25,10 @@ const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follo
@@ -958,6 +1181,32 @@ index 4339af40..3c384bd8 100644
          _ = e.arena.reset(.retain_capacity);
          const a = e.arena.allocator();
          try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
+@@ -154,7 +300,7 @@ pub const Engine = struct {
+         } else {
+             for (live.items) |s| {
+                 // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
+-                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
++                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null or s.gateWatching();
+                 const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
+                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
+             }
+@@ -374,8 +520,15 @@ pub const Engine = struct {
+         const budget_cut = s.thinkCut(committed.items);
+         const loop_cut = sm.loopCut(s, committed.items);
+         const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
++        const gate_cut = s.gateCut(committed.items);
++        const gate_wins = if (gate_cut) |g| (if (loop_wins) g < loop_cut.? else budget_cut == null or g < budget_cut.?) else false;
+         var cut: ?usize = null;
+-        if (loop_wins) {
++        if (gate_wins) {
++            cut = gate_cut;
++            path = path[0 .. gate_cut.? + 1];
++            committed.shrinkRetainingCapacity(gate_cut.?);
++            try committed.append(a, s.gate.?.spec.opener);
++        } else if (loop_wins) {
+             cut = loop_cut;
+             path = path[0 .. loop_cut.? + 1];
+             committed.shrinkRetainingCapacity(loop_cut.? + 1);
 diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
 index 2100cc37..2f43b921 100644
 --- a/zig/src/core/lanes/engine_test.zig
@@ -1147,10 +1396,19 @@ index dd60ca7f..93ed09d2 100644
              var l = kv.value;
              freeLane(x.gpa, &l);
 diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
-index 910f5016..f5015a11 100644
+index 910f5016..8701d5b8 100644
 --- a/zig/src/core/lanes/lanes.zig
 +++ b/zig/src/core/lanes/lanes.zig
-@@ -40,6 +40,7 @@ test {
+@@ -31,6 +31,8 @@ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+ pub const Model = config.Model;
+ pub const Stream = stream.Stream;
++pub const Media = stream.Media;
++pub const MediaItem = stream.MediaItem;
+ pub const Sampling = sampling.Sampling;
+ pub const SuffixLookup = proposer.SuffixLookup;
+ pub const LogprobRow = logprob.Row;
+@@ -40,6 +42,7 @@ test {
      _ = @import("engine_test.zig");
      _ = @import("gpu_full_test.zig");
      _ = @import("drafted_test.zig");
@@ -1159,24 +1417,29 @@ index 910f5016..f5015a11 100644
  
  pub const learned_disk = @import("learned_disk.zig");
 diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
-index 7cddf9a0..3fce51e5 100644
+index 7cddf9a0..5b4e577f 100644
 --- a/zig/src/core/lanes/open.zig
 +++ b/zig/src/core/lanes/open.zig
-@@ -38,7 +38,7 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+@@ -37,8 +37,12 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+     const drawn = try e.drawFirst(s, position);
      var feed: Feed = .{ .handle = drawn };
      if (try e.forcedNext(s)) |t| feed = .{ .value = t };
++    if (s.gateWatching() and feed == .handle) { // the call gate reads the first draw: a reply that skips the opener opens it
++        const drawn_token = try e.backend.read(drawn);
++        feed = .{ .value = if (s.gateCut(&.{drawn_token}) != null) s.gate.?.spec.opener else drawn_token };
++    }
      var asked: ?u32 = null;
 -    if (e.cfg.family_mtp and s.drafts) {
 +    if (e.cfg.family_mtp and s.drafts and !e.cfg.join_batch) {
          // the head reads the prompt's last row and the first token, and drafts the one after it
          const d: u32 = @intCast(try e.rule.depth(win.who(s)));
          asked = d;
-@@ -48,11 +48,16 @@ pub fn opened(e: *Engine, s: *Stream) !void {
+@@ -48,11 +52,16 @@ pub fn opened(e: *Engine, s: *Stream) !void {
          if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
              s.next = held; // a tree head's first drafts as host tokens, as every later round's
          };
 -    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
-+    } else if (!(e.cfg.family_mtp and s.drafts) and e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
++    } else if (!(e.cfg.family_mtp and s.drafts) and e.cfg.pipelined and s.logprobs == null and s.grammar == null and !s.gateWatching()) {
          try e.queueNext(s, feed);
      }
      const value = try e.readFeed(feed);
@@ -1190,7 +1453,7 @@ index 7cddf9a0..3fce51e5 100644
          const first = if (feed == .handle) value else try e.backend.read(drawn);
          try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
-index d43d01b1..5578426e 100644
+index d43d01b1..c365adc0 100644
 --- a/zig/src/core/lanes/stream.zig
 +++ b/zig/src/core/lanes/stream.zig
 @@ -23,6 +23,9 @@ pub const Reason = enum {
@@ -1224,7 +1487,7 @@ index d43d01b1..5578426e 100644
      }
      return null;
  }
-@@ -64,6 +74,10 @@ pub fn detectLoop(emitted: []const u32) ?u32 {
+@@ -64,6 +74,78 @@ pub fn detectLoop(emitted: []const u32) ?u32 {
      return cycleAt(emitted, &.{}, emitted.len);
  }
  
@@ -1232,10 +1495,145 @@ index d43d01b1..5578426e 100644
 +    return firedAt(s.loop_rule, s.emitted(), &.{}, s.emitted().len);
 +}
 +
++/// tool_choice "required" or a named function: outside a think block the reply opens a call. The first token that
++/// is neither the opener, whitespace, nor a think-block mark becomes the opener (Python call_gate.CallGate, answer
++/// phase; the call's name is the model's own).
++pub const CallSpec = struct {
++    opener: u32,
++    think_open: i64 = -1,
++    think_end: i64 = -1,
++    blank: []const u32 = &.{},
++};
++
++pub const Gate = struct {
++    spec: CallSpec,
++    armed: bool,
++    done: bool = false,
++
++    /// Armed unless the prompt leaves a think block open (its last opener after its last end).
++    pub fn init(spec: CallSpec, prompt: []const u32) Gate {
++        var last_open: isize = -1;
++        var last_end: isize = -1;
++        for (prompt, 0..) |t, i| {
++            if (@as(i64, t) == spec.think_open) last_open = @intCast(i);
++            if (@as(i64, t) == spec.think_end) last_end = @intCast(i);
++        }
++        const held = spec.think_open >= 0 and spec.think_end >= 0 and last_open > last_end;
++        return .{ .spec = spec, .armed = !held };
++    }
++
++    fn isBlank(g: Gate, t: u32) bool {
++        return std.sort.binarySearch(u32, g.spec.blank, t, struct {
++            fn order(key: u32, item: u32) std.math.Order {
++                return std.math.order(key, item);
++            }
++        }.order) != null;
++    }
++
++    /// The state after `t`, and whether `t` breaks the call (the opener replaces it).
++    fn step(g: Gate, t: u32) struct { g: Gate, breaks: bool } {
++        var n = g;
++        if (n.done) return .{ .g = n, .breaks = false };
++        if (!n.armed) {
++            n.armed = @as(i64, t) == n.spec.think_end;
++        } else if (@as(i64, t) == n.spec.think_open) {
++            n.armed = false;
++        } else if (t == n.spec.opener) {
++            n.done = true;
++        } else if (!g.isBlank(t)) {
++            n.done = true;
++            return .{ .g = n, .breaks = true };
++        }
++        return .{ .g = n, .breaks = false };
++    }
++
++    /// The index in the next committed `tokens` that the opener replaces.
++    pub fn cut(g: Gate, tokens: []const u32) ?usize {
++        var state = g;
++        for (tokens, 0..) |t, i| {
++            const r = state.step(t);
++            if (r.breaks) return i;
++            state = r.g;
++        }
++        return null;
++    }
++
++    pub fn observe(g: *Gate, t: u32) void {
++        g.* = g.step(t).g;
++    }
++};
++
  /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
  pub const StopCheck = struct {
      ptr: *anyopaque,
-@@ -113,6 +127,7 @@ pub const Spec = struct {
+@@ -97,6 +179,66 @@ pub const Held = struct {
+     parents: ?[]i32 = null,
+ };
+ 
++/// One picture or clip for the vision tower: a uint8 canvas [frames, 3, h, w] (CHW, frames 1 for a picture, which the
++/// tower pairs with itself; an even count for a clip). h and w are multiples of 28.
++pub const MediaItem = struct {
++    video: bool = false,
++    frames: u32 = 1,
++    h: u32,
++    w: u32,
++    data: []const u8,
++
++    /// The feature rows the tower gives it: one per 28x28 block of each frame pair.
++    pub fn rows(it: MediaItem) usize {
++        const pairs: usize = if (it.video) it.frames / 2 else 1;
++        return pairs * (it.h / 28) * (it.w / 28);
++    }
++};
++
++/// A prompt's pictures and clips (GLM vision): the prompt rows the tower's features replace (ascending), and either
++/// the features already encoded (bf16 [rows.len, width]) or the canvases for the engine's own tower. A prompt with
++/// media is neither kept nor resumed, and prefills alone.
++pub const Media = struct {
++    rows: []const u32,
++    width: u32 = 4096,
++    /// host bf16 features [rows.len, width] (an out-of-process tower); empty: encode `items` on the engine's tower
++    features: []const u8 = &.{},
++    items: []const MediaItem = &.{},
++    /// a following rank's copy (two ranks): the feature rows' count only; rows and features arrive by rank 0's broadcast
++    follower_rows: u32 = 0,
++
++    pub fn rowCount(m: *const Media) usize {
++        return if (m.follower_rows > 0) m.follower_rows else m.rows.len;
++    }
++
++    pub fn featureBytes(m: *const Media) usize {
++        return m.rowCount() * @as(usize, m.width) * 2;
++    }
++
++    pub fn check(m: *const Media, prompt_len: usize) error{BadMedia}!void {
++        if (m.follower_rows > 0) {
++            if (m.rows.len != 0 or m.features.len != 0 or m.items.len != 0 or m.width == 0 or m.follower_rows > prompt_len) return error.BadMedia;
++            return;
++        }
++        if (m.rows.len == 0 or m.width == 0) return error.BadMedia;
++        if (m.features.len != 0 and m.features.len != m.featureBytes()) return error.BadMedia;
++        if (m.features.len == 0) {
++            var n: usize = 0;
++            for (m.items) |it| {
++                if (it.h == 0 or it.w == 0 or it.h % 28 != 0 or it.w % 28 != 0 or (it.video and (it.frames == 0 or it.frames % 2 != 0)) or (!it.video and it.frames != 1)) return error.BadMedia;
++                if (it.data.len != @as(usize, it.frames) * 3 * it.h * it.w) return error.BadMedia;
++                n += it.rows();
++            }
++            if (n != m.rows.len) return error.BadMedia;
++        }
++        var last: ?u32 = null;
++        for (m.rows) |r| {
++            if (r >= prompt_len or (last != null and r <= last.?)) return error.BadMedia;
++            last = r;
++        }
++    }
++};
++
+ pub const Spec = struct {
+     id: []const u8,
+     prompt: []const u32,
+@@ -113,6 +255,7 @@ pub const Spec = struct {
      think_end: i64 = -1,
      think_open: ?bool = null, // null: open when a budget is set (the server's rule)
      loop_guard: bool = false,
@@ -1243,15 +1641,42 @@ index d43d01b1..5578426e 100644
      chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
      history_len: u32 = 0, // prompt prefix lengths a backend may keep for a later turn: the rendered history,
      shared_prefixes: []const u32 = &.{}, // then shared system blocks
-@@ -139,6 +154,7 @@ pub const Stream = struct {
+@@ -120,7 +263,9 @@ pub const Spec = struct {
+     decide: ?u32 = null, // the prompt row where living lessons decide whether they act on the reply
+     logprobs: ?u8 = null, // the target's log probabilities for each committed token, with this many best tokens
+     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
++    call: ?CallSpec = null, // tool_choice required / a named function
+     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
++    media: ?*const Media = null,
+ };
+ 
+ pub const Stream = struct {
+@@ -139,17 +284,24 @@ pub const Stream = struct {
      think_end: i64,
      think_open: bool,
      loop_guard: bool,
 +    loop_rule: LoopRule = .mac,
      loop_period: ?u32 = null,
++    /// Structured output: the first token's allowed bits a driver hands the backend (rank 1 of a pair has no grammar of
++    /// its own); empty: the backend reads the stream's grammar.
++    first_mask: []const u32 = &.{},
      chunks: []const u32,
      history_len: u32,
-@@ -170,6 +186,7 @@ pub const Stream = struct {
+     shared_prefixes: []const u32,
+     logprobs: ?u8 = null,
+     grammar: ?*grammar.Constraint = null, // follows each committed token; its masks keep the draws inside it
++    gate: ?Gate = null,
+     problem: []const u8 = "", // why a stream finished with `error` (static text)
+     rows: std.ArrayList(Row) = .empty, // with `logprobs`: one a token of emitted(), in order
+     reuse: Reuse = .{},
+     decode_spans: []const [2]u32 = &.{},
+     decide: ?u32 = null,
++    /// the prompt's pictures and clips (null: text); valid until the stream is released
++    media: ?*const Media = null,
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
+@@ -170,6 +322,7 @@ pub const Stream = struct {
      picks: [plan_lanes.sizes.len + 1]u32 = @splat(0), // the planner's picks: each tree size, then chain + grafts
      graft_room: ?u32 = null, // grafted rows the planner left this round's window (null: no planner)
      held_levels: u32 = 0, // head levels drafted for the held window
@@ -1259,7 +1684,7 @@ index d43d01b1..5578426e 100644
      round_over: ?f64 = null, // the stream's round time beyond its window and head levels (ms, recent): chains
      tree_over: ?f64 = null, // and trees
      measured: [plan_lanes.sizes.len + 1]plan_lanes.Measured = @splat(.{}), // each pick's round times past its table price
-@@ -201,6 +218,7 @@ pub const Stream = struct {
+@@ -201,6 +354,7 @@ pub const Stream = struct {
              .think_end = spec.think_end,
              .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
              .loop_guard = spec.loop_guard,
@@ -1267,7 +1692,25 @@ index d43d01b1..5578426e 100644
              .chunks = spec.chunks,
              .history_len = spec.history_len,
              .shared_prefixes = spec.shared_prefixes,
-@@ -351,7 +369,7 @@ pub const Stream = struct {
+@@ -208,7 +362,9 @@ pub const Stream = struct {
+             .decide = spec.decide,
+             .logprobs = spec.logprobs,
+             .grammar = spec.grammar,
++            .gate = if (spec.call) |c| Gate.init(c, spec.prompt) else null,
+             .decode_spans = spec.decode_spans,
++            .media = spec.media,
+         };
+         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
+         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
+@@ -338,6 +494,7 @@ pub const Stream = struct {
+             if (rows.len > 0) try s.rows.append(gpa, rows[i]);
+             landed += 1;
+             if (@as(i64, t) == s.think_end) s.think_open = false;
++            if (s.gate) |*g| g.observe(t);
+             if (s.grammar) |g| {
+                 if (!try g.follow(t)) {
+                     s.finished = true;
+@@ -351,7 +508,7 @@ pub const Stream = struct {
                      break;
                  }
              }
@@ -1276,8 +1719,504 @@ index d43d01b1..5578426e 100644
              if (s.isEos(t) or s.stopped()) {
                  s.finished = true;
                  s.reason = .stop;
+@@ -382,6 +539,18 @@ pub const Stream = struct {
+         return c.check(c.ptr, s.emitted());
+     }
+ 
++    /// The call gate still has to see the reply's first non-blank token: rounds are verify windows until then.
++    pub fn gateWatching(s: *const Stream) bool {
++        const g = s.gate orelse return false;
++        return !g.done;
++    }
++
++    /// The index in `tokens` (the next committed) the call gate replaces with the opener.
++    pub fn gateCut(s: *const Stream, tokens: []const u32) ?usize {
++        const g = s.gate orelse return null;
++        return g.cut(tokens);
++    }
++
+     pub fn popForce(s: *Stream) ?u32 {
+         if (s.force.items.len == 0) return null;
+         return s.force.orderedRemove(0);
+@@ -434,3 +603,53 @@ test "loop guard fires, closes thinking, and latches once" {
+     _ = try s.commit(gpa, &.{8}, &.{});
+     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+ }
++
++test "call gate: a reply that skips the opener opens it; blanks and think blocks pass" {
++    const spec: CallSpec = .{ .opener = 50, .think_open = 60, .think_end = 61, .blank = &.{ 10, 11 } };
++    // prompt ends with an empty think block: armed from the first token
++    var g = Gate.init(spec, &.{ 1, 60, 61 });
++    try std.testing.expect(g.armed);
++    try std.testing.expectEqual(@as(?usize, 1), g.cut(&.{ 10, 7, 8 }));
++    try std.testing.expectEqual(@as(?usize, null), g.cut(&.{ 10, 11, 50, 7 }));
++    g.observe(10);
++    g.observe(50);
++    try std.testing.expect(g.done);
++    try std.testing.expectEqual(@as(?usize, null), g.cut(&.{ 7, 8 }));
++    // prompt leaves a think block open: held until its end
++    var h = Gate.init(spec, &.{ 1, 60 });
++    try std.testing.expect(!h.armed);
++    try std.testing.expectEqual(@as(?usize, 2), h.cut(&.{ 7, 61, 8 }));
++    h.observe(7);
++    h.observe(61);
++    try std.testing.expect(h.armed and !h.done);
++    // a think block opened in the reply holds the gate again
++    try std.testing.expectEqual(@as(?usize, null), (Gate.init(spec, &.{1})).cut(&.{ 60, 7, 8 }));
++}
++
++test "call gate in commit: observe follows committed tokens" {
++    const gpa = std.testing.allocator;
++    var s = try Stream.init(gpa, .{ .id = "g", .prompt = &.{ 1, 61 }, .max_new = 10, .call = .{ .opener = 50, .think_open = 60, .think_end = 61 } });
++    defer s.deinit(gpa);
++    try std.testing.expect(s.gateWatching());
++    try std.testing.expectEqual(@as(?usize, 0), s.gateCut(&.{9}));
++    _ = try s.commit(gpa, &.{50}, &.{});
++    try std.testing.expect(!s.gateWatching());
++}
++
++test "media rows and canvases must cover the prompt" {
++    const pix: [3 * 28 * 56]u8 = @splat(0);
++    const item: MediaItem = .{ .h = 28, .w = 56, .data = &pix };
++    try std.testing.expectEqual(@as(usize, 2), item.rows());
++    var m: Media = .{ .rows = &.{ 1, 2 }, .items = &.{item} };
++    try m.check(5);
++    try std.testing.expectError(error.BadMedia, m.check(2)); // a row past the prompt
++    m.rows = &.{ 2, 1 };
++    try std.testing.expectError(error.BadMedia, m.check(5)); // rows out of order
++    m.rows = &.{ 1, 2, 3 };
++    try std.testing.expectError(error.BadMedia, m.check(5)); // rows the canvases do not give
++    const feats: [16]u8 = @splat(0);
++    const f: Media = .{ .rows = &.{ 1, 2 }, .width = 4, .features = &feats };
++    try f.check(5);
++    const follower: Media = .{ .rows = &.{}, .follower_rows = 2 };
++    try follower.check(5);
++}
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index d9bae7d2..508633b4 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -52,11 +52,22 @@ pub const Snapshots = struct {
+         peer_other_bytes: ?*const fn (*anyopaque, u64) anyerror!u64 = null,
+         peer_other_remove: ?*const fn (*anyopaque, u64) anyerror!void = null,
+         forget_checked: ?*const fn (*anyopaque, [:0]const u8, u64) anyerror!void = null,
++        /// A state leaving memory for room or a cap (the policy lets it go to disk): the family may store it first.
++        evict: ?*const fn (ptr: *anyopaque, saved: Saved, tokens: []const u32, at: u32) void = null,
++        /// The longest stored state `prompt` extends that is longer than `longer_than` (null: none).
++        stored: ?*const fn (ptr: *anyopaque, prompt: []const u32, longer_than: u32, at: *u32, key: *u64, tokens: *[]const u32) bool = null,
++        /// Read stored state `key` of `at` tokens into new storage; the store keeps it like a saved one.
++        load: ?*const fn (ptr: *anyopaque, key: u64, at: u32) anyerror!Saved = null,
++        /// The disk tier's numbers: entries, bytes, writes, write bytes, reads, read bytes, skipped, failed.
++        spill_stats: ?*const fn (ptr: *anyopaque, out: *[8]u64) void = null,
+         /// Learned state `key`'s files under `dir` removed (the cap needs room, or they no longer read back).
+         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
+     };
+ };
+ 
++/// A state a family holds on disk (the spill tier): its position and tokens, and the family's key for it.
++pub const Stored = struct { at: u32, key: u64, tokens: []const u32 };
++
+ /// What a paged store asks of the backend's pages: who holds each, and how many are free.
+ pub const Pages = struct {
+     ptr: *anyopaque,
+@@ -94,6 +105,50 @@ pub const Rules = struct {
+     tail: bool = false,
+ };
+ 
++/// What a family's recipe adds to the store's own order (GLM's kept-state policy, multi.py): off by default. The caps
++/// are Thomas Wade's (ThomasWadeZ, PR #65), the recency of shared cuts meleesciony's (issue #75), the share of the pool
++/// jdecker76's (issue #84), the disk tier Robert Wojciechowski's (wojo, patch 0088): the recipe's authors.
++pub const Policy = struct {
++    /// Kept states at most (0: no limit): the oldest superseded one goes first (`capVictim`), then the least recently used.
++    entries: u32 = 0,
++    /// The bytes the kept states hold together (0: only the budget): the states go by the same order, the newest stays.
++    bytes_cap: u64 = 0,
++    /// One conversation's own states at most (0: no limit), the least recently used of its own first; shared cuts are not counted.
++    per_chat: u32 = 0,
++    /// The recipe's order and marks: no rewind state, a conversation's shorter states superseded first, a shared cut only by recency.
++    recipe: bool = false,
++    /// The fewest tokens a shared-prefix state adds past the resume point (0: off): a state is also kept where the prompt
++    /// stops sharing a kept one (rounded down to the grid), as engine.shared_points.
++    shared_least: u32 = 0,
++    /// States leaving memory may go to the family's disk tier, and a lookup may read one back (the spill tier).
++    spill: bool = false,
++    /// Past this share of the budget (0: never) the states eviction would take next are stored early, one a keep.
++    spill_highwater: f64 = 0,
++};
++
++/// /health's kept-state view: counts, bytes, and the mix by origin and conversation.
++pub const KeptStats = struct {
++    prompts: u32 = 0,
++    bytes: u64 = 0,
++    bytes_cap: u64 = 0,
++    own: u32 = 0,
++    shared: u32 = 0,
++    chats: u32 = 0,
++    rows: u64 = 0,
++    entries_cap: u32 = 0,
++    per_chat: u32 = 0,
++    budget: u64 = 0,
++    /// [chat, states, longest] of the first chats (by chat id)
++    by_chat: [8][3]u64 = @splat(.{ 0, 0, 0 }),
++    by_chat_n: u8 = 0,
++    spill_on: bool = false,
++    spill: [8]u64 = @splat(0),
++    hits: u64 = 0,
++    misses: u64 = 0,
++    evicted: u64 = 0,
++    restored: u64 = 0,
++};
++
+ pub const Entry = struct {
+     tokens: []u32, // the state's tokens and `lookahead` more
+     decode_spans: []modes.Span = &.{}, // canonical row arithmetic through at, excluding lookahead
+@@ -104,9 +159,12 @@ pub const Entry = struct {
+     used: u64, // the store's clock at its last keep or resume
+     last: []u32, // the last prompt that kept or resumed it
+     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
++    chat: u32 = 0, // the conversation (Policy): the state it resumed from, else a new one
++    own: bool = true, // a conversation's own state, not a shared cut
++    spilled: bool = false, // the family stored it on disk already (an early write)
+ };
+ 
+-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
++pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0 };
+ 
+ /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
+ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+@@ -129,6 +187,8 @@ pub const Store = struct {
+     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
+     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
+     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
++    policy: Policy = .{},
++    next_chat: u32 = 1,
+ 
+     const SHARED_KEYS = 64;
+ 
+@@ -151,6 +211,21 @@ pub const Store = struct {
+         s.gpa.destroy(e);
+     }
+ 
++    /// A state leaving memory for room or a cap: stored first when the policy allows it and a longer state of its
++    /// conversation does not hold it (multi.py `_superseded`).
++    fn evict(s: *Store, i: usize, to_disk: bool) void {
++        const e = s.entries.items[i];
++        if (to_disk and s.policy.spill and !e.spilled) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
++        s.remove(i);
++    }
++
++    fn superseded(s: *const Store, e: *const Entry) bool {
++        for (s.entries.items) |o| {
++            if (o != e and o.chat == e.chat and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) return true;
++        }
++        return false;
++    }
++
+     fn remove(s: *Store, i: usize) void {
+         const e = s.entries.orderedRemove(i);
+         s.held -= e.bytes;
+@@ -228,7 +303,9 @@ pub const Store = struct {
+     }
+ 
+     /// `lookup` plus a rewind state on the starts or grid; a state kept under min_gap before it serves instead.
+-    pub fn lookupRewind(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, rewind_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
++    pub fn lookupRewind(s: *Store, a: Allocator, prompt: []const u32, history_in: u32, rewind_in: u32, shared_in: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
++        const rewind_len = if (s.policy.recipe) 0 else rewind_in;
++        const history_len = s.recipeHistory(prompt.len, history_in);
+         const endpoint = if (s.rules.planned) s.startAt(starts, history_len) else history_len;
+         const rewind = if (s.rules.planned) s.startAt(starts, rewind_len -| s.rules.lookahead) else rewind_len -| s.rules.lookahead;
+         const endpoint_bytes = if (endpoint > 0 and (endpoint < prompt.len or (s.rules.warm and endpoint == prompt.len)) and endpoint + s.rules.lookahead <= prompt.len) s.family.vtable.bytes(s.family.ptr, endpoint) else 0;
+@@ -241,6 +318,16 @@ pub const Store = struct {
+         const e = s.recall(prompt, starts, spans, s.find(prompt, starts, spans));
+         if (e == null) s.counts.misses += 1;
+         const from = if (e) |x| x.at else 0;
++        var merged: ?[]u32 = null;
++        defer if (merged) |m| a.free(m);
++        var shared: []const u32 = if (s.policy.recipe and s.policy.shared_least == 0) &.{} else shared_in; // TF_GLM_SHARED_PREFIX=0: no shared points
++        if (s.policy.recipe and s.policy.shared_least > 0) if (s.lcpPoint(prompt, from, endpoint, starts)) |p| {
++            const m = try a.alloc(u32, shared_in.len + 1);
++            @memcpy(m[0..shared_in.len], shared_in);
++            m[shared_in.len] = p;
++            merged = m;
++            shared = m;
++        };
+         const marks_ = if (s.active_rewind_at == 0)
+             try s.fitting(a, try s.marks(a, prompt, from, history_len, shared, starts, if (e) |x| x.last else &.{}))
+         else
+@@ -265,7 +352,7 @@ pub const Store = struct {
+         }
+         while (s.held + need > s.budget) {
+             const i = s.victimBut(from, prompt) orelse return;
+-            s.remove(i);
++            s.evict(i, true);
+             s.counts.evicted += 1;
+         }
+     }
+@@ -413,10 +500,11 @@ pub const Store = struct {
+                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
+                 if (s.spare() < free_) continue;
+             }
+-            s.remove(s.victimBut(null, prompt).?); // its storage may come back spare and take this state
++            s.evict(s.victimBut(null, prompt).?, true); // its storage may come back spare and take this state
+             s.counts.evicted += 1;
+         }
+         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
++        const chat = s.chatOf(prompt, at);
+         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
+         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
+             s.gpa.destroy(e);
+@@ -434,7 +522,7 @@ pub const Store = struct {
+             return s.fail(at, err);
+         };
+         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
+-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
++        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared };
+         owns_decoded = false;
+         s.entries.append(s.gpa, e) catch {
+             s.free(e);
+@@ -443,19 +531,21 @@ pub const Store = struct {
+         s.held += charged;
+         s.counts.kept += 1;
+         if (shared) learned.learn(s, e, starts);
++        s.enforce(e);
+         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+         return true;
+     }
+ 
+     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
+-    fn recall(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
++    fn recall(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have_in: ?*Entry) ?*Entry {
++        const have = if (spans.len == 0) s.spillRecall(prompt, have_in) else have_in;
+         const im = s.imprint orelse return have;
+         const read = s.family.vtable.read orelse return have;
+         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
+         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
+         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
+-            s.remove(s.victimBut(have, prompt) orelse return have);
++            s.evict(s.victimBut(have, prompt) orelse return have, true);
+             s.counts.evicted += 1;
+         }
+         if (bytes > s.budget) return have;
+@@ -476,6 +566,71 @@ pub const Store = struct {
+         return e;
+     }
+ 
++    /// The spill tier's longest stored state this prompt extends, when it is longer than `have`: read into new storage as an
++    /// entry no conversation owns. Else `have`.
++    fn spillRecall(s: *Store, prompt: []const u32, have: ?*Entry) ?*Entry {
++        if (!s.policy.spill) return have;
++        const find_stored = s.family.vtable.stored orelse return have;
++        const load = s.family.vtable.load orelse return have;
++        var hit: Stored = .{ .at = 0, .key = 0, .tokens = &.{} };
++        if (!find_stored(s.family.ptr, prompt, if (have) |x| x.at else 0, &hit.at, &hit.key, &hit.tokens)) return have;
++        const bytes = s.family.vtable.bytes(s.family.ptr, hit.at);
++        if (bytes > s.budget) return have;
++        while (s.held + s.spare() + bytes > s.budget) {
++            s.evict(s.victimBut(have, prompt) orelse return have, true);
++            s.counts.evicted += 1;
++        }
++        const e = s.gpa.create(Entry) catch return have;
++        e.* = .{ .tokens = &.{}, .at = hit.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .own = false, .spilled = true, .chat = s.freshChat() };
++        e.tokens = s.gpa.dupe(u32, hit.tokens) catch return s.drop(e, have, false);
++        e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
++        e.saved = load(s.family.ptr, hit.key, hit.at) catch |err| {
++            note("reading {d} stored tokens failed ({s}); prefilling them", .{ hit.at, @errorName(err) });
++            return s.drop(e, have, false);
++        };
++        s.entries.append(s.gpa, e) catch return s.drop(e, have, true);
++        s.held += bytes;
++        s.counts.restored += 1;
++        return e;
++    }
++
++    /// Past the highwater share of the budget, the next state eviction would take is stored now (one a call), so its
++    /// eviction frees its memory at once.
++    fn earlyWrite(s: *Store) void {
++        const hw = s.policy.spill_highwater;
++        if (!s.policy.spill or hw <= 0) return;
++        if (@as(f64, @floatFromInt(s.held)) <= hw * @as(f64, @floatFromInt(s.budget))) return;
++        const f = s.family.vtable.evict orelse return;
++        const i = s.capVictim(null, true) orelse return;
++        const e = s.entries.items[i];
++        e.spilled = true;
++        if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
++    }
++
++    /// A clean stop: every state not stored yet is stored, newest first, until `max_ns` have passed.
++    pub fn flush(s: *Store, max_ns: u64) u32 {
++        if (!s.policy.spill) return 0;
++        const f = s.family.vtable.evict orelse return 0;
++        var t0: std.c.timespec = undefined;
++        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t0);
++        var n: u32 = 0;
++        while (true) {
++            var best: ?*Entry = null;
++            for (s.entries.items) |e| if (!e.spilled and !s.superseded(e) and (best == null or e.used > best.?.used)) {
++                best = e;
++            };
++            const e = best orelse break;
++            e.spilled = true;
++            f(s.family.ptr, e.saved, e.tokens, e.at);
++            n += 1;
++            var t1: std.c.timespec = undefined;
++            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t1);
++            const spent: u64 = @intCast((t1.sec - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec));
++            if (spent > max_ns) break;
++        }
++        return n;
++    }
++
+     /// A half-made recalled entry undone (`saved` once read); the lookup goes on with `have`.
+     fn drop(s: *Store, e: *Entry, have: ?*Entry, saved: bool) ?*Entry {
+         if (saved) s.family.vtable.drop(s.family.ptr, e.saved);
+@@ -499,6 +654,7 @@ pub const Store = struct {
+ 
+     /// The entry to free first, never `skip`: a superseded one, oldest first; else the oldest, the turn's rewind last.
+     fn victimBut(s: *const Store, skip: ?*Entry, prompt: []const u32) ?usize {
++        if (s.policy.recipe) return s.capVictim(skip, false);
+         var best: ?usize = null;
+         for (s.entries.items, 0..) |e, i| {
+             if (e.shared or e == skip or s.isActiveRewind(e, prompt)) continue; // a shared cut is evicted only as the least recently used
+@@ -516,6 +672,128 @@ pub const Store = struct {
+         return oldest;
+     }
+ 
++    /// The recipe keeps a prompt's own end state on the grid whatever the request names (engine.grid_point): without a
++    /// history length (a raw prompt) the end of the prompt; a prompt that ends on the grid keeps one grid step short of
++    /// its end, so a repeat still runs its last rows (the recipe keeps the head's logits row to replay; here none).
++    fn recipeHistory(s: *const Store, n: usize, history: u32) u32 {
++        if (!s.policy.recipe) return history;
++        const h: u32 = if (history == 0 or history > n) @intCast(n) else history;
++        const g = s.rules.grid;
++        return if (s.rules.planned and g > 0 and h == n and h % g == 0 and h > g) h - g else h;
++    }
++
++    /// The recipe's cap_victim (multi.py): the least recently used state shorter than a longer one of its conversation, a
++    /// shared cut excepted; else the least recently used of all. Never `skip`.
++    fn capVictim(s: *const Store, skip: ?*Entry, unspilled: bool) ?usize {
++        var oldest: ?usize = null;
++        var shorter: ?usize = null;
++        for (s.entries.items, 0..) |e, i| {
++            if (e == skip or (unspilled and e.spilled)) continue;
++            if (oldest == null or e.used < s.entries.items[oldest.?].used) oldest = i;
++            if (e.shared) continue;
++            const longer = for (s.entries.items) |o| {
++                if (o != e and o.chat == e.chat and o.at > e.at) break true;
++            } else false;
++            if (longer and (shorter == null or e.used < s.entries.items[shorter.?].used)) shorter = i;
++        }
++        return shorter orelse oldest;
++    }
++
++    fn freshChat(s: *Store) u32 {
++        defer s.next_chat += 1;
++        return s.next_chat;
++    }
++
++    /// The conversation a state kept for `prompt` at `at` belongs to: the longest kept state this prompt extends (the one
++    /// it resumed from, or an earlier mark of this pass), else a new one.
++    fn chatOf(s: *Store, prompt: []const u32, at: u32) u32 {
++        var best: ?*Entry = null;
++        for (s.entries.items) |e| {
++            if (e.at >= at or e.tokens.len > prompt.len) continue;
++            if (best != null and e.at <= best.?.at) continue;
++            if (std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) best = e;
++        }
++        if (best) |b| return b.chat;
++        defer s.next_chat += 1;
++        return s.next_chat;
++    }
++
++    /// The caps after a state is kept (multi.py `_keep`): the conversation's own states, then the entry count, then the bytes.
++    fn enforce(s: *Store, newest: *Entry) void {
++        const p = s.policy;
++        if (p.per_chat > 0 and newest.own) while (true) {
++            var count: u32 = 0;
++            var oldest: ?usize = null;
++            for (s.entries.items, 0..) |e, i| if (e.own and e.chat == newest.chat) {
++                count += 1;
++                if (oldest == null or e.used < s.entries.items[oldest.?].used) oldest = i;
++            };
++            if (count <= p.per_chat) break;
++            if (s.entries.items[oldest.?] == newest) break; // the state this call kept stays
++            s.evict(oldest.?, false); // superseded turns are not worth the disk tier
++            s.counts.evicted += 1;
++        };
++        if (p.entries > 0) while (s.entries.items.len > @max(1, p.entries)) {
++            s.evict(s.capVictim(newest, false) orelse break, true);
++            s.counts.evicted += 1;
++        };
++        if (p.bytes_cap > 0) while (s.entries.items.len > 1 and s.held > p.bytes_cap) {
++            s.evict(s.capVictim(newest, false) orelse break, false); // dropped for its bytes: not written
++            s.counts.evicted += 1;
++        };
++        s.earlyWrite();
++    }
++
++    /// Where `prompt` stops sharing a kept state, rounded down to the grid, when that adds at least `shared_least` tokens past
++    /// the resume point and lies before the history's end (engine.shared_points; the system block's cut comes from the host).
++    fn lcpPoint(s: *const Store, prompt: []const u32, from: u32, endpoint: u32, starts: []const u32) ?u32 {
++        const least = s.policy.shared_least;
++        var best: usize = 0;
++        for (s.entries.items) |e| {
++            if (e.tokens.len < from + least) continue;
++            const n = @min(prompt.len, e.tokens.len);
++            const lcp = std.mem.indexOfDiff(u32, prompt[0..n], e.tokens[0..n]) orelse n;
++            best = @max(best, lcp);
++        }
++        const at: u32 = if (s.rules.planned) s.startAt(starts, @intCast(best)) else @intCast(best);
++        if (at < from + least or at >= endpoint) return null;
++        return at;
++    }
++
++    /// /health's kept-state numbers: the first eight conversations by their state count (the recipe's kept_mix.by_chat).
++    pub fn keptStats(s: *const Store) KeptStats {
++        var k: KeptStats = .{ .prompts = @intCast(s.entries.items.len), .bytes = s.held, .bytes_cap = s.policy.bytes_cap, .entries_cap = s.policy.entries, .per_chat = s.policy.per_chat, .budget = s.budget };
++        var chats: [64][3]u64 = undefined; // [chat, states, longest]
++        var n: usize = 0;
++        for (s.entries.items) |e| {
++            if (e.own) k.own += 1 else k.shared += 1;
++            k.rows += e.at;
++            const slot = for (chats[0..n]) |*c| {
++                if (c[0] == e.chat) break c;
++            } else if (n < chats.len) blk: {
++                chats[n] = .{ e.chat, 0, 0 };
++                n += 1;
++                break :blk &chats[n - 1];
++            } else continue;
++            slot[1] += 1;
++            slot[2] = @max(slot[2], e.at);
++        }
++        k.chats = @intCast(n);
++        std.mem.sort([3]u64, chats[0..n], {}, struct {
++            fn lt(_: void, x: [3]u64, y: [3]u64) bool {
++                return if (x[1] != y[1]) x[1] > y[1] else x[0] < y[0];
++            }
++        }.lt);
++        k.hits, k.misses, k.evicted, k.restored = .{ s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.restored };
++        if (s.policy.spill) if (s.family.vtable.spill_stats) |f| {
++            k.spill_on = true;
++            f(s.family.ptr, &k.spill);
++        };
++        k.by_chat_n = @intCast(@min(n, k.by_chat.len));
++        @memcpy(k.by_chat[0..k.by_chat_n], chats[0..k.by_chat_n]);
++        return k;
++    }
++
+     /// Eviction order past the superseded states: least recently used first, the turn's rewind state last.
+     fn before(s: *const Store, e: *const Entry, o: *const Entry, prompt: []const u32) bool {
+         const e_rewind = s.isActiveRewind(e, prompt);
+@@ -547,6 +825,7 @@ fn floorStart(starts: []const u32, at: u32) u32 {
+ test {
+     _ = @import("prompt_cache_test.zig");
+     _ = @import("prompt_cache_rewind_test.zig");
++    _ = @import("prompt_cache_policy_test.zig");
+     _ = @import("learned_fault_test.zig");
+     _ = modes;
+ }
 diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
-index a608fd61..235be92e 100644
+index a608fd61..c5c0ffed 100644
 --- a/zig/src/cuda/abi.zig
 +++ b/zig/src/cuda/abi.zig
 @@ -153,6 +153,8 @@ pub const Api = struct {
@@ -1289,6 +2228,38 @@ index a608fd61..235be92e 100644
      cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
      cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
      cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
+@@ -167,6 +169,7 @@ pub const Api = struct {
+     cuMemcpyHtoDAsync_v2: *const fn (DevicePtr, CPtr, usize, Stream) callconv(.c) R,
+     cuMemcpyDtoHAsync_v2: *const fn (Ptr, DevicePtr, usize, Stream) callconv(.c) R,
+     cuMemcpyDtoDAsync_v2: *const fn (DevicePtr, DevicePtr, usize, Stream) callconv(.c) R,
++    cuMemcpy2DAsync_v2: *const fn (*const Memcpy2D, Stream) callconv(.c) R,
+     cuMemsetD8_v2: *const fn (DevicePtr, u8, usize) callconv(.c) R,
+     cuMemsetD32_v2: *const fn (DevicePtr, c_uint, usize) callconv(.c) R,
+     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
+@@ -220,3 +223,23 @@ comptime {
+     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
+     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
+ }
++
++/// CUDA_MEMCPY2D (cuda.h): a pitched copy; both sides device memory here (memory type 2).
++pub const Memcpy2D = extern struct {
++    src_x_bytes: usize = 0,
++    src_y: usize = 0,
++    src_type: c_uint = 2,
++    src_host: ?*const anyopaque = null,
++    src_device: DevicePtr = 0,
++    src_array: ?*anyopaque = null,
++    src_pitch: usize,
++    dst_x_bytes: usize = 0,
++    dst_y: usize = 0,
++    dst_type: c_uint = 2,
++    dst_host: ?*anyopaque = null,
++    dst_device: DevicePtr = 0,
++    dst_array: ?*anyopaque = null,
++    dst_pitch: usize,
++    width_bytes: usize,
++    height: usize,
++};
 diff --git a/zig/src/cuda/aot.zig b/zig/src/cuda/aot.zig
 index b8e58d2e..bfbbd4f8 100644
 --- a/zig/src/cuda/aot.zig
@@ -1325,7 +2296,7 @@ index b8e58d2e..bfbbd4f8 100644
          const got = k.consts.map.get(c.name) orelse return false;
          if (c.int) |x| if (got.int == null or got.int.? != x) return false;
 diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
-index 19ba7db2..ab89845d 100644
+index 19ba7db2..8e8a14c0 100644
 --- a/zig/src/cuda/kernels.zig
 +++ b/zig/src/cuda/kernels.zig
 @@ -37,6 +37,23 @@ pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_point
@@ -1352,7 +2323,7 @@ index 19ba7db2..ab89845d 100644
  pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
  pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
  pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
-@@ -75,3 +92,14 @@ pub fn treeVariant(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_
+@@ -75,3 +92,15 @@ pub fn treeVariant(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_
      if (slots <= 16) return tree(16, 2, 2, false);
      return tree(32, 2, 1, false);
  }
@@ -1362,11 +2333,28 @@ index 19ba7db2..ab89845d 100644
 +pub const glm_kda: []const u8 = if (options.glm_kda) &Blob("fatbin_glm_kda").bytes else &.{};
 +pub const glm_kda_chunk: []const u8 = if (options.glm_kda_chunk) &Blob("fatbin_glm_kda_chunk").bytes else &.{};
 +pub const glm_hc: []const u8 = if (options.glm_hc) &Blob("fatbin_glm_hc").bytes else &.{};
++pub const glm_vision: []const u8 = if (options.glm_vision) &Blob("fatbin_glm_vision").bytes else &.{};
 +pub const glm_exl3: []const u8 = if (options.glm_exl3) &Blob("fatbin_glm_exl3").bytes else &.{};
 +pub const glm_qmm: []const u8 = if (options.glm_qmm) &Blob("fatbin_glm_qmm").bytes else &.{};
 +pub const glm_qmm_prefill: []const u8 = if (options.glm_qmm_prefill) &Blob("fatbin_glm_qmm_prefill").bytes else &.{};
 +
 +pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
+diff --git a/zig/src/cuda/memory.zig b/zig/src/cuda/memory.zig
+index 2c469bae..37164dd7 100644
+--- a/zig/src/cuda/memory.zig
++++ b/zig/src/cuda/memory.zig
+@@ -251,3 +251,11 @@ test "peak reset preserves an allocation between its read and store" {
+     try std.testing.expectEqual(before.device + 100, after.device);
+     try std.testing.expectEqual(before.device + 400, after.peak);
+ }
++
++/// `rows` rows of `width` bytes from `src` (row pitch `src_pitch`) to `dst` (row pitch `dst_pitch`), device to device on
++/// `stream`: the contiguous clone of a strided activation block (Python's `x.clone(memory_format=contiguous_format)`).
++pub fn copyRows(d: *const Driver, dst: abi.DevicePtr, dst_pitch: usize, src: abi.DevicePtr, src_pitch: usize, width: usize, rows: usize, stream: abi.Stream) Error!void {
++    if (rows == 0 or width == 0) return;
++    const m: abi.Memcpy2D = .{ .src_device = src, .src_pitch = src_pitch, .dst_device = dst, .dst_pitch = dst_pitch, .width_bytes = width, .height = rows };
++    try d.check(d.api.cuMemcpy2DAsync_v2(&m, stream), "cuMemcpy2DAsync");
++}
 diff --git a/zig/src/cuda/nccl.zig b/zig/src/cuda/nccl.zig
 index f742d625..dfe12300 100644
 --- a/zig/src/cuda/nccl.zig
@@ -1390,10 +2378,18 @@ index f742d625..dfe12300 100644
  
  pub const Library = struct {
 diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
-index ebbb12b9..60c8ee77 100644
+index ebbb12b9..f652d888 100644
 --- a/zig/src/cuda/root.zig
 +++ b/zig/src/cuda/root.zig
-@@ -21,6 +21,7 @@ pub const Dim3 = launch.Dim3;
+@@ -7,6 +7,7 @@ pub const Context = @import("context.zig").Context;
+ pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
+ pub const HostBuffer = @import("memory.zig").HostBuffer;
+ pub const usage = @import("memory.zig").usage;
++pub const copyRows = @import("memory.zig").copyRows;
+ pub const Usage = @import("memory.zig").Usage;
+ pub const carveout = @import("carveout.zig");
+ pub const Carveout = carveout.Carveout;
+@@ -21,6 +22,7 @@ pub const Dim3 = launch.Dim3;
  pub const graph = @import("graph.zig");
  pub const cublaslt = @import("cublaslt.zig");
  pub const nccl = @import("nccl.zig");
@@ -1401,7 +2397,7 @@ index ebbb12b9..60c8ee77 100644
  pub const triton = @import("triton.zig");
  pub const aot = @import("aot.zig");
  pub const kernels = @import("kernels.zig");
-@@ -42,6 +43,7 @@ test {
+@@ -42,6 +44,7 @@ test {
      _ = abi;
      _ = aot;
      _ = segments;
@@ -1410,7 +2406,7 @@ index ebbb12b9..60c8ee77 100644
      _ = @import("fp8.zig");
      _ = carveout;
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index ac76da05..848a3bda 100644
+index ac76da05..f0059df2 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
 @@ -4,13 +4,15 @@ const cuda = @import("cuda");
@@ -1439,16 +2435,34 @@ index ac76da05..848a3bda 100644
  pub const families: []const api.Family = blk: {
      var out: [registry.len]api.Family = undefined;
      for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
-@@ -161,6 +165,8 @@ const Host = struct {
+@@ -161,6 +165,15 @@ const Host = struct {
      slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
      slide_free: ?*const fn (Allocator, *anyopaque) void = null,
      dir: []u8 = &.{}, // the model folder the learner writes its lessons into
 +    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // a following rank's loop (two-rank families)
++    read_status: ?*const fn (*anyopaque, *?u64, *?u64) void = null,
 +    store_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family-kept store's snapshot calls (Loaded.cache)
++    flush_ns: u64 = 0, // a clean stop stores the kept states not on disk yet, within this long (0: not at all)
++
++    fn readExtraStatus(p: *anyopaque, out: *api.Status) void {
++        const h: *Host = @ptrCast(@alignCast(p));
++        h.read_status.?(h.family, &out.pool_tokens, &out.pool_free_tokens);
++    }
  
      fn close(p: *anyopaque) void {
          const h: *Host = @ptrCast(@alignCast(p));
-@@ -184,6 +190,11 @@ const Host = struct {
+@@ -169,6 +182,10 @@ const Host = struct {
+         h.cfg.deinit(h.gpa);
+         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+         if (h.store) |s| {
++            if (h.flush_ns > 0) {
++                const n = s.flush(h.flush_ns);
++                if (n > 0) std.log.info("spill: stored {d} kept prompt states before stopping", .{n});
++            }
+             s.deinit();
+             h.gpa.destroy(s);
+         }
+@@ -184,6 +201,11 @@ const Host = struct {
          h.gpa.destroy(h);
      }
  
@@ -1460,7 +2474,15 @@ index ac76da05..848a3bda 100644
      fn bind(p: *anyopaque) *Host {
          const h: *Host = @ptrCast(@alignCast(p));
          if (h.gpu) |g| if (bound != &g.ctx) {
-@@ -328,6 +339,24 @@ const Host = struct {
+@@ -203,6 +225,7 @@ const Host = struct {
+         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
++        if (h.read_status != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
+         h.host.cache = h.store;
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+         if (h.learn != null) h.host.learner = h.learner();
+@@ -328,6 +351,24 @@ const Host = struct {
                      return x.inner.vtable.held.?(x.inner.ptr, s, out);
                  }
              }.f else null,
@@ -1485,7 +2507,7 @@ index ac76da05..848a3bda 100644
              .release = struct {
                  fn f(p: *anyopaque, s: *lanes.Stream) void {
                      const x = bind(p);
-@@ -348,7 +377,114 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+@@ -348,7 +389,144 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
      return null;
  }
  
@@ -1557,6 +2579,20 @@ index ac76da05..848a3bda 100644
 +    if (@hasField(F.Options, "parallel")) fo.parallel = o.lanes;
 +    if (@hasField(F.Options, "draft_dir")) fo.draft_dir = o.drafter;
 +    if (@hasField(F.Options, "prompt_cache_gib")) fo.prompt_cache_gib = o.prompt_cache_gib;
++    if (@hasField(F.Options, "spill_gib")) {
++        fo.spill_dir = o.spill_dir;
++        fo.spill_gib = o.spill_gib;
++        fo.spill_highwater = o.spill_highwater;
++        fo.spill_min_tokens = o.spill_min_tokens;
++        fo.spill_min_free_gib = o.spill_min_free_gib;
++        fo.spill_flush_s = o.spill_flush_s;
++    }
++    if (@hasField(F.Options, "vision")) fo.vision = o.vision;
++    if (@hasField(F.Options, "tower")) fo.tower = o.vision_zig;
++    if (o.vision and !@hasField(F.Options, "vision")) {
++        problem.* = try std.fmt.allocPrint(a, "--vision: the native CUDA engine has no picture or clip input for {s} checkpoints", .{o.model_type});
++        return null;
++    }
 +    if (two_rank) {
 +        fo.tp = o.tp;
 +        fo.rank = o.rank;
@@ -1573,11 +2609,24 @@ index ac76da05..848a3bda 100644
 +    errdefer gpa.destroy(h);
 +    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
 +    h.follow_fn = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
++    h.read_status = if (@hasField(@TypeOf(loaded), "read_status")) loaded.read_status else null;
 +    if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
 +        // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
 +        h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
++        // the family's disk tier (GLM's spill): states leaving memory are written, a lookup reads a longer one back
++        if (@hasField(@TypeOf(c), "spill")) if (c.spill) |sp| {
++            h.store_vt.evict = sp.evict;
++            h.store_vt.stored = sp.stored;
++            h.store_vt.load = sp.load;
++            h.store_vt.spill_stats = sp.stats;
++            h.flush_ns = @intFromFloat(@max(0, sp.flush_s) * 1e9);
++        };
 +        const store = try gpa.create(api.prompt_cache.Store);
-+        store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, if (@hasDecl(F, "cache_rules")) .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned, .min_prompt = if (@hasField(@TypeOf(F.cache_rules), "min_prompt")) F.cache_rules.min_prompt else (api.prompt_cache.Rules{}).min_prompt } else .{}, c.budget);
++        store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, if (@hasField(@TypeOf(c), "rules"))
++            .{ .planned = true, .grid = c.rules.grid, .min_gap = c.rules.min_gap, .min_prompt = c.rules.min_prompt }
++        else if (@hasDecl(F, "cache_rules")) .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned, .min_prompt = if (@hasField(@TypeOf(F.cache_rules), "min_prompt")) F.cache_rules.min_prompt else (api.prompt_cache.Rules{}).min_prompt } else .{}, c.budget);
++        // a family with the recipe's kept-state rules (GLM): its caps, order and shared points
++        if (@hasField(@TypeOf(c), "rules")) store.policy = .{ .entries = c.rules.entries, .bytes_cap = c.rules.bytes_cap, .per_chat = c.rules.per_chat, .recipe = true, .shared_least = c.rules.shared_least, .spill = h.store_vt.evict != null, .spill_highwater = if (h.store_vt.evict != null) c.spill.?.highwater else 0 };
 +        h.store = store;
 +    };
 +    errdefer if (h.store) |store| {
@@ -1586,9 +2635,12 @@ index ac76da05..848a3bda 100644
 +    };
 +    try h.serve(io, loaded.facts, loaded.rows, .{
 +        .lanes = o.lanes,
++        .call_gates = true,
 +        .context_window = @intCast(window),
 +        .prefill_step = F.prefill_step,
 +        .prompt_cache = h.store != null,
++        .structures = loaded.backend.vtable.first_masked != null,
++        .media = o.vision and @hasDecl(F, "media") and F.media,
 +        .startup = h.startup,
 +    }, null);
 +    opened = true;
@@ -1600,7 +2652,7 @@ index ac76da05..848a3bda 100644
      const native = modelContext(a, io, o.dir);
      const window = contextWindow(o.context, native, F.default_context) catch |e| {
          problem.* = switch (e) {
-@@ -427,7 +563,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -427,7 +605,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      const after = try pool(a, io, &g.ctx, problem) orelse return null;
      const room = after.room(model) -| loaded.learn_bytes;
      const free = loaded.free_streams;
@@ -1609,7 +2661,16 @@ index ac76da05..848a3bda 100644
          problem.* = switch (e) {
              error.NoStream => try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve; lower --context, or free device memory", .{ window, toGib(loaded.stream_bytes), toGib(room), toGib(model), toGib(after.reserve) }),
              error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * (o.lanes -| free)), window, toGib(room), free + room / loaded.stream_bytes }),
-@@ -501,6 +637,9 @@ test "chip classes name the compute capability as gate entries do" {
+@@ -474,7 +652,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         gpa.free(h.dir);
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
++    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .call_gates = true, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }
+@@ -501,6 +679,9 @@ test "chip classes name the compute capability as gate entries do" {
  test "every registered family is listed for capabilities" {
      try std.testing.expectEqual(@as(usize, registry.len), families.len);
      try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
@@ -1620,9 +2681,17 @@ index ac76da05..848a3bda 100644
  
  test "variables: unset or empty means the default, anything but a whole number is refused" {
 diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
-index 4821e0f3..9c34a9cc 100644
+index 4821e0f3..08bed86e 100644
 --- a/zig/src/server/anthropic.zig
 +++ b/zig/src/server/anthropic.zig
+@@ -1,6 +1,6 @@
+ //! Anthropic's Messages routes over the chat handler: typed SSE events, tool_use blocks, count_tokens.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const http_body = @import("http_body.zig");
+ const fields = @import("fields.zig");
 @@ -30,7 +30,7 @@ fn errorValue(a: Allocator, message: []const u8, status: u16) Allocator.Error!Va
      const kind = switch (status) {
          400 => "invalid_request_error",
@@ -1641,10 +2710,31 @@ index 4821e0f3..9c34a9cc 100644
              const o = json.newObject(a) catch return;
              o.put(a, "input_tokens", json.intValue(a, n) catch return) catch return;
              return routes.sendValue(conn, a, 200, .{ .object = o });
+diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
+index f70b6a11..095ad66c 100644
+--- a/zig/src/server/anthropic_translate.zig
++++ b/zig/src/server/anthropic_translate.zig
+@@ -1,6 +1,6 @@
+ //! Anthropic Messages requests as the chat requests that run them (``anthropic_translate.translate``).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const pyrepr = @import("pyrepr.zig");
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 6315e329..e98c05fc 100644
+index 6315e329..1089cde9 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
+@@ -1,7 +1,7 @@
+ //! One reply, as ``ChatApp.chat`` makes it: render, submit to the engine, stream text, reasoning and calls.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields_mod = @import("fields.zig");
+ const reply_text = @import("reply_text.zig");
 @@ -13,6 +13,10 @@ const ids = @import("ids.zig");
  const clock = @import("clock.zig");
  const Server = @import("server.zig").Server;
@@ -1656,7 +2746,16 @@ index 6315e329..e98c05fc 100644
  const Value = json.Value;
  const Cx = errors.Cx;
  const Allocator = std.mem.Allocator;
-@@ -57,6 +61,11 @@ pub const Reply = struct {
+@@ -32,6 +36,8 @@ pub const Input = struct {
+     id: []const u8 = "",
+     /// ``logprobs: true`` with this many ``top_logprobs``; null: not asked.
+     logprobs: ?u8 = null,
++    /// The request's own messages when they hold picture or clip parts (--vision): prompt.prepareMedia renders them.
++    media: ?Value = null,
+ };
+ 
+ /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
+@@ -57,6 +63,11 @@ pub const Reply = struct {
      effort: ?[]const u8 = null,
      /// ``choices[0].logprobs`` (``{"content": [...]}``) for a request that asked; null otherwise.
      logprobs: ?Value = null,
@@ -1668,7 +2767,7 @@ index 6315e329..e98c05fc 100644
  };
  
  pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
-@@ -159,6 +168,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -159,6 +170,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
      if (gone.check()) return error.Cancelled;
      var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
      if (input.prompt != null) thinking = false;
@@ -1676,7 +2775,7 @@ index 6315e329..e98c05fc 100644
      const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
      const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
      if (gone.check()) return error.Cancelled;
-@@ -167,8 +177,16 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -167,11 +179,19 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
      const n: i64 = @intCast(rendered.ids.len);
      if (window > 0) {
          const room = window - n;
@@ -1694,8 +2793,20 @@ index 6315e329..e98c05fc 100644
 +        }
          limit = @min(limit, room);
      }
-     const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
-@@ -199,6 +217,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
++    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+     var shared: std.ArrayList(u32) = .empty;
+     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
+         if (cut >= 512) try shared.append(a, @intCast(cut));
+@@ -191,6 +211,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .shared_prefixes = shared.items,
+         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk), // a cut before the conversation's own text: fresh sessions resume their whole harness
+         .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids), // from the tokens alone, for every request: cached states are keyed by tokens
++        .media = rendered.media,
+         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+     };
+@@ -199,6 +220,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
          const budget_field = f.get("thinking_budget");
          const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
          if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
@@ -1703,7 +2814,7 @@ index 6315e329..e98c05fc 100644
          if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
              if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
              request.think_close = srv.think_close;
-@@ -236,6 +255,20 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+@@ -236,6 +258,20 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
      var box: Mailbox = .{ .io = io, .gpa = srv.gpa };
      defer box.deinit();
      const id = srv.next_id.fetchAdd(1, .monotonic);
@@ -1724,7 +2835,7 @@ index 6315e329..e98c05fc 100644
      if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
      defer if (srv.keepalive) |k| k.end();
      srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
-@@ -245,13 +278,31 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+@@ -245,13 +281,31 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
      };
      release(srv, preparing); // a background request waits only while a foreground one prepares
      preparing = false;
@@ -1759,7 +2870,7 @@ index 6315e329..e98c05fc 100644
      };
      if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
      return result;
-@@ -308,6 +359,35 @@ const Shown = struct {
+@@ -308,6 +362,35 @@ const Shown = struct {
      }
  };
  
@@ -1795,7 +2906,7 @@ index 6315e329..e98c05fc 100644
  /// The token loop and the text it streams.
  const Generation = struct {
      srv: *Server,
-@@ -322,6 +402,10 @@ const Generation = struct {
+@@ -322,6 +405,10 @@ const Generation = struct {
      max_tokens: u32,
      tools: []const Value,
      calls: ?tool_stream.Streamer = null,
@@ -1806,7 +2917,7 @@ index 6315e329..e98c05fc 100644
      collected: std.ArrayList(u32) = .empty,
      visible: reply_text.Incremental = .{},
      hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
-@@ -368,6 +452,7 @@ const Generation = struct {
+@@ -368,6 +455,7 @@ const Generation = struct {
                  g.reason = "stop";
              } else if (try g.stopHit()) {
                  g.reason = "stop";
@@ -1814,7 +2925,7 @@ index 6315e329..e98c05fc 100644
                  g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
              } else if (g.collected.items.len >= g.max_tokens) g.reason = "length";
          }
-@@ -389,23 +474,28 @@ const Generation = struct {
+@@ -389,23 +477,28 @@ const Generation = struct {
          const text = g.stops.visible(all, true);
          if (g.visible.pending()) return; // a character still split across tokens
          var answer = text;
@@ -1846,7 +2957,7 @@ index 6315e329..e98c05fc 100644
          if (g.calls) |*c| {
              var out: std.ArrayList(Value) = .empty;
              try c.feed(answer, &out); // never the reasoning: a call it mentions is not made
-@@ -413,6 +503,21 @@ const Generation = struct {
+@@ -413,6 +506,21 @@ const Generation = struct {
          }
      }
  
@@ -1868,7 +2979,7 @@ index 6315e329..e98c05fc 100644
      fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
          sink.call(sink.ctx, delta) catch {
              g.cancel();
-@@ -458,12 +563,20 @@ const Generation = struct {
+@@ -458,12 +566,20 @@ const Generation = struct {
                  g.engine_done = true;
                  return;
              }
@@ -1891,7 +3002,7 @@ index 6315e329..e98c05fc 100644
          }
      }
  
-@@ -481,17 +594,36 @@ const Generation = struct {
+@@ -481,17 +597,36 @@ const Generation = struct {
          const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
          const raw = try g.srv.text.decode(a, content_tokens);
          const visible = g.stops.visible(raw, false);
@@ -1932,7 +3043,7 @@ index 6315e329..e98c05fc 100644
              const h = reply_text.parseHarmony(text);
              content = h.content;
              reasoning = h.reasoning;
-@@ -500,15 +632,23 @@ const Generation = struct {
+@@ -500,15 +635,23 @@ const Generation = struct {
              const thought = g.streamed_reasoning.text.items;
              if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                  try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
@@ -1965,7 +3076,7 @@ index 6315e329..e98c05fc 100644
          }
          const prefilled = m.prefilled_ns;
          const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
-@@ -532,10 +672,17 @@ const Generation = struct {
+@@ -532,10 +675,17 @@ const Generation = struct {
          const sha = @import("tokens.zig").tokenSha(g.collected.items);
          try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
          try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
@@ -1983,7 +3094,7 @@ index 6315e329..e98c05fc 100644
          }
          const s = m.stats;
          const spec = try json.newObject(a);
-@@ -550,8 +697,11 @@ const Generation = struct {
+@@ -550,8 +700,11 @@ const Generation = struct {
              .content = content,
              .stop_sequence = g.stops.matched(raw),
              .reasoning = reasoning,
@@ -1997,7 +3108,7 @@ index 6315e329..e98c05fc 100644
              .prompt_tokens = prompt_len,
              .cached_tokens = m.cached orelse 0,
              .completion_tokens = g.collected.items.len,
-@@ -597,3 +747,13 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
+@@ -597,3 +750,13 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
      try o.put(a, key, .{ .string = text });
      return .{ .object = o };
  }
@@ -2011,11 +3122,77 @@ index 6315e329..e98c05fc 100644
 +    box.prefilled_ns = 1;
 +    try std.testing.expect(leaves(.{ .glm = true, .prompt_stop = false }, &box)); // decoding: the reply stops
 +}
+diff --git a/zig/src/server/chunk_plan.zig b/zig/src/server/chunk_plan.zig
+index 2a4505cd..9c2ab0e3 100644
+--- a/zig/src/server/chunk_plan.zig
++++ b/zig/src/server/chunk_plan.zig
+@@ -1,6 +1,6 @@
+ //! Where a prompt's prefill chunks start (Python's PrefillPlan and message_markers): prompts that agree up to a start cut alike up to it.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const prompt = @import("prompt.zig");
+ const Server = @import("server.zig").Server;
 diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
-index 40ee1e0e..aaef59aa 100644
+index 40ee1e0e..4dd35aae 100644
 --- a/zig/src/server/cli.zig
 +++ b/zig/src/server/cli.zig
-@@ -115,7 +115,9 @@ pub const flags = [_]Flag{
+@@ -19,8 +19,12 @@ pub const Flag = struct {
+     native: bool = false,
+     /// The values it honours when only some of the choices.
+     native_values: ?[]const []const u8 = null,
++    /// A flag the GLM recipe passes that this engine does not serve yet: parsed, then refused with this reason.
++    later: ?[]const u8 = null,
+ };
+ 
++const vision_later = "GLM vision (pictures and clips) is not built into the Zig engine yet (package H); serve with VISION=0 until it lands";
++
+ const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else if (served("--backend=rocm")) &.{ "auto", "rocm" } else &.{ "auto", "cuda" };
+ 
+ /// The flags past the common ones the binary's backend serves, from its root's `serves` (test roots: none).
+@@ -49,11 +53,12 @@ pub const flags = [_]Flag{
+     .{ .name = "--api-key-file", .native = true },
+     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
+     .{ .name = "--dashboard", .kind = .store_true, .native = true },
+-    .{ .name = "--vision", .kind = .store_true },
+-    .{ .name = "--vision-urls", .kind = .store_true },
++    .{ .name = "--vision", .kind = .store_true, .native = cuda_build },
++    .{ .name = "--vision-urls", .kind = .store_true, .native = cuda_build },
++    .{ .name = "--vision-backend", .choices = &.{ "zig", "python" }, .native = cuda_build },
+     .{ .name = "--vision-offload", .kind = .store_true },
+-    .{ .name = "--vision-max-images" },
+-    .{ .name = "--vision-image-tokens" },
++    .{ .name = "--vision-max-images", .native = cuda_build },
++    .{ .name = "--vision-image-tokens", .native = cuda_build },
+     .{ .name = "--context", .native = true },
+     .{ .name = "--speed-up", .native = true },
+     .{ .name = "--max-tokens", .native = true },
+@@ -81,8 +86,12 @@ pub const flags = [_]Flag{
+     .{ .name = "--prompt-cache-gib", .native = true },
+     .{ .name = "--prompt-cache-over-cap", .kind = .store_true, .native = true },
+     .{ .name = "--checkpoint-slots", .native = served("--checkpoint-slots") },
+-    .{ .name = "--spill-gib" },
+-    .{ .name = "--snapshot-dir", .native = true, .native_values = &.{"none"} },
++    .{ .name = "--spill-gib", .native = cuda_build },
++    .{ .name = "--spill-highwater", .native = cuda_build },
++    .{ .name = "--spill-min-tokens", .native = cuda_build },
++    .{ .name = "--spill-min-free-gib", .native = cuda_build },
++    .{ .name = "--spill-flush-s", .native = cuda_build },
++    .{ .name = "--snapshot-dir", .native = true }, // the spill tier's folder (the recipe passes /spill with --spill-gib)
+     .{ .name = "--max-snapshots", .native = true, .native_values = &.{"0"} },
+     .{ .name = "--parallel", .native = true },
+     .{ .name = "--decode-share" },
+@@ -93,7 +102,7 @@ pub const flags = [_]Flag{
+     .{ .name = "--ple-on-ssd", .kind = .store_true },
+     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
+     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "rocm" }, .native = true, .native_values = backend_values },
+-    .{ .name = "--tp", .choices = &.{ "1", "2", "4", "8" }, .native = served("--tp") },
++    .{ .name = "--tp", .choices = &.{ "1", "2", "3", "4", "8" }, .native = served("--tp") },
+     .{ .name = "--rank", .native = served("--tp") },
+     .{ .name = "--master", .native = served("--tp") },
+     .{ .name = "--master-port", .native = served("--tp") },
+@@ -115,7 +124,9 @@ pub const flags = [_]Flag{
  
  /// The variables this binary honours as the Python engine does, then the CUDA build's.
  pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" } ++
@@ -2026,14 +3203,204 @@ index 40ee1e0e..aaef59aa 100644
  
  pub const Args = struct {
      model: []const u8 = "",
-@@ -218,6 +220,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+@@ -136,6 +147,12 @@ pub const Args = struct {
+     learn_dir: ?[]const u8 = null,
+     learn_min_free_gib: f64 = 4,
+     learn_gib: f64 = 32, // disk for learned states, every model and build together
++    snapshot_dir: ?[]const u8 = null, // the spill tier's folder
++    spill_gib: f64 = 0, // the spill tier's disk cap a rank (0: off)
++    spill_highwater: f64 = 0.70,
++    spill_min_tokens: u32 = 8192,
++    spill_min_free_gib: f64 = 50,
++    spill_flush_s: ?f64 = null, // a clean stop's budget (null: TF_SPILL_FLUSH_S, else 60)
+     max_tokens: i64 = 4096,
+     temperature: ?f64 = null,
+     top_p: ?f64 = null,
+@@ -146,6 +163,11 @@ pub const Args = struct {
+     thinking_budget: i64 = 0,
+     loop_guard: bool = false,
+     no_drafts: bool = false,
++    vision: bool = false, // picture and clip input (the CUDA engine hosts the vision tower)
++    vision_urls: bool = false, // --vision: also fetch public https URLs
++    vision_backend: []const u8 = "python", // zig: the engine hosts the tower; python: Python TensorFold's, in a helper process
++    vision_max_images: ?i64 = null,
++    vision_image_tokens: ?i64 = null,
+     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
+     compact_auto: bool = false,
+     compact_fraction: ?f64 = null,
+@@ -210,6 +232,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+                 if (std.mem.eql(u8, c, value.?)) break;
+             } else return fail(u, a, "argument {s}: invalid choice: '{s}'", .{ name, value.? });
+         } else if (eq != null) return fail(u, a, "argument {s}: ignored explicit argument '{s}'", .{ name, token[eq.? + 1 ..] });
++        if (flag.later) |why| return fail(u, a, "{s}: {s}", .{ name, why });
+         if (!flag.native) return fail(u, a, "{s} is not served by the native engine yet; the Python engine 0.6.6 serves it: python -m pip install git+https://github.com/ashhart/TensorFold.git@v0.6.6", .{name});
+         if (flag.native_values) |allowed| if (value) |v| for (allowed) |x| {
+             if (std.mem.eql(u8, x, v)) break;
+@@ -218,6 +241,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
      }
      out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
      try ranks(u, a, out);
-+    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other rank", .{out.tp});
++    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other ranks", .{out.tp});
      out.alias = alias.items;
      out.api_key = keys.items;
      return out;
+@@ -257,6 +281,20 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+     } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
+         out.learn = true;
+         out.learn_dir = v;
++    } else if (is(name, "--snapshot-dir")) {
++        out.snapshot_dir = if (std.mem.eql(u8, v, "none")) null else v;
++    } else if (is(name, "--spill-gib")) {
++        out.spill_gib = try gib(u, a, name, v);
++    } else if (is(name, "--spill-highwater")) {
++        const f = try float(u, a, name, v);
++        if (!(f > 0 and f <= 1)) return fail(u, a, "argument --spill-highwater: a fraction in (0, 1]: '{s}'", .{v});
++        out.spill_highwater = f;
++    } else if (is(name, "--spill-min-tokens")) {
++        out.spill_min_tokens = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --spill-min-tokens: a token count from 0: '{s}'", .{v});
++    } else if (is(name, "--spill-min-free-gib")) {
++        out.spill_min_free_gib = try gib(u, a, name, v);
++    } else if (is(name, "--spill-flush-s")) {
++        out.spill_flush_s = try gib(u, a, name, v);
+     } else if (is(name, "--learn-min-free-gib")) {
+         out.learn_min_free_gib = try gib(u, a, name, v);
+     } else if (is(name, "--learn-gib")) {
+@@ -279,6 +317,18 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
+     if (std.mem.eql(u8, name, "--device")) {
+         out.device = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --device: a GPU ordinal from 0: '{s}'", .{v});
++    } else if (std.mem.eql(u8, name, "--vision")) {
++        out.vision = true;
++    } else if (std.mem.eql(u8, name, "--vision-urls")) {
++        out.vision = true;
++        out.vision_urls = true;
++    } else if (std.mem.eql(u8, name, "--vision-backend")) {
++        out.vision = true;
++        out.vision_backend = v;
++    } else if (std.mem.eql(u8, name, "--vision-max-images")) {
++        out.vision_max_images = try int(u, a, name, v);
++    } else if (std.mem.eql(u8, name, "--vision-image-tokens")) {
++        out.vision_image_tokens = try int(u, a, name, v);
+     } else if (std.mem.eql(u8, name, "--segments")) {
+         const n = try int(u, a, name, v);
+         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
+@@ -350,6 +400,12 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
+         .speed_up = args.speed_up,
+         .prompt_cache_gib = args.prompt_cache_gib,
+         .prompt_cache_over_cap = args.prompt_cache_over_cap,
++        .spill_dir = args.snapshot_dir,
++        .spill_gib = args.spill_gib,
++        .spill_highwater = args.spill_highwater,
++        .spill_min_tokens = args.spill_min_tokens,
++        .spill_min_free_gib = args.spill_min_free_gib,
++        .spill_flush_s = args.spill_flush_s,
+         .learn = if (args.learn) args.learn_dir orelse try api.prompt_imprint.defaultRoot(a) else null,
+         .learn_gib = args.learn_gib,
+         .learn_min_free_gib = args.learn_min_free_gib,
+@@ -364,6 +420,8 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
+         .master = args.master,
+         .master_port = args.master_port,
+         .policy = args.policy,
++        .vision = args.vision,
++        .vision_zig = args.vision and std.mem.eql(u8, args.vision_backend, "zig"),
+     };
+ }
+ 
+@@ -534,3 +592,19 @@ test "an engine is asked for what the flags say, and the defaults of the flags n
+     try std.testing.expectEqual(@as(?i64, 3), gpu.keep);
+     try std.testing.expectEqualStrings("matrix=off", gpu.policy);
+ }
++
++test "the recipe's start.sh flags: the spill flags are read and vision is accepted" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var u: Usage = .{};
++    const got = try parse(a, &.{ "m", "--context", "131072", "--parallel", "8", "--max-tokens", "32768", "--no-thinking", "--spill-gib", "64", "--snapshot-dir", "/spill", "--spill-highwater", "0.70", "--spill-min-tokens", "8192", "--spill-min-free-gib", "50" }, &u);
++    try std.testing.expectEqual(@as(f64, 64), got.spill_gib);
++    try std.testing.expectEqualStrings("/spill", got.snapshot_dir.?);
++    try std.testing.expectEqual(@as(f64, 0.70), got.spill_highwater);
++    try std.testing.expectEqual(@as(u32, 8192), got.spill_min_tokens);
++    try std.testing.expectEqual(@as(f64, 50), got.spill_min_free_gib);
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-highwater", "1.5" }, &u));
++    const vis = try parse(a, &.{ "m", "--vision", "--vision-urls" }, &u);
++    try std.testing.expect(vis.vision and vis.vision_urls);
++}
+diff --git a/zig/src/server/compact.zig b/zig/src/server/compact.zig
+index a295aba2..fce4234e 100644
+--- a/zig/src/server/compact.zig
++++ b/zig/src/server/compact.zig
+@@ -1,6 +1,6 @@
+ //! Note and reply are ordinary greedy or keyed generations, so the same request compacts and answers the same way.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const chat = @import("chat.zig");
+ const stored = @import("compact_mem.zig");
+ const server_mod = @import("server.zig");
+diff --git a/zig/src/server/compact_mem.zig b/zig/src/server/compact_mem.zig
+index eca242ed..b45513ba 100644
+--- a/zig/src/server/compact_mem.zig
++++ b/zig/src/server/compact_mem.zig
+@@ -1,6 +1,6 @@
+ //! The compaction note file and the hash of the messages a note already covers.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const Server = @import("server.zig").Server;
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+diff --git a/zig/src/server/compact_test.zig b/zig/src/server/compact_test.zig
+index f1c09d48..549bb61b 100644
+--- a/zig/src/server/compact_test.zig
++++ b/zig/src/server/compact_test.zig
+@@ -1,7 +1,7 @@
+ //! Host checks for opt-in compaction. The fake engine records each prompt and answers OK.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const model_text = @import("model_text.zig");
+ const chat = @import("chat.zig");
+diff --git a/zig/src/server/completion_prompt_test.zig b/zig/src/server/completion_prompt_test.zig
+index c74aba9e..667e375a 100644
+--- a/zig/src/server/completion_prompt_test.zig
++++ b/zig/src/server/completion_prompt_test.zig
+@@ -1,7 +1,7 @@
+ //! Token ids in a completion prompt, top-level or nested: ids in the vocabulary are served, other values get a 400.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const model_text = @import("model_text.zig");
+ const openai = @import("openai.zig");
+ const Server = @import("server.zig").Server;
+diff --git a/zig/src/server/decisions.zig b/zig/src/server/decisions.zig
+index b3bd3b64..ad876263 100644
+--- a/zig/src/server/decisions.zig
++++ b/zig/src/server/decisions.zig
+@@ -1,6 +1,6 @@
+ //! /v1/decisions checks a body the way 0.6.6 checks it, then scores through the engine hook when a family sets one.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const pyrepr = @import("pyrepr.zig");
+diff --git a/zig/src/server/decisions_test.zig b/zig/src/server/decisions_test.zig
+index 160622e9..ca3dc87a 100644
+--- a/zig/src/server/decisions_test.zig
++++ b/zig/src/server/decisions_test.zig
+@@ -1,7 +1,7 @@
+ //! Request checks for /v1/decisions, and a fake engine hook that scores one choice.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const openai = @import("openai.zig");
+ const model_text = @import("model_text.zig");
 diff --git a/zig/src/server/errors.zig b/zig/src/server/errors.zig
 index c18c443e..f7b96556 100644
 --- a/zig/src/server/errors.zig
@@ -2066,11 +3433,62 @@ index c18c443e..f7b96556 100644
              .server => 500,
              else => 400,
          };
+diff --git a/zig/src/server/fields.zig b/zig/src/server/fields.zig
+index 0de8c8ab..99eb1359 100644
+--- a/zig/src/server/fields.zig
++++ b/zig/src/server/fields.zig
+@@ -1,6 +1,6 @@
+ //! Request field checks shared by every route: numbers, stops, thinking switches, efforts, probabilities.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+diff --git a/zig/src/server/grammar.zig b/zig/src/server/grammar.zig
+index c8a68b5c..543f08a2 100644
+--- a/zig/src/server/grammar.zig
++++ b/zig/src/server/grammar.zig
+@@ -1,7 +1,7 @@
+ //! Structured-output fields checked as ``engine.grammar.request_spec`` checks them; the engine enforces them.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const pyrepr = @import("pyrepr.zig");
+ const tool_specs = @import("tool_specs.zig");
 diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
-index 22e4b976..d6b41e62 100644
+index 22e4b976..d401cbfb 100644
 --- a/zig/src/server/hf_text.zig
 +++ b/zig/src/server/hf_text.zig
-@@ -12,6 +12,10 @@ pub const HfText = struct {
+@@ -2,16 +2,35 @@
+ const std = @import("std");
+ const tokenizer = @import("tokenizer");
+ const template = @import("template");
+-const json = @import("json.zig");
++const json = @import("json");
+ const model_text = @import("model_text.zig");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
++/// --vision: the checkpoint template's no-media reminder becomes GLM's picture and clip markers (Glm5NextProcessor's
++/// layout; ``glm5_next/cuda/app.py media_template``), a part's ``tf_mark`` going before them.
++pub var media_template: bool = false;
++const no_media = "{{- \"<reminder>You are unable to process this \" ~ media_type ~ \" because you don't have multi-modal input ability. Try different methods.</reminder>\" }}";
++const with_media = "{%- if item.tf_mark is defined -%}{{- item.tf_mark -}}{%- endif -%}" ++
++    "{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>" ++
++    "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>" ++
++    "{%- else -%}" ++ no_media ++ "{%- endif -%}";
++
++/// The template with its media branch swapped, or null when it has none TensorFold knows how to extend.
++pub fn swapMedia(a: Allocator, source: []const u8) Allocator.Error!?[]const u8 {
++    if (std.mem.count(u8, source, no_media) != 1) return null;
++    return try std.mem.replaceOwned(u8, a, source, no_media, with_media);
++}
++
+ pub const HfText = struct {
+     gpa: Allocator,
      arena: std.heap.ArenaAllocator,
      tok: tokenizer.Tokenizer,
      source: []const u8 = "",
@@ -2081,7 +3499,7 @@ index 22e4b976..d6b41e62 100644
      tool_source: []const u8 = "",
      compiled: ?template.Compiled = null,
      tool_compiled: ?template.Compiled = null,
-@@ -34,6 +38,9 @@ pub const HfText = struct {
+@@ -34,6 +53,9 @@ pub const HfText = struct {
          errdefer t.tok.deinit();
          const config = readJson(io, a, dir, "tokenizer_config.json");
          const model_config = readJson(io, a, dir, "config.json");
@@ -2091,7 +3509,20 @@ index 22e4b976..d6b41e62 100644
          if (template_override) |path| {
              t.source = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| {
                  problem.* = try std.fmt.allocPrint(pa, "cannot read chat template override ({s})", .{@errorName(e)});
-@@ -55,6 +62,18 @@ pub const HfText = struct {
+@@ -43,6 +65,12 @@ pub const HfText = struct {
+         t.specials = try specialsOf(a, config);
+         t.eos = try t.eosIds(a, model_config, config);
+         try t.readPostProcessor(io, a, dir);
++        if (media_template and t.glm and t.source.len > 0) {
++            t.source = (try swapMedia(a, t.source)) orelse {
++                problem.* = try std.fmt.allocPrint(pa, "--vision: this checkpoint's chat template has no media branch TensorFold knows how to extend (GLM-5.3 Flash's chat_template.jinja)", .{});
++                return error.Load;
++            };
++        }
+         if (t.source.len > 0) {
+             var diag: template.Diag = .{};
+             defer if (diag.msg.len > 0) gpa.free(diag.msg);
+@@ -55,6 +83,18 @@ pub const HfText = struct {
          return t;
      }
  
@@ -2110,7 +3541,7 @@ index 22e4b976..d6b41e62 100644
      pub fn deinit(t: *HfText) void {
          if (t.compiled) |*c| c.deinit();
          if (t.tool_compiled) |*c| c.deinit();
-@@ -122,7 +141,8 @@ pub const HfText = struct {
+@@ -122,7 +162,8 @@ pub const HfText = struct {
          return .{ .object = out };
      }
  
@@ -2120,7 +3551,7 @@ index 22e4b976..d6b41e62 100644
      fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
          var out: std.ArrayList(u32) = .empty;
          if (model_config == .object) {
-@@ -270,6 +290,9 @@ pub const HfText = struct {
+@@ -270,6 +311,9 @@ pub const HfText = struct {
              var it = t.specials.object.iterator();
              while (it.next()) |e| try context.put(a, e.key_ptr.*, e.value_ptr.*);
          }
@@ -2130,7 +3561,7 @@ index 22e4b976..d6b41e62 100644
          try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
          try context.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
          if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
-@@ -280,7 +303,12 @@ pub const HfText = struct {
+@@ -280,7 +324,12 @@ pub const HfText = struct {
              problem.* = diag.msg;
              return error.Template;
          };
@@ -2144,7 +3575,7 @@ index 22e4b976..d6b41e62 100644
      }
  };
  
-@@ -367,3 +395,33 @@ test "explicit template overrides checkpoint templates including tool prompts an
+@@ -367,3 +416,46 @@ test "explicit template overrides checkpoint templates including tool prompts an
      defer empty.deinit();
      try std.testing.expectError(error.Template, empty.text().render(a, messages, .{}, &problem));
  }
@@ -2178,11 +3609,39 @@ index 22e4b976..d6b41e62 100644
 +    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, off.eos); // TF_GLM_ASSISTANT_ENDS=0 keeps the checkpoint's
 +    try std.testing.expect(off.effort_tail and off.clear_thinking);
 +}
++
++test "the media branch of GLM's template is swapped for the picture and clip markers" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const source = "x{%- set media_type = item.type -%}" ++ no_media ++ "y";
++    const out = (try swapMedia(a, source)).?;
++    try std.testing.expect(std.mem.indexOf(u8, out, "<|begin_of_image|><|image|><|end_of_image|>") != null);
++    try std.testing.expect(std.mem.indexOf(u8, out, "item.tf_mark is defined") != null);
++    try std.testing.expect(std.mem.endsWith(u8, out, "{%- endif -%}y"));
++    try std.testing.expect((try swapMedia(a, "no media branch")) == null);
++    try std.testing.expect((try swapMedia(a, source ++ no_media)) == null);
++}
 diff --git a/zig/src/server/http_body.zig b/zig/src/server/http_body.zig
-index ad2951eb..b618e32e 100644
+index ad2951eb..b4930f2b 100644
 --- a/zig/src/server/http_body.zig
 +++ b/zig/src/server/http_body.zig
-@@ -138,7 +138,17 @@ fn trailerName(line: []const u8) bool {
+@@ -1,11 +1,12 @@
+ //! Bounded request bodies, fixed-length or chunked, refused as the Python server refuses them.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const Conn = @import("http_conn.zig").Conn;
+ const Allocator = std.mem.Allocator;
+ 
+-pub const limit = 32 * 1024 * 1024;
++/// 32 MiB; 96 MiB with --vision (base64 data URLs are a third larger than the files)
++pub var limit: usize = 32 * 1024 * 1024;
+ const metadata_limit = 65536;
+ 
+ /// A body, or the refusal a RequestError carries (the connection then closes).
+@@ -138,7 +139,17 @@ fn trailerName(line: []const u8) bool {
  
  /// The body as JSON (an empty body reads as ``{}``): a framing refusal, or the decoder's message as another exception.
  pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
@@ -2201,7 +3660,7 @@ index ad2951eb..b618e32e 100644
          .ok => |b| b,
          .refused => |message| return cx.refuse(message),
      };
-@@ -147,3 +157,8 @@ pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
+@@ -147,3 +158,8 @@ pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
          .err => |message| cx.other(message),
      };
  }
@@ -2222,6 +3681,18 @@ index f29d9f86..b53075ab 100644
          if (c.close) try c.addHeader("Connection", "close");
          try c.finish(body);
      }
+diff --git a/zig/src/server/json.zig b/zig/src/server/json.zig
+index 2b69a19f..d81cb213 100644
+--- a/zig/src/server/json.zig
++++ b/zig/src/server/json.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const parse = @import("json_parse.zig").parse;
++pub const wtf8Encode = @import("json_parse.zig").wtf8Encode;
+ pub const parseText = @import("json_parse.zig").parseText;
+ pub const ParseResult = @import("json_parse.zig").Result;
+ pub const write = @import("json_write.zig").write;
 diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
 index a5ef71bd..be6870b0 100644
 --- a/zig/src/server/late_system_test.zig
@@ -2297,19 +3768,55 @@ index a5ef71bd..be6870b0 100644
  }
  
  fn writeAll(fd: std.c.fd_t, data: []const u8) !void {
+diff --git a/zig/src/server/live.zig b/zig/src/server/live.zig
+index cb0cbaf6..8a1f7df7 100644
+--- a/zig/src/server/live.zig
++++ b/zig/src/server/live.zig
+@@ -1,7 +1,7 @@
+ //! The live status line (connections, decode and prefill tok/s), redrawn in a terminal, and /health's copy of it.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const log = @import("log.zig");
+ const Allocator = std.mem.Allocator;
+ 
+diff --git a/zig/src/server/logprobs.zig b/zig/src/server/logprobs.zig
+index 0d0b37d0..ff6d62da 100644
+--- a/zig/src/server/logprobs.zig
++++ b/zig/src/server/logprobs.zig
+@@ -1,7 +1,7 @@
+ //! OpenAI ``logprobs`` on a chat reply: which requests may ask, and ``choices[0].logprobs`` from the engine's rows.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const Server = @import("server.zig").Server;
+ const Value = json.Value;
 diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
-index 5ca1fd32..a37c0946 100644
+index 5ca1fd32..248175a8 100644
 --- a/zig/src/server/main.zig
 +++ b/zig/src/server/main.zig
-@@ -8,6 +8,7 @@ const engines = @import("engines.zig");
+@@ -1,13 +1,16 @@
+ //! ``tensorfold-native``: ``capabilities --json`` for the Python switch, and ``serve MODEL [flags]`` with no Python.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const cli = @import("cli.zig");
+ const log = @import("log.zig");
+ const hub = @import("hub.zig");
+ const engines = @import("engines.zig");
  const serve = @import("serve.zig");
  const hf_text = @import("hf_text.zig");
++const vision = @import("vision_helper.zig");
++const vision_server = @import("vision_server.zig");
  const startup = @import("startup.zig");
 +const recipe = @import("recipe.zig");
  const checkpoint_cli = @import("checkpoint_cli");
  
  const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
-@@ -66,6 +67,15 @@ pub fn main(init: std.process.Init) !u8 {
+@@ -66,6 +69,28 @@ pub fn main(init: std.process.Init) !u8 {
          if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
          return 0;
      }
@@ -2322,10 +3829,23 @@ index 5ca1fd32..a37c0946 100644
 +        };
 +        recipe_cfg.glm = true;
 +    }
++    hf_text.media_template = args.vision;
++    // --vision (rank 0): the frontend, and for the python backend the helper, which loads and warms its tower on this GPU
++    // before the engine reads its memory budget, so the tower and the helper's context stay outside the caches' share
++    var vis: ?*vision_server.Vision = null;
++    defer if (vis) |x| x.stop(io);
++    if (args.vision) {
++        const backend: vision_server.Backend = if (std.mem.eql(u8, args.vision_backend, "zig")) .zig else .python;
++        vis = vision_server.Vision.start(gpa, io, backend, args.vision_urls, imageTokenId(a, io, dir), if (args.vision_max_images) |n| @intCast(n) else null, if (args.vision_image_tokens) |n| @intCast(n) else null, &problem) catch return fail(problem);
++        if (backend == .python) {
++            const lim = vis.?.fe.opts.limits;
++            vis.?.helper = vision.Helper.start(gpa, io, dir, .{ .allow_urls = args.vision_urls, .max_images = lim.max_images, .image_tokens = lim.image_tokens }, init.environ_map, &problem) catch return fail(problem);
++        }
++    }
      var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
      defer text_arena.deinit();
      var text_problem: []const u8 = "";
-@@ -76,6 +86,7 @@ pub fn main(init: std.process.Init) !u8 {
+@@ -76,6 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
      } orelse return fail(problem);
      defer up.text.deinit();
      defer up.engine.close(up.engine.ctx);
@@ -2333,18 +3853,142 @@ index 5ca1fd32..a37c0946 100644
      return serve.run(gpa, io, args, .{
          .engine = up.engine.engine,
          .text = up.text.text(),
-@@ -83,6 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
+@@ -83,7 +109,9 @@ pub fn main(init: std.process.Init) !u8 {
          .model_dir = dir,
          .sampling = try sampling(a, io, dir, args),
          .environ = init.environ_map,
 +        .recipe = recipe_cfg,
          .started = started,
++        .vision = vis,
      });
  }
+ 
+@@ -128,3 +156,13 @@ fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args) !
+     if (args.min_p) |t| try out.put(a, "min_p", .{ .float = t });
+     return if (out.count() > 0) json.Value{ .object = out } else null;
+ }
++
++/// config.json's image_token_id (the picture placeholder), 154854 for GLM-5.3-Flash.
++fn imageTokenId(a: std.mem.Allocator, io: std.Io, dir: []const u8) u32 {
++    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 154854;
++    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return 154854;
++    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return 154854;
++    if (doc != .object) return 154854;
++    const t = doc.object.get("image_token_id") orelse return 154854;
++    return if (t == .integer and t.integer > 0) @intCast(t.integer) else 154854;
++}
+diff --git a/zig/src/server/memory_routes.zig b/zig/src/server/memory_routes.zig
+index 5a168451..a8fa3191 100644
+--- a/zig/src/server/memory_routes.zig
++++ b/zig/src/server/memory_routes.zig
+@@ -1,7 +1,7 @@
+ //! Authenticated, read-only sizing diagnostics; unknown counters and plans are omitted rather than guessed.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const process = @import("process_memory.zig");
+ const routes = @import("routes.zig");
+ const Server = @import("server.zig").Server;
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index 9559ed78..e1a0d6fa 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -1,6 +1,6 @@
+ //! Chat messages as the template sees them: leading instructions merged, text parts joined, call arguments as objects.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const Value = json.Value;
+@@ -21,8 +21,30 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
+     return copy;
+ }
+ 
++/// ``has_images``: a message whose content holds an image_url or video_url part.
++pub fn hasVisual(messages: ?Value) bool {
++    const list = messages orelse return false;
++    if (list != .array) return false;
++    for (list.array) |m| {
++        const content = m.get("content") orelse continue;
++        if (content != .array) continue;
++        for (content.array) |part| if (part.typeIs("image_url") or part.typeIs("video_url")) return true;
++    }
++    return false;
++}
++
++fn isVisualPart(part: Value) bool {
++    return part.typeIs("image_url") or part.typeIs("image") or part.typeIs("video_url") or part.typeIs("video");
++}
++
+ /// ``normalize_messages`` (text only): leading system and developer text merged, later ones as ``late_system``; a template that needs a user query gains one user turn after a trailing tool run.
+ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool) errors.Refused!Value {
++    return normalizeWith(cx, messages, late_system, needs_user_after_tool, false);
++}
++
++/// ``normalize_messages``; `allow_media` (``allow_images``): a user or tool message with picture or clip parts keeps its
++/// parts list for the template.
++pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, allow_media: bool) errors.Refused!Value {
+     const list = messages orelse return cx.refuse("messages must be a non-empty list");
+     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
+     var out: std.ArrayList(Value) = .empty;
+@@ -34,6 +56,22 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
+         if (fields.hasMedia(message)) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+         const content = message.get("content");
+         var item: *json.Object = message.object;
++        const visual = allow_media and content != null and content.? == .array and for (content.?.array) |part| {
++            if (part == .object and isVisualPart(part)) break true;
++        } else false;
++        if (visual) {
++            const r = role.?.string;
++            if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) return cx.refuse("images and videos are supported only in user and tool messages");
++            for (content.?.array) |part| {
++                if (part != .object or !(part.typeIs("text") or isVisualPart(part))) return cx.refuse("image messages may contain text and image_url (or video_url) parts only");
++                if (part.typeIs("text")) {
++                    const t = part.get("text");
++                    if (t == null or t.? != .string) return cx.refuse("a text content part must contain a text string");
++                }
++            }
++            try out.append(cx.a, message);
++            continue;
++        }
+         if (content != null and content.? == .array) {
+             var text: std.ArrayList(u8) = .empty;
+             for (content.?.array) |part| {
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index d044b61d..dec77aa1 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -122,6 +122,16 @@ pub const Metrics = struct {
+         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
+         const keeps = engine.info().prompt_cache;
+         if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states.", snap.cached);
++        if (status.kept) |k| {
++            try gauge(w, "kept_prompts", "gauge", "Prompt states kept for reuse.", k.prompts);
++            try gauge(w, "kept_bytes", "gauge", "Device bytes the kept prompt states hold.", k.bytes);
++            if (k.spill_on) {
++                try gauge(w, "spill_entries", "gauge", "Kept prompt states stored on this rank's disk.", k.spill[0]);
++                try gauge(w, "spill_stored_bytes", "gauge", "Bytes the spill tier's files take.", k.spill[1]);
++                try gauge(w, "spill_writes_total", "counter", "Prompt states written to the spill tier.", k.spill[2]);
++                try gauge(w, "spill_reads_total", "counter", "Prompt states read back from the spill tier.", k.spill[4]);
++            }
++        }
+         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+         const live = streams[0..@min(status.streams, streams.len)];
+         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
 diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
-index 0b36055a..2713463e 100644
+index 0b36055a..258bcab3 100644
 --- a/zig/src/server/model_text.zig
 +++ b/zig/src/server/model_text.zig
+@@ -1,6 +1,6 @@
+ //! The tokenizer and chat template a server renders prompts and replies with (the tok and jinja branches plug in here).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const RenderOptions = struct {
 @@ -10,6 +10,8 @@ pub const RenderOptions = struct {
      /// Also ``thinking_mode`` ("thinking" or "chat") for templates that read that switch.
      enable_thinking: bool = false,
@@ -2355,9 +3999,17 @@ index 0b36055a..2713463e 100644
  
  pub const Error = error{ Template, OutOfMemory };
 diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
-index 91d02cce..fd8c0cdb 100644
+index 91d02cce..99bc4bd1 100644
 --- a/zig/src/server/openai.zig
 +++ b/zig/src/server/openai.zig
+@@ -1,6 +1,6 @@
+ //! POST /v1/chat/completions and /v1/completions, JSON or SSE, as ``server.http`` answers them.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const chat = @import("chat.zig");
 @@ -17,6 +17,9 @@ const sse = @import("sse.zig");
  const http_body = @import("http_body.zig");
  const routes = @import("routes.zig");
@@ -2377,18 +4029,24 @@ index 91d02cce..fd8c0cdb 100644
          const err = errorBody(a, &cx, if (is_chat) "messages" else "prompt") catch return;
          return routes.sendValue(conn, a, cx.status(), wrapError(a, err) catch return);
      };
-@@ -125,7 +128,9 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+@@ -124,8 +127,14 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     const logprobs = try fields.probabilityOptions(cx, body, exact_bytes);
      if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
      var input: chat.Input = .{ .fields = undefined };
-     if (is_chat) {
+-    if (is_chat) {
 -        input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
++    if (is_chat and srv.vision != null and messages.hasVisual(body.get("messages"))) {
++        // picture and clip parts: split, rendered and prepared by the vision backend (prompt.prepareMedia)
++        input.media = body.get("messages");
++        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
++    } else if (is_chat) {
 +        // the recipe: a tool result's pictures render as the template's reminder (0056); a user's are refused below
 +        const sent: ?Value = if (srv.config.recipe.glm and body.get("messages") != null) try glm_history.toolMedia(cx.a, body.get("messages").?) else body.get("messages");
 +        input.messages = try messages.normalize(cx, sent, "system", srv.needs_user_after_tool);
          input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
      } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
          input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
-@@ -143,13 +148,14 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+@@ -143,13 +152,14 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
          input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
      };
      const sampling = try json.newObject(cx.a);
@@ -2404,7 +4062,7 @@ index 91d02cce..fd8c0cdb 100644
      input.fields = .{ .object = sampling };
      const streamed = if (body.get("stream")) |s| s.truthy() else false;
      if (logprobs != null) {
-@@ -314,6 +320,13 @@ const Run = struct {
+@@ -314,6 +324,13 @@ const Run = struct {
      fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
          const tools = r.plan.input.tools;
          if (tools.len == 0) return null;
@@ -2418,7 +4076,7 @@ index 91d02cce..fd8c0cdb 100644
          const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
          const calls = parsed.calls orelse {
              if (r.plan.policy.single) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
-@@ -329,7 +342,7 @@ const Run = struct {
+@@ -329,7 +346,7 @@ const Run = struct {
          const a = r.a;
          const kind_ok = cx.kind != .other and cx.kind != .server;
          const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
@@ -2427,7 +4085,7 @@ index 91d02cce..fd8c0cdb 100644
      }
  
      /// A reply that ended before anything was sent: a refusal's 400, a failure's 500, nothing when the client left.
-@@ -389,7 +402,9 @@ const Run = struct {
+@@ -389,7 +406,9 @@ const Run = struct {
          if (r.is_chat) {
              const message = try json.newObject(a);
              try message.put(a, "role", .{ .string = "assistant" });
@@ -2438,7 +4096,7 @@ index 91d02cce..fd8c0cdb 100644
              if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
              if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
              try choice.put(a, "message", .{ .object = message });
-@@ -418,6 +433,10 @@ const Run = struct {
+@@ -418,6 +437,10 @@ const Run = struct {
                  if (!r.is_chat and delta != .string) return; // completions stream text only
                  return r.emit(r.chunk(delta, null) catch return error.Closed);
              }
@@ -2449,7 +4107,7 @@ index 91d02cce..fd8c0cdb 100644
              const filtered = r.policyDelta(delta) catch return error.Closed;
              const d = filtered orelse return;
              try r.prose();
-@@ -465,11 +484,11 @@ const Run = struct {
+@@ -465,11 +488,11 @@ const Run = struct {
          // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
          var compaction: ?compact.Stamp = null;
          const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
@@ -2463,7 +4121,7 @@ index 91d02cce..fd8c0cdb 100644
                  return r.unsent(&cx, e, field);
              };
              compaction = ready.stamp;
-@@ -477,6 +496,8 @@ const Run = struct {
+@@ -477,6 +500,8 @@ const Run = struct {
          };
          var handed = false; // generate gives the preparing count back from here on
          defer if (!handed) chat.release(r.srv, prepared.preparing);
@@ -2472,7 +4130,7 @@ index 91d02cce..fd8c0cdb 100644
          r.out.vt.open(r.out.ctx) catch return;
          if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
          var sink_state: StreamSink = .{ .run = r, .tools = tools };
-@@ -513,8 +534,12 @@ const Run = struct {
+@@ -513,8 +538,12 @@ const Run = struct {
              }
              if (calls != null and !reply.tool_calls_streamed) {
                  r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
@@ -2488,18 +4146,34 @@ index 91d02cce..fd8c0cdb 100644
                  r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
              } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
 diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
-index e68363bf..01f73c89 100644
+index e68363bf..60df5a00 100644
 --- a/zig/src/server/prompt.zig
 +++ b/zig/src/server/prompt.zig
-@@ -5,6 +5,7 @@ const errors = @import("errors.zig");
+@@ -1,15 +1,21 @@
+ //! Prompt ids from a request, as ``prepare_prompt`` and ``render_prompt_ids`` make them.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
  const messages_mod = @import("messages.zig");
  const model_text = @import("model_text.zig");
  const chat = @import("chat.zig");
 +const glm_history = @import("glm_history.zig");
  const Server = @import("server.zig").Server;
++const api = @import("engine_api");
++const vision = @import("vision");
++const helper_mod = @import("vision_helper.zig");
++const vision_server = @import("vision_server.zig");
++const log = @import("log.zig");
  const Value = json.Value;
  const Cx = errors.Cx;
-@@ -27,9 +28,12 @@ pub const isTitle = messages_mod.isTitleRequest;
+ 
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0 };
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null };
+ 
+ /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
+ pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
+@@ -27,9 +33,12 @@ pub const isTitle = messages_mod.isTitleRequest;
  
  /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
  pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
@@ -2513,7 +4187,103 @@ index e68363bf..01f73c89 100644
          .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
          .add_generation_prompt = generation,
          .enable_thinking = thinking,
-@@ -119,7 +123,7 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
+@@ -96,6 +105,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+         } },
+         .ids => |ids| return .{ .ids = ids },
+     };
++    if (input.media) |raw| return prepareMedia(srv, cx, raw, input.tools, thinking, effort);
+     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+     var history_len: usize = 0;
+@@ -106,6 +116,87 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+     return .{ .ids = prompt, .history_len = history_len, .rewind_len = rewind_len };
+ }
+ 
++/// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, marked, the
++/// media in order), normalized with their parts, rendered, then the vision backend: the token ids and the media the
++/// engine takes. Such a prompt is neither kept nor resumed.
++fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
++    const v = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
++    if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
++    var diag: vision.errors.Diag = .{};
++    const sp = vision.split.splitImages(cx.a, raw, v.fe.splitOptions(), &diag) catch |e| return mediaFailure(cx, e, &diag);
++    var nonce_raw: [8]u8 = undefined;
++    std.Io.random(srv.io, &nonce_raw);
++    const marks = try vision.split.MediaMarks.init(cx.a, sp.messages, nonce_raw);
++    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, sp.messages, srv.late_system, srv.needs_user_after_tool, true));
++    var problem: []const u8 = "";
++    const options: model_text.RenderOptions = .{
++        .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
++        .add_generation_prompt = true,
++        .enable_thinking = thinking,
++        .reasoning_effort = if (thinking) effort else null,
++    };
++    const text = srv.text.render(cx.a, normalized, options, &problem) catch |e| switch (e) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Template => return cx.fail(.request, "the chat template rejected the request: {s}", .{problem}),
++    };
++    const window: ?usize = if (srv.info.context_window > 0) srv.info.context_window else null;
++    switch (v.backend) {
++        .python => {
++            const helper = v.helper orelse return cx.refuse("the vision helper is not running");
++            const list = try cx.a.alloc(helper_mod.Source, sp.sources.len);
++            for (sp.sources, list) |s, *slot| slot.* = switch (s) {
++                .image => |i| .{ .kind = .image, .url = i.url, .detail = @tagName(i.detail) },
++                .video => |x| .{ .kind = .video, .url = x.url },
++            };
++            const result = helper.prepare(cx.a, text, &marks.nonce, list, if (window) |w| @intCast(w) else null) catch |e| switch (e) {
++                error.OutOfMemory => return error.OutOfMemory,
++                else => return cx.fail(.capacity, "image processing failed ({s}); retry shortly", .{@errorName(e)}),
++            };
++            switch (result) {
++                .refused => |r| {
++                    if (r.context) return cx.fail(.context_length, "{s}", .{r.message});
++                    return cx.fail(if (r.status == 503) .capacity else .request, "{s}", .{r.message});
++                },
++                .ok => |p| {
++                    log.line("vision (python): {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
++                    return .{ .ids = p.tokens, .media = p.media };
++                },
++            }
++        },
++        .zig => {
++            const rd = marks.read(cx.a, text, true, &diag) catch |e| return mediaFailure(cx, e, &diag);
++            v.slots.acquire(srv.io, &diag) catch return cx.fail(.capacity, "{s}", .{diag.message()});
++            defer v.slots.release(srv.io);
++            const t0 = std.Io.Clock.awake.now(srv.io).toNanoseconds();
++            var media = v.fe.loadSources(cx.a, sp.sources, rd.order, &diag) catch |e| return mediaFailure(cx, e, &diag);
++            defer media.deinit(cx.a);
++            const ex = v.fe.expand(cx.a, rd.text, media.pictures, media.clips, &diag) catch |e| return mediaFailure(cx, e, &diag);
++            const ids = srv.text.encode(cx.a, ex.text, false) catch |e| switch (e) {
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Template => return cx.fail(.server, "the tokenizer cannot encode this prompt", .{}),
++            };
++            const fin = v.fe.finish(cx.a, ids, v.image_token, ex.items, window, &diag) catch |e| return mediaFailure(cx, e, &diag);
++            const items = vision_server.engineItems(v, cx.a, ex.items, &diag) catch |e| switch (e) {
++                error.OutOfMemory => return error.OutOfMemory,
++                else => return mediaFailure(cx, e, &diag),
++            };
++            const m = try cx.a.create(api.Media);
++            m.* = .{ .rows = fin.positions, .items = items };
++            m.check(ids.len) catch return cx.fail(.server, "the picture rows do not fit the prompt", .{});
++            const t1 = std.Io.Clock.awake.now(srv.io).toNanoseconds();
++            log.line("vision: {d} image(s), {d} clip(s): {d} visual tokens of {d} prompt tokens (frontend {d:.3}s)", .{ media.pictures.len, media.clips.len, fin.positions.len, ids.len, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
++            return .{ .ids = ids, .media = m };
++        },
++    }
++}
++
++fn mediaFailure(cx: *Cx, e: anyerror, diag: *vision.errors.Diag) errors.Refused {
++    return switch (e) {
++        error.OutOfMemory => error.OutOfMemory,
++        else => if (diag.isContextLimit()) cx.fail(.context_length, "{s}", .{diag.message()}) else cx.refuse(diag.message()),
++    };
++}
++
+ /// Where the latest user message's text starts (of the first `real_count`): the prompt and a probe there agree to it.
+ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tools: []const Value, prompt: []const u32, thinking: bool, effort: ?[]const u8) usize {
+     if (messages != .array or real_count > messages.array.len) return 0;
+@@ -119,7 +210,7 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
      const user = json.copyObject(cx.a, messages.array[user_index].object) catch return 0;
      user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
      list[user_index] = .{ .object = user };
@@ -2522,7 +4292,7 @@ index e68363bf..01f73c89 100644
      const probe = renderIds(srv, &scratch, .{ .array = list }, tools, thinking, effort, true) catch return 0;
      const i = std.mem.indexOfDiff(u32, prompt, probe) orelse return 0;
      return if (i < prompt.len) i else 0;
-@@ -138,7 +142,7 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
+@@ -138,7 +229,7 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
      user.put(cx.a, "role", .{ .string = "user" }) catch return 0;
      user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
      probe[first_user] = .{ .object = user };
@@ -2531,11 +4301,89 @@ index e68363bf..01f73c89 100644
      const other = renderIds(srv, &scratch, .{ .array = probe }, tools, thinking, effort, true) catch return 0;
      var shared: usize = 0;
      while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;
+diff --git a/zig/src/server/pyrepr.zig b/zig/src/server/pyrepr.zig
+index d5607735..255232af 100644
+--- a/zig/src/server/pyrepr.zig
++++ b/zig/src/server/pyrepr.zig
+@@ -1,6 +1,6 @@
+ //! Python's ``repr`` of decoded JSON, for refusal messages that quote a request's value.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
+diff --git a/zig/src/server/request_log.zig b/zig/src/server/request_log.zig
+index ea4c8b79..2a8ba1be 100644
+--- a/zig/src/server/request_log.zig
++++ b/zig/src/server/request_log.zig
+@@ -1,10 +1,10 @@
+-//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images redacted, for replays.
++//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images and videos redacted, for replays.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
+-/// The body with every image part's URL replaced, the rest kept.
++/// The body with every image and video part's URL replaced, the rest kept.
+ fn redact(a: Allocator, v: Value) Allocator.Error!Value {
+     switch (v) {
+         .array => |items| {
+@@ -13,13 +13,13 @@ fn redact(a: Allocator, v: Value) Allocator.Error!Value {
+             return .{ .array = out };
+         },
+         .object => |o| {
+-            if (v.typeIs("image_url")) {
++            for ([_][]const u8{ "image_url", "video_url" }) |kind| if (v.typeIs(kind)) {
+                 const copy = try json.copyObject(a, o);
+                 const url = try json.newObject(a);
+                 try url.put(a, "url", .{ .string = "<redacted>" });
+-                try copy.put(a, "image_url", .{ .object = url });
++                try copy.put(a, kind, .{ .object = url });
+                 return .{ .object = copy };
+-            }
++            };
+             const out = try json.newObject(a);
+             for (o.keys(), o.values()) |k, item| try out.put(a, k, try redact(a, item));
+             return .{ .object = out };
+diff --git a/zig/src/server/responses.zig b/zig/src/server/responses.zig
+index 309aade4..a18074b0 100644
+--- a/zig/src/server/responses.zig
++++ b/zig/src/server/responses.zig
+@@ -1,6 +1,6 @@
+ //! OpenAI's Responses API: each request runs as its chat completion, translated item by item and event by event.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const http_body = @import("http_body.zig");
+ const openai = @import("openai.zig");
+diff --git a/zig/src/server/responses_translate.zig b/zig/src/server/responses_translate.zig
+index 14b2425f..b5b95a36 100644
+--- a/zig/src/server/responses_translate.zig
++++ b/zig/src/server/responses_translate.zig
+@@ -1,6 +1,6 @@
+ //! A Responses request as the chat completion that runs it (``responses_translate.translate``).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const pyrepr = @import("pyrepr.zig");
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index ecc81c57..e6a2dcf7 100644
+index ecc81c57..1d5204ca 100644
 --- a/zig/src/server/root.zig
 +++ b/zig/src/server/root.zig
-@@ -12,6 +12,7 @@ pub const server = @import("server.zig");
+@@ -1,5 +1,5 @@
+ //! The native HTTP server's surface: what main and the test servers build a server from.
+-pub const json = @import("json.zig");
++pub const json = @import("json");
+ pub const errors = @import("errors.zig");
+ pub const auth = @import("auth.zig");
+ pub const cli = @import("cli.zig");
+@@ -12,12 +12,13 @@ pub const server = @import("server.zig");
  pub const serve = @import("serve.zig");
  pub const hub = @import("hub.zig");
  pub const tool_specs = @import("tool_specs.zig");
@@ -2543,11 +4391,19 @@ index ecc81c57..e6a2dcf7 100644
  pub const Server = server.Server;
  pub const Config = server.Config;
  
-@@ -41,6 +42,21 @@ test {
+ test {
+     @import("std").testing.refAllDecls(@This());
+-    _ = @import("json.zig");
++    _ = @import("json");
+     _ = @import("fields.zig");
+     _ = @import("reply_text.zig");
+     _ = @import("tool_parse.zig");
+@@ -41,6 +42,22 @@ test {
      _ = @import("stream_preflight_test.zig");
      _ = @import("logprobs_test.zig");
      _ = @import("late_system_test.zig");
 +    _ = @import("glm_chat_test.zig");
++    _ = @import("vision_render_test.zig");
 +    _ = @import("glm_prompts.zig");
 +    _ = @import("glm_history.zig");
 +    _ = @import("glm_keys.zig");
@@ -2565,11 +4421,32 @@ index ecc81c57..e6a2dcf7 100644
      _ = @import("compact_test.zig");
      _ = @import("completion_prompt_test.zig");
      _ = @import("decisions.zig");
+diff --git a/zig/src/server/routes.zig b/zig/src/server/routes.zig
+index 44981cdd..35186a5e 100644
+--- a/zig/src/server/routes.zig
++++ b/zig/src/server/routes.zig
+@@ -1,6 +1,6 @@
+ //! Method and path dispatch, as ``do_GET``, ``do_POST`` and ``do_DELETE`` route them.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const http_conn = @import("http_conn.zig");
+ const http_body = @import("http_body.zig");
+ const auth = @import("auth.zig");
 diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
-index 967c0979..859c3850 100644
+index 967c0979..257d0df7 100644
 --- a/zig/src/server/serve.zig
 +++ b/zig/src/server/serve.zig
-@@ -70,6 +70,8 @@ pub const Setup = struct {
+@@ -1,7 +1,7 @@
+ //! A server's life: keys, the listening socket, the startup lines, the live line, and a clean stop on SIGTERM or SIGINT.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const auth = @import("auth.zig");
+ const cli = @import("cli.zig");
+ const log = @import("log.zig");
+@@ -70,9 +70,13 @@ pub const Setup = struct {
      /// Sampling defaults from generation_config.json and the flags, as a JSON object; null: greedy.
      sampling: ?json.Value = null,
      environ: ?*const std.process.Environ.Map = null,
@@ -2578,7 +4455,12 @@ index 967c0979..859c3850 100644
      started: i96 = 0,
      /// Called once the socket listens, with its port (tests read it).
      on_listen: ?*const fn (port: u16) void = null,
-@@ -113,6 +115,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
++    /// --vision: the started helper (picture and clip prompts)
++    vision: ?*@import("vision_server.zig").Vision = null,
+ };
+ 
+ fn env(s: Setup, name: []const u8) ?[]const u8 {
+@@ -113,6 +117,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
          .reasoning_effort = args.reasoning_effort,
          .thinking_budget = args.thinking_budget,
          .loop_guard = args.loop_guard,
@@ -2586,10 +4468,34 @@ index 967c0979..859c3850 100644
          .keep_warm_s = args.keep_warm,
          .default_sampling = s.sampling,
          .use_drafts = !args.no_drafts,
+@@ -129,6 +134,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         return 1;
+     };
+     defer srv.deinit();
++    if (s.vision) |h| {
++        if (!srv.info.media) {
++            std.debug.print("tensorfold: --vision: this engine takes no picture or clip rows\n", .{});
++            return 2;
++        }
++        srv.vision = h;
++        @import("http_body.zig").limit = 96 * 1024 * 1024;
++    }
+     if (args.loop_guard and !srv.info.loop_guard) {
+         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+         return 2;
 diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
-index 255b02a2..b63a55d6 100644
+index 255b02a2..615bcbbb 100644
 --- a/zig/src/server/server.zig
 +++ b/zig/src/server/server.zig
+@@ -1,7 +1,7 @@
+ //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const auth = @import("auth.zig");
 @@ -22,6 +22,7 @@ const log = @import("log.zig");
  const live = @import("live.zig");
  const slide_graph = @import("slide_graph.zig");
@@ -2616,7 +4522,7 @@ index 255b02a2..b63a55d6 100644
      think_close: []const u32 = &.{},
      think_close_end: ?u32 = null,
      metrics: metrics.Metrics,
-@@ -83,6 +88,10 @@ pub const Server = struct {
+@@ -83,17 +88,26 @@ pub const Server = struct {
      /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
      keepalive: ?*api.keepalive.Keepalive = null,
      preparing: std.atomic.Value(i64) = .init(0),
@@ -2625,9 +4531,16 @@ index 255b02a2..b63a55d6 100644
 +    /// Requests the engine holds now, running or waiting, background ones included (admission.zig).
 +    in_system: std.atomic.Value(u32) = .init(0),
      arena: std.heap.ArenaAllocator,
++    /// --vision: the helper that prepares picture and clip prompts (null: text only)
++    vision: ?*@import("vision_server.zig").Vision = null,
      /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
      grammars: ?*api.grammar.Compiler = null,
-@@ -94,6 +103,8 @@ pub const Server = struct {
+     grammar_problem: ?[]const u8 = null,
+     grammar_mutex: std.Io.Mutex = .init,
++    blank_ids: ?[]const u32 = null, // the whitespace-only tokens, sorted (a call gate lets them precede the opener)
+     /// The facts the learner was taught and whether the weights recall them.
+     slide: slide_graph.Graph,
+     teacher: slide_lesson.Teacher, // what every Sliding Weights lesson shares: keep prompts, the turn's end
  
      /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
      pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
@@ -2636,7 +4549,7 @@ index 255b02a2..b63a55d6 100644
          const srv = try gpa.create(Server);
          srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
          if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
-@@ -106,6 +117,13 @@ pub const Server = struct {
+@@ -106,6 +120,13 @@ pub const Server = struct {
          srv.eos = try a.dupe(u32, text.eosIds());
          if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
          srv.effort_levels = try fields.effortLevels(a, text.templateSource());
@@ -2650,7 +4563,7 @@ index 255b02a2..b63a55d6 100644
          srv.late_system = try lateSystem(a, text);
          srv.needs_user_after_tool = needsUserAfterTool(text.templateSource());
          if (text.tokenId("</think>")) |end| {
-@@ -123,6 +141,10 @@ pub const Server = struct {
+@@ -123,6 +144,10 @@ pub const Server = struct {
      }
  
      pub fn deinit(srv: *Server) void {
@@ -2661,19 +4574,222 @@ index 255b02a2..b63a55d6 100644
          if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
          if (srv.grammars) |g| g.close();
          srv.metrics.deinit();
+@@ -166,7 +191,8 @@ pub const Server = struct {
+     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
+         _ = prompt_ids;
+         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
+-        if (has_tools and required and srv.info.structures) {
++        // GLM's recipe gates the call's first token (Info.call_gates, r107-serve) instead of compiling a grammar.
++        if (has_tools and required and srv.info.structures and !(srv.config.recipe.glm and srv.info.call_gates)) {
+             const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
+             request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
+         } else if (has_tools and required) {
+@@ -183,7 +209,7 @@ pub const Server = struct {
+                 };
+                 break :blk if (ids.len > 0) ids[0] else null;
+             } else srv.text.tokenId("<think>");
+-            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close) };
++            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close), .blank = try srv.blankTokens() };
+         }
+         if (try grammar.spec(cx, f)) |s| {
+             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
+@@ -191,6 +217,25 @@ pub const Server = struct {
+         }
+     }
+ 
++    /// The ids of the vocabulary's whitespace-only tokens, sorted; scanned at the first gated request.
++    fn blankTokens(srv: *Server) Allocator.Error![]const u32 {
++        srv.grammar_mutex.lockUncancelable(srv.io);
++        defer srv.grammar_mutex.unlock(srv.io);
++        if (srv.blank_ids) |b| return b;
++        var out: std.ArrayList(u32) = .empty;
++        var scratch: std.heap.ArenaAllocator = .init(srv.gpa);
++        defer scratch.deinit();
++        var id: u32 = 0;
++        while (id < srv.text.vocabSize()) : (id += 1) {
++            _ = scratch.reset(.retain_capacity);
++            const text = try srv.text.decode(scratch.allocator(), &.{id});
++            if (text.len == 0) continue;
++            if (std.mem.indexOfNone(u8, text, " \t\r\n") == null) try out.append(srv.arena.allocator(), id);
++        }
++        srv.blank_ids = out.items;
++        return out.items;
++    }
++
+     /// A request's grammar, compiled once here (a 400 with xgrammar's reason when it cannot be enforced).
+     pub fn compiledStructure(srv: *Server, cx: *Cx, kind: grammar.Kind, text: []const u8, field: []const u8, thinking: bool) errors.Refused!api.Structure {
+         const c = srv.grammarCompiler() orelse return cx.fail(.request, "{s}: {s}", .{ if (kind == .structural_tag) field else "structured output", srv.grammar_problem.? });
+diff --git a/zig/src/server/slide.zig b/zig/src/server/slide.zig
+index 88de83dd..bd6fc8b7 100644
+--- a/zig/src/server/slide.zig
++++ b/zig/src/server/slide.zig
+@@ -1,7 +1,7 @@
+ //! Sliding Weights over HTTP: /v1/slide/learn streams learning, /v1/slide/graph lists or clears facts, /slide draws.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const sse = @import("sse.zig");
+ const http_body = @import("http_body.zig");
+ const routes = @import("routes.zig");
+diff --git a/zig/src/server/slide_ask.zig b/zig/src/server/slide_ask.zig
+index d7c18f24..d02eb119 100644
+--- a/zig/src/server/slide_ask.zig
++++ b/zig/src/server/slide_ask.zig
+@@ -1,7 +1,7 @@
+ //! What a lesson asks the model and how replies become examples: chat replies, continuations, token ids.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const chat = @import("chat.zig");
+ const prompt = @import("prompt.zig");
+ const errors = @import("errors.zig");
+diff --git a/zig/src/server/slide_graph.zig b/zig/src/server/slide_graph.zig
+index 0f4d466d..68569070 100644
+--- a/zig/src/server/slide_graph.zig
++++ b/zig/src/server/slide_graph.zig
+@@ -1,7 +1,7 @@
+ //! The Sliding Weights fact graph: what was taught, how far each lesson is, where its neurons went; never the weights.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const slide_model = @import("slide_model.zig");
+ const Allocator = std.mem.Allocator;
+ const Io = std.Io;
+diff --git a/zig/src/server/slide_lesson.zig b/zig/src/server/slide_lesson.zig
+index 8e995cd8..b3845008 100644
+--- a/zig/src/server/slide_lesson.zig
++++ b/zig/src/server/slide_lesson.zig
+@@ -1,7 +1,7 @@
+ //! A fact's lesson written by the model itself: the teller's questions, short answers, near misses, keep prompts.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const chat = @import("chat.zig");
+ const prompt = @import("prompt.zig");
+ const errors = @import("errors.zig");
+diff --git a/zig/src/server/slide_model.zig b/zig/src/server/slide_model.zig
+index 274f9bb5..014fcca7 100644
+--- a/zig/src/server/slide_model.zig
++++ b/zig/src/server/slide_model.zig
+@@ -1,6 +1,6 @@
+ //! The served model as the Sliding Weights view draws it: its layers, its pockets, and the shards that hold them.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const Allocator = std.mem.Allocator;
+ const Io = std.Io;
+ 
+diff --git a/zig/src/server/slide_teacher.zig b/zig/src/server/slide_teacher.zig
+index d8018426..0cbc1ef5 100644
+--- a/zig/src/server/slide_teacher.zig
++++ b/zig/src/server/slide_teacher.zig
+@@ -1,7 +1,7 @@
+ //! What every lesson shares, written once: keep prompts with the model's answers, the personal bank, the turn's end.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const log = @import("log.zig");
+ const prompts = @import("slide_prompts.zig");
+ const slide_ask = @import("slide_ask.zig");
+diff --git a/zig/src/server/slide_think.zig b/zig/src/server/slide_think.zig
+index dce2cb1b..26f36159 100644
+--- a/zig/src/server/slide_think.zig
++++ b/zig/src/server/slide_think.zig
+@@ -1,7 +1,7 @@
+ //! A lesson with thinking on: the model's reasoning to where it restates the question, then a learned recall line.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const chat = @import("chat.zig");
+ const prompt = @import("prompt.zig");
+ const errors = @import("errors.zig");
+diff --git a/zig/src/server/sse.zig b/zig/src/server/sse.zig
+index de30ac12..0942a7e1 100644
+--- a/zig/src/server/sse.zig
++++ b/zig/src/server/sse.zig
+@@ -1,6 +1,6 @@
+ //! Server-sent events as the Python server frames them: the head, ``data:`` frames, typed ``event:`` frames, ``[DONE]``.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const Conn = @import("http_conn.zig").Conn;
+ const Allocator = std.mem.Allocator;
+ 
 diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
-index 89ee5c84..a011329c 100644
+index 89ee5c84..cdb5e331 100644
 --- a/zig/src/server/status_routes.zig
 +++ b/zig/src/server/status_routes.zig
-@@ -31,6 +31,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+@@ -1,7 +1,7 @@
+ //! GET /health, /v1/models, /metrics, and the opt-in dashboard.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const live = @import("live.zig");
+ const routes = @import("routes.zig");
+ const Server = @import("server.zig").Server;
+@@ -23,6 +23,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     var status: api.Status = .{};
+     srv.engine.status(&status, &.{});
+     try o.put(a, "warming", .{ .bool = status.warming });
++    try @import("glm_health.zig").put(a, o, status);
+     const memory = try json.newObject(a);
+     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
+         try memory.put(a, "active", try json.intValue(a, mem.active));
+@@ -30,10 +31,46 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+         try memory.put(a, "peak", try json.intValue(a, mem.peak));
      }
      try o.put(a, "memory", .{ .object = memory });
++    if (status.kept) |k| try keptFields(a, o, k);
      try o.put(a, "live", try live.snapshot(a, srv.engine));
 +    if (srv.config.recipe.glm) try @import("glm_health.zig").add(srv, a, o, status);
      routes.sendValue(conn, a, 200, .{ .object = o });
  }
  
-@@ -64,6 +65,7 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64) Alloca
++/// The recipe's /health fields for the kept prompt states: kept_prompts, kept_bytes, kept_bytes_cap, kept_mix.
++fn keptFields(a: Allocator, o: *json.Object, k: api.prompt_cache.KeptStats) !void {
++    try o.put(a, "kept_prompts", try json.intValue(a, k.prompts));
++    try o.put(a, "kept_bytes", try json.intValue(a, k.bytes));
++    try o.put(a, "kept_bytes_cap", try json.intValue(a, k.bytes_cap));
++    try o.put(a, "kept_entries_cap", try json.intValue(a, k.entries_cap));
++    try o.put(a, "kept_budget", try json.intValue(a, k.budget));
++    const mix = try json.newObject(a);
++    try mix.put(a, "own", try json.intValue(a, k.own));
++    try mix.put(a, "shared", try json.intValue(a, k.shared));
++    try mix.put(a, "chats", try json.intValue(a, k.chats));
++    try mix.put(a, "rows", try json.intValue(a, k.rows));
++    const by = try a.alloc(Value, k.by_chat_n);
++    for (by, k.by_chat[0..k.by_chat_n]) |*slot, row| {
++        const triple = try a.alloc(Value, 3);
++        for (triple, row) |*v, n| v.* = try json.intValue(a, n);
++        slot.* = .{ .array = triple };
++    }
++    try mix.put(a, "by_chat", .{ .array = by });
++    try o.put(a, "kept_mix", .{ .object = mix });
++    const pc = try json.newObject(a);
++    try pc.put(a, "hits", try json.intValue(a, k.hits));
++    try pc.put(a, "misses", try json.intValue(a, k.misses));
++    try pc.put(a, "evicted", try json.intValue(a, k.evicted));
++    try pc.put(a, "restored_from_disk", try json.intValue(a, k.restored));
++    try o.put(a, "prompt_cache", .{ .object = pc });
++    if (k.spill_on) {
++        const sp = try json.newObject(a);
++        const names = [_][]const u8{ "entries", "bytes", "writes", "write_bytes", "reads", "read_bytes", "skipped", "failed" };
++        for (names, k.spill) |name, v| try sp.put(a, name, try json.intValue(a, v));
++        try o.put(a, "spill", .{ .object = sp });
++    }
++}
++
+ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+     const created = std.Io.Clock.real.now(srv.io).toSeconds();
+     const data = try a.alloc(Value, srv.config.model_ids.len);
+@@ -64,6 +101,7 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64) Alloca
  pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
      var out: std.Io.Writer.Allocating = .init(a);
      srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
@@ -2681,10 +4797,39 @@ index 89ee5c84..a011329c 100644
      const body = out.written();
      conn.startResponse(200, null) catch return;
      conn.addHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8") catch return;
+@@ -154,3 +192,20 @@ test "stats snapshot exposes counters and omits unknown memory" {
+         try std.testing.expect(object.contains(key));
+     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+ }
++
++test "health shows the kept prompt states: count, bytes, caps, the own/shared mix by conversation, the cache's counters and the spill tier" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = try json.newObject(a);
++    var k: api.prompt_cache.KeptStats = .{ .prompts = 3, .bytes = 1000, .bytes_cap = 4096, .own = 2, .shared = 1, .chats = 2, .rows = 300, .entries_cap = 32, .budget = 1 << 20, .hits = 5, .misses = 2, .evicted = 1, .restored = 1 };
++    k.by_chat[0] = .{ 1, 2, 200 };
++    k.by_chat[1] = .{ 2, 1, 100 };
++    k.by_chat_n = 2;
++    k.spill_on = true;
++    k.spill = .{ 4, 5000, 6, 7000, 1, 1000, 2, 0 };
++    try keptFields(a, o, k);
++    const text = try json.stringify(a, .{ .object = o }, .{});
++    for ([_][]const u8{ "\"kept_prompts\": 3", "\"kept_bytes\": 1000", "\"kept_bytes_cap\": 4096", "\"own\": 2", "\"shared\": 1", "\"chats\": 2", "\"rows\": 300", "\"by_chat\": [[1, 2, 200], [2, 1, 100]]", "\"hits\": 5", "\"restored_from_disk\": 1", "\"spill\"", "\"writes\": 6" }) |want|
++        try std.testing.expect(std.mem.indexOf(u8, text, want) != null);
++}
 diff --git a/zig/src/server/tokens.zig b/zig/src/server/tokens.zig
-index 3a2e3519..bf4fed31 100644
+index 3a2e3519..5e7f2154 100644
 --- a/zig/src/server/tokens.zig
 +++ b/zig/src/server/tokens.zig
+@@ -1,6 +1,6 @@
+ //! vLLM's /tokenize and /detokenize (the ids the chat and completion routes would run), and a reply's token SHA.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const messages = @import("messages.zig");
 @@ -94,7 +94,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator, detok: bool) void {
      o.put(a, "type", .{ .string = "invalid_request_error" }) catch return;
      const wrapped = json.newObject(a) catch return;
@@ -2694,10 +4839,43 @@ index 3a2e3519..bf4fed31 100644
  }
  
  /// The reply's token ids hashed: drafted and ``"draft": false`` replies must match.
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+index 27b76df1..c8ed03f4 100644
+--- a/zig/src/server/tool_grammar.zig
++++ b/zig/src/server/tool_grammar.zig
+@@ -1,7 +1,7 @@
+ //! tool_choice "required" or a named function as a grammar: calls in the template's markup, arguments in their schema.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const prompt = @import("prompt.zig");
+ const tool_specs = @import("tool_specs.zig");
+@@ -36,7 +36,10 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
+     const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
+     var scratch: Cx = .{ .a = cx.a };
+     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
+-    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object), and this one does not: send \"auto\"");
++    const s = style(rendered) orelse return cx.refuse(if (srv.config.recipe.glm)
++        "tool_choice \"required\" or a named function is not served for GLM-5.3 on the Zig engine yet (the recipe gates the call's first token, which this engine has no gate for): send \"auto\""
++    else
++        "tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object), and this one does not: send \"auto\"");
+     const text = try build(cx.a, s, tools, parallel);
+     return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
+ }
 diff --git a/zig/src/server/tool_params.zig b/zig/src/server/tool_params.zig
-index c59d11cf..b71254d9 100644
+index c59d11cf..502c859a 100644
 --- a/zig/src/server/tool_params.zig
 +++ b/zig/src/server/tool_params.zig
+@@ -1,6 +1,6 @@
+ //! Typed tool parameters: XML parameter text decoded by the offered schema (``tool_parameters.py``).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const reply_text = @import("reply_text.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const Value = json.Value;
 @@ -43,25 +43,94 @@ pub fn schemaOf(s: *const Schemas, name: []const u8, key: []const u8, a: Allocat
      return props.get(key) orelse .{ .object = try json.newObject(a) };
  }
@@ -2838,6 +5016,15 @@ index c59d11cf..b71254d9 100644
  }
  
  /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
+@@ -324,7 +396,7 @@ const Literal = struct {
+     fn appendCode(a: Allocator, out: *std.ArrayList(u8), v: u21) Error!void {
+         if (v > 0x10ffff) return error.Invalid;
+         var buf: [4]u8 = undefined;
+-        const n = @import("json_parse.zig").wtf8Encode(v, &buf);
++        const n = json.wtf8Encode(v, &buf);
+         try out.appendSlice(a, buf[0..n]);
+     }
+ 
 @@ -379,3 +451,47 @@ test "decode parameters" {
      try std.testing.expectEqualStrings("[\"a\", null, true]", try json.stringify(a, py, .{}));
      try std.testing.expectEqual(Value.null, (try decode(a, " None ", (try json.parse(a, "{\"type\": \"null\"}")).ok, true)));
@@ -2887,10 +5074,16 @@ index c59d11cf..b71254d9 100644
 +    try std.testing.expectEqual(@as(usize, 2), (try decode(a, "[1,2", arr, false)).array.len);
 +}
 diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
-index 58ce898d..9f06de0a 100644
+index 58ce898d..033bedc8 100644
 --- a/zig/src/server/tool_parse.zig
 +++ b/zig/src/server/tool_parse.zig
-@@ -6,6 +6,7 @@ const reply_text = @import("reply_text.zig");
+@@ -1,11 +1,12 @@
+ //! Tool calls in a finished reply, every family's markup, as OpenAI tool_calls (``tools.parse_tool_calls_from_content``).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const ids = @import("ids.zig");
+ const reply_text = @import("reply_text.zig");
  const tool_params = @import("tool_params.zig");
  const tool_specs = @import("tool_specs.zig");
  const tool_streaming = @import("tool_streaming.zig");
@@ -2907,10 +5100,42 @@ index 58ce898d..9f06de0a 100644
      }
      return null;
  }
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index 2c43c3f1..8edbd52e 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -1,6 +1,6 @@
+ //! The tool_parse tests, as their own test binary: whole-reply parses and the close-call helpers.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const tool_parse = @import("tool_parse.zig");
+ const parse = tool_parse.parse;
+ const closeCall = tool_parse.closeCall;
+diff --git a/zig/src/server/tool_specs.zig b/zig/src/server/tool_specs.zig
+index 1a20f480..cca2610d 100644
+--- a/zig/src/server/tool_specs.zig
++++ b/zig/src/server/tool_specs.zig
+@@ -1,6 +1,6 @@
+ //! Offered tools and tool_choice as the template should see them (``tools.active_tool_specs``).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
 diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
-index a02ee06d..f77a2d63 100644
+index a02ee06d..ff5430d7 100644
 --- a/zig/src/server/tool_stream.zig
 +++ b/zig/src/server/tool_stream.zig
+@@ -1,6 +1,6 @@
+ //! Tool calls while they are written: XML calls as argument deltas, and the one-call policy's text filter.
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const ids = @import("ids.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_params = @import("tool_params.zig");
 @@ -188,12 +188,7 @@ fn trimTail(rest: []const u8, tail: usize) usize {
      return rest.len - reply_text.afterChars(rest, chars - tail).len;
  }
@@ -2925,3 +5150,28 @@ index a02ee06d..f77a2d63 100644
  
  const wrap = @import("tool_parse.zig").wrapCalls;
  
+diff --git a/zig/src/server/tool_streaming.zig b/zig/src/server/tool_streaming.zig
+index 700caedd..48fe167e 100644
+--- a/zig/src/server/tool_streaming.zig
++++ b/zig/src/server/tool_streaming.zig
+@@ -1,6 +1,6 @@
+ //! The streaming half of tool calls: each finished call's opening delta, then its arguments (``stream_tool_call_deltas``).
+ const std = @import("std");
+-const json = @import("json.zig");
++const json = @import("json");
+ const tool_specs = @import("tool_specs.zig");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+diff --git a/zig/src/server/warm.zig b/zig/src/server/warm.zig
+index 89a9e527..1dcc57e9 100644
+--- a/zig/src/server/warm.zig
++++ b/zig/src/server/warm.zig
+@@ -1,7 +1,7 @@
+ //! After a chat reply, the next turn's shared prompt prefilled in the background, so that turn resumes past the reply.
+ const std = @import("std");
+ const api = @import("engine_api");
+-const json = @import("json.zig");
++const json = @import("json");
+ const errors = @import("errors.zig");
+ const prompt_mod = @import("prompt.zig");
+ const chat = @import("chat.zig");

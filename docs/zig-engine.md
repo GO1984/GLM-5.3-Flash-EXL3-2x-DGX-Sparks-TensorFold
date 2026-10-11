@@ -37,19 +37,19 @@ would change what is served.
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
 | `CONTEXT`, `PARALLEL` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`: the captured kernels are keyed on that arena; other values need more captures (TODO; a warning says so) |
 | `MAX_TOKENS`, `THINKING` | `--max-tokens`, `--thinking` / `--no-thinking` |
-| `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> `--drafter mtp` (PARALLEL=1): ported on branch `r107-cx-mtp` (`zig-glm-cx-mtp`), not in `zig/patches` yet, so `./start.sh` refuses it until `ZIG_HAS=mtp` is set (set it when the patches carry it) |
+| `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> `--drafter mtp` (PARALLEL=1). The MTP head is in `zig/patches`; `ZIG_HAS` defaults to `mtp displaykv` |
 | `KV`, `DENSE` | fixed at `fp8` and `q4`; other values refused (TODO) |
 | `COMM`, `TF_ROCE_MAX_KB` | `TF_GLM_ROCE` (1 for `roce`, 0 for `nccl`), `TF_ROCE_MAX_KB` |
 | `TF_GLM_L2PF` | `TF_GLM_L2PF` (0 / off: off; anything else: 1) |
 | `MEMORY_RESERVE_GIB`, `KV_POOL_GIB` | `TENSORFOLD_MEMORY_RESERVE_GIB` and `TF_GLM_CACHE_GIB`, passed as for Python; the memory-sized pool is in branch `r107-cx-displaykv` (see `DISPLAY_KV_*` below); the 19.6 GiB default is the Python engine's measurement |
 | `TF_GLM_EFFORT_TAIL`, `TF_GLM_CLEAR_THINKING`, `STREAM_SMOOTH`, `STREAM_SMOOTH_MS`, `TF_GLM_LOOP_GUARD`, `MAX_QUEUED` (`TF_GLM_MAX_QUEUED`), `TF_GLM_KEEP_REASONING`, `TF_GLM_KEEP_REASONING_MB`, `TF_GLM_ASSISTANT_ENDS`, `TF_GLM_PROMPT_STOP` | implemented (`zig/src/server/recipe.zig`, branch `r107-int`): the ranks read the recipe's own names, passed unchanged |
-| `KV_POOL_GIB`, `TF_GLM_CACHE_ENTRIES`, `TF_GLM_CACHE_SHARE_PCT`, `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`, `SHARED_PREFIX` | TODO: no prompt cache in the GLM Zig engine yet (`--prompt-cache-gib 0` is passed) |
-| `SPILL_*` | TODO (refused); the prompt cache report (`zig-notes/r107-cache.md`) has not landed. The branch `r107-cx-cachew` caches the packed weights on disk (`TF_GLM_PACK_CACHE`, a different thing: faster loads, no prompt states) |
-| `VISION`, `VISION_URLS` | TODO (`VISION` defaults to 0 under `ENGINE=zig`; `VISION=1` is refused) |
-| `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` (`TF_GLM_DISPLAY_KV_MIB`, `_BACKEND`, `_CARD`) | ported on branch `r107-cx-displaykv`, not in `zig/patches` yet: refused until `ZIG_HAS=displaykv`; the variables are passed as for Python |
+| `KV_POOL_GIB`, `TF_GLM_CACHE_ENTRIES`, `TF_GLM_CACHE_SHARE_PCT`, `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`, `SHARED_PREFIX` | the engine keeps prompt states. `./start.sh` passes `--prompt-cache-gib 0` (the qualified path); raise it to keep states |
+| `SPILL_*` | implemented: the same `--spill-gib` / `--snapshot-dir` / `--spill-*` flags as the Python path. Default `SPILL_GIB=0` |
+| `VISION`, `VISION_URLS` | implemented (`--vision`, `--vision-urls`). Default `VISION=0` under `ENGINE=zig` so the text server keeps the tower's memory; `VISION=1` loads the tower on rank 0 |
+| `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` (`TF_GLM_DISPLAY_KV_MIB`, `_BACKEND`, `_CARD`) | implemented. Default off. `ZIG_HAS` includes `displaykv` |
 | `COPY`, `COPY_MAX`, `COPY_CODE`, `DRAFT_POLICY` | TODO: the engine's copy drafts and DFlash2 policy are built in, not settable |
 | `TF_GLM_SIDE` | ported (shared expert on a second stream, decode windows; off by default as in Python), branch `r107-tpf`; passed unchanged |
-| `SPLIT` (`TF_GLM_HC_SPLIT`, `TF_GLM_PREFILL_OVERLAP`), `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PREFILL_ROWS`, `TF_GLM_PROMPT_PARTIALS`, `TF_GLM_MSA` | passed unchanged and validated as Python does, but TODO in the engine: the settings and plans exist (`r107-tpf`), the split prefill does not run yet; the Zig prefill is 2048 rows, so `TF_GLM_PREFILL_ROWS` is not read (and no ring / relay for TP=4) |
+| `SPLIT` (`TF_GLM_HC_SPLIT`, `TF_GLM_PREFILL_OVERLAP`), `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PREFILL_ROWS`, `TF_GLM_PROMPT_PARTIALS`, `TF_GLM_MSA` | split prefill, overlap, own-front and microbatch run at TP=2 (`r107-tpf`, on `r107-int`). `TF_GLM_PREFILL_ROWS` sets the chunk size. Past two ranks the chunk runs unsplit (no TP=3/4 ring exchange in this project) |
 | `KDA_CHUNKED` | the chunked kernel is built in |
 | `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `TF_GLM_MULTI_WINDOW`, `TF_GLM_MULTI_LONE` | TODO: prompts fill one at a time; the verify window is fixed (64 rows shared, 16 a stream) |
 | `STREAM_SMOOTH`, `STREAM_SMOOTH_MS` | TODO |
@@ -69,9 +69,9 @@ once its port is in `zig/patches`.
 
 ## Known limits (not the scripts')
 
-- Prompts past about 32k tokens fail (`MissingTritonVariant`): the `_select_split` variant for them was not captured.
-- No prompt cache, no vision, no MTP head, TP=2 only.
-- The Zig engine's HTTP server on a GPU is being qualified separately; see its notes before relying on a reply.
+- Wider decode `_select_split` cubins are in the AOT set (the long-context branch). Prompts past the captured buckets still fail with `MissingTritonVariant`.
+- TP=2 is what this project runs. The TP=3/4 control plane is in the engine; spark3 and spark4 are not in this project, and split prefill past two ranks stays unsplit.
+- Qual on this head (`zig-notes/r107-int.md`): 58 of 61 cases identical to Python. `tools_required` differs after the call opener. Decode at 8 streams is still under the Python engine.
 
 ## Build and test the Zig side
 
