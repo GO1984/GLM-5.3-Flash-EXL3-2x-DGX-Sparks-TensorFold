@@ -1,7 +1,8 @@
 # The Zig engine image (ENGINE=zig): TensorFold's tensorfold-native, built from TensorFold at TF_REF with zig/patches/*.patch
 # applied (git apply in the checkout's root, filename order), on a CUDA runtime image with only what the binary loads at
 # run time: libcuda (the host driver, through the NVIDIA runtime), cuBLAS/cuBLASLt (the CUDA runtime image), NCCL (the pip
-# wheel of the version the Python image carries) and libibverbs (the RoCE all-gathers and NCCL's IB transport).
+# wheel of the version the Python image carries), libibverbs (the RoCE all-gathers and NCCL's IB transport) and
+# cuDNN (the native vision tower; the text server does not load it).
 # Built by scripts/prepare.sh (never by hand: it passes the build arguments and the build context, which holds this file,
 # zig/patches and zig/aot only). No GPU is needed to build: nvcc compiles the sm_121 fatbins, and the captured Triton
 # kernel set (zig/aot/glm-aot-sm121.tar.xz) is data.
@@ -56,8 +57,9 @@ RUN python3 -m venv /tmp/nv && /tmp/nv/bin/pip install -q --no-cache-dir "nvidia
     mkdir -p /opt/nccl && cp -a "$(find /tmp/nv -name 'libnccl.so.2' | head -1)" /opt/nccl/ && ls -l /opt/nccl
 
 FROM ${RUN_IMAGE}
+# libcudnn9: the native vision tower (--vision-backend zig) dlopens libcudnn.so.9. The text server does not load it.
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      libibverbs1 ibverbs-providers rdma-core && rm -rf /var/lib/apt/lists/*
+      libibverbs1 ibverbs-providers rdma-core libcudnn9-cuda-13 && rm -rf /var/lib/apt/lists/*
 ARG NCCL_VERSION
 # (the CUDA runtime image carries an older NCCL at this name: replaced, so the one that loads is the wheel's)
 COPY --from=build /opt/nccl/libnccl.so.2 /tmp/libnccl.so.new

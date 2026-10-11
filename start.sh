@@ -122,7 +122,8 @@ if [[ "$ENGINE" == zig ]]; then
   if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4 (spark3/spark4 are not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=4 commands only (spark3/spark4 are not in this project)"; fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
     warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
-  [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
+  # The Zig image has no Python tower helper. VISION=1 loads the native tower, which dlopens cuDNN.
+  [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision --vision-backend zig)
   [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
   if [[ "$SPILL_GIB" != 0 ]]; then
     [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
