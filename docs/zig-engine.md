@@ -37,17 +37,19 @@ would change what is served.
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
 | `CONTEXT`, `PARALLEL` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`: the captured kernels are keyed on that arena; other values need more captures (TODO; a warning says so) |
 | `MAX_TOKENS`, `THINKING` | `--max-tokens`, `--thinking` / `--no-thinking` |
-| `DRAFTER` | `dflash2` -> `--drafter DIR`. `mtp`: TODO (refused) |
+| `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> `--drafter mtp` (PARALLEL=1): ported on branch `r107-cx-mtp` (`zig-glm-cx-mtp`), not in `zig/patches` yet, so `./start.sh` refuses it until `ZIG_HAS=mtp` is set (set it when the patches carry it) |
 | `KV`, `DENSE` | fixed at `fp8` and `q4`; other values refused (TODO) |
 | `COMM`, `TF_ROCE_MAX_KB` | `TF_GLM_ROCE` (1 for `roce`, 0 for `nccl`), `TF_ROCE_MAX_KB` |
-| `TF_GLM_L2PF` | `TF_GLM_L2PF` (0 / off: off; anything else: on) |
-| `MEMORY_RESERVE_GIB` | `TENSORFOLD_MEMORY_RESERVE_GIB` |
+| `TF_GLM_L2PF` | `TF_GLM_L2PF` (0 / off: off; anything else: 1) |
+| `MEMORY_RESERVE_GIB`, `KV_POOL_GIB` | `TENSORFOLD_MEMORY_RESERVE_GIB` and `TF_GLM_CACHE_GIB`, passed as for Python; the memory-sized pool is in branch `r107-cx-displaykv` (see `DISPLAY_KV_*` below); the 19.6 GiB default is the Python engine's measurement |
+| `TF_GLM_EFFORT_TAIL`, `TF_GLM_CLEAR_THINKING`, `STREAM_SMOOTH`, `STREAM_SMOOTH_MS`, `TF_GLM_LOOP_GUARD`, `MAX_QUEUED` (`TF_GLM_MAX_QUEUED`), `TF_GLM_KEEP_REASONING`, `TF_GLM_KEEP_REASONING_MB`, `TF_GLM_ASSISTANT_ENDS`, `TF_GLM_PROMPT_STOP` | implemented (`zig/src/server/recipe.zig`, branch `r107-int`): the ranks read the recipe's own names, passed unchanged |
 | `KV_POOL_GIB`, `TF_GLM_CACHE_ENTRIES`, `TF_GLM_CACHE_SHARE_PCT`, `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`, `SHARED_PREFIX` | TODO: no prompt cache in the GLM Zig engine yet (`--prompt-cache-gib 0` is passed) |
-| `SPILL_*` | TODO (refused) |
+| `SPILL_*` | TODO (refused); the prompt cache report (`zig-notes/r107-cache.md`) has not landed. The branch `r107-cx-cachew` caches the packed weights on disk (`TF_GLM_PACK_CACHE`, a different thing: faster loads, no prompt states) |
 | `VISION`, `VISION_URLS` | TODO (`VISION` defaults to 0 under `ENGINE=zig`; `VISION=1` is refused) |
-| `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` | TODO (refused when set) |
+| `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` (`TF_GLM_DISPLAY_KV_MIB`, `_BACKEND`, `_CARD`) | ported on branch `r107-cx-displaykv`, not in `zig/patches` yet: refused until `ZIG_HAS=displaykv`; the variables are passed as for Python |
 | `COPY`, `COPY_MAX`, `COPY_CODE`, `DRAFT_POLICY` | TODO: the engine's copy drafts and DFlash2 policy are built in, not settable |
-| `SPLIT`, `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PROMPT_PARTIALS`, `TF_GLM_SIDE`, `TF_GLM_MSA` | TODO: no split prefill yet (and no ring / relay for TP=4) |
+| `TF_GLM_SIDE` | ported (shared expert on a second stream, decode windows; off by default as in Python), branch `r107-tpf`; passed unchanged |
+| `SPLIT` (`TF_GLM_HC_SPLIT`, `TF_GLM_PREFILL_OVERLAP`), `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PREFILL_ROWS`, `TF_GLM_PROMPT_PARTIALS`, `TF_GLM_MSA` | passed unchanged and validated as Python does, but TODO in the engine: the settings and plans exist (`r107-tpf`), the split prefill does not run yet; the Zig prefill is 2048 rows, so `TF_GLM_PREFILL_ROWS` is not read (and no ring / relay for TP=4) |
 | `KDA_CHUNKED` | the chunked kernel is built in |
 | `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `TF_GLM_MULTI_WINDOW`, `TF_GLM_MULTI_LONE` | TODO: prompts fill one at a time; the verify window is fixed (64 rows shared, 16 a stream) |
 | `STREAM_SMOOTH`, `STREAM_SMOOTH_MS` | TODO |
@@ -59,10 +61,11 @@ would change what is served.
 | `LOG_*`, `FOREGROUND`, `WAIT_TIMEOUT`, `STOP_TIMEOUT`, `CONTAINER_NAME`, `KERNEL_CACHE`, `STATE_DIR` | unchanged |
 | `HF_HUB_OFFLINE`, `TENSORFOLD_API_KEY` | read as before |
 
-Only these environment variables reach a Zig rank: the mapped ones above, plus `TF_GLM_LOAD_THREADS`,
-`TENSORFOLD_CUDA_MEMORY_LIMIT_GB`, `TF_CUDA_DEVICE`, `TF_GRAPH_LOG`, `TF_ROUND_LOG`, `TF_TP_TRACE`, `TF_TP_STATS`,
-`TF_TP_TIMEOUT_S` and `TF_GLM_PROFILE_API` when you set them. The Python engine's `TF_GLM_*` switches stay out of its
-environment.
+A Zig rank gets what a Python rank gets: every `TENSORFOLD_*`, `TF_GLM_*` and `TF_ROCE_*` variable that
+`scripts/config.sh` exports or you set (variables the engine does not read are ignored; a malformed value of one it does
+read fails the start), plus `TF_GLM_ROCE` from `COMM`, `TF_GLM_L2PF` as 0 or 1, and `TF_CUDA_DEVICE`, `TF_GRAPH_LOG`,
+`TF_ROUND_LOG`, `TF_TP_*` when you set them. `ZIG_HAS` (space-separated `mtp`, `displaykv`) lifts the refusal of a feature
+once its port is in `zig/patches`.
 
 ## Known limits (not the scripts')
 

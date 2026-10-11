@@ -111,12 +111,14 @@ if [[ "$ENGINE" == zig ]]; then
   # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
   # cannot do yet is refused here, before anything is stopped, never silently dropped
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); use ENGINE=python or leave it at its default"; }
-  [[ "$DRAFTER" == dflash2 ]]            || zig_unsupported "DRAFTER=$DRAFTER (only DFlash2 drafts)"
+  # features whose Zig ports are not in zig/patches yet are refused until ZIG_HAS names them (space-separated: mtp displaykv)
+  ZIG_HAS="${ZIG_HAS:-}"
+  [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (the MTP head is not in zig/patches yet; ZIG_HAS=mtp when it is)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
   [[ "$VISION" == 0 ]]                   || zig_unsupported "VISION=1 (image and video input)"
   [[ "$SPILL_GIB" == 0 ]]                || zig_unsupported "the spill tier (SPILL_GIB)"
-  (( DISPLAY_KV_MIB == 0 ))              || zig_unsupported "DISPLAY_KV_MIB"
+  (( DISPLAY_KV_MIB == 0 )) || [[ " $ZIG_HAS " == *" displaykv "* ]] || zig_unsupported "DISPLAY_KV_MIB (not in zig/patches yet; ZIG_HAS=displaykv when it is)"
   if (( TP == 3 )); then (( DRY )) || zig_unsupported "TP=3"; warn "ENGINE=zig: TP=3 is not in the Zig engine yet (its parser refuses --tp 3); printing the commands only"; fi
   if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4"; warn "ENGINE=zig: TP=4 is not in the Zig engine yet (no split, ring or relay); printing the commands only"; fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
@@ -240,6 +242,7 @@ snapshot() {  # <repo id>: its snapshot path in the container, checked on every 
 }
 MODEL_ARG=$(snapshot "$MODEL_ID")
 if [[ "$DRAFTER" == dflash2 ]]; then DRAFTER_ARG=$(snapshot "$DFLASH2_ID")
+elif [[ "$ENGINE" == zig ]]; then DRAFTER_ARG=mtp      # (the Zig engine names the MTP head; Python takes none)
 else DRAFTER_ARG=none; fi                           # the checkpoint's MTP head, even when DFlash2 is downloaded
 SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the command line comes later and wins
 ENGINE_CMD=(tensorfold serve); [[ "$ENGINE" == zig ]] && ENGINE_CMD=(tensorfold-native serve)
@@ -338,14 +341,17 @@ fi
 # docker commands run over ssh, where this shell's environment does not reach. None of them is a secret. At TP>2,
 # TF_ROCE_HCA names a node's own devices, so each rank gets its own (scripts/nodes.sh, rank_nccl_env); at TP=2 it
 # passes as set, as in v1.4 (unset: the ranks take NCCL_IB_HCA's devices).
-# ENGINE=zig: the recipe's settings the Zig engine reads, as the variables it reads (docs/zig-engine.md has the full table)
+# ENGINE=zig: the ranks get what the Python path gives them (every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable, as
+# scripts/config.sh sets and you set them: the engine reads the recipe's own names, e.g. TF_GLM_EFFORT_TAIL,
+# TF_GLM_CLEAR_THINKING, TF_GLM_STREAM_SMOOTH(_MS), TF_GLM_LOOP_GUARD, TF_GLM_MAX_QUEUED, TF_GLM_KEEP_REASONING(_MB),
+# TF_GLM_ASSISTANT_ENDS, TF_GLM_PROMPT_STOP, TF_GLM_SIDE, TF_GLM_MTP; ones it does not read are ignored), plus TF_GLM_ROCE
+# from COMM (its name for COMM), TF_GLM_L2PF as 0 or 1, and the Zig engine's own debug variables when you set them
 zig_env() {
-  local v l2=1
+  local v l2=1 name
   [[ "$TF_GLM_L2PF" =~ ^(0|off)$ ]] && l2=0
-  ENV_ARGS+=(-e TENSORFOLD_NO_UPDATE_CHECK=1 -e "TENSORFOLD_MEMORY_RESERVE_GIB=$MEMORY_RESERVE_GIB"
-             -e "TF_GLM_ROCE=$([[ "$COMM" == roce ]] && echo 1 || echo 0)" -e "TF_ROCE_MAX_KB=$TF_ROCE_MAX_KB" -e "TF_GLM_L2PF=$l2")
-  # set by you (not by scripts/config.sh): read by the Zig engine as they are
-  for v in TF_GLM_LOAD_THREADS TENSORFOLD_CUDA_MEMORY_LIMIT_GB TF_CUDA_DEVICE TF_GRAPH_LOG TF_ROUND_LOG TF_TP_TRACE TF_TP_STATS TF_TP_TIMEOUT_S TF_GLM_PROFILE_API; do
+  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" | grep -v '^TF_GLM_L2PF=' || true)
+  ENV_ARGS+=(-e "TF_GLM_ROCE=$([[ "$COMM" == roce ]] && echo 1 || echo 0)" -e "TF_GLM_L2PF=$l2")
+  for v in TF_CUDA_DEVICE TF_GRAPH_LOG TF_ROUND_LOG TF_TP_TRACE TF_TP_STATS TF_TP_TIMEOUT_S; do
     [[ -z "${!v:-}" ]] || ENV_ARGS+=(-e "$v=${!v}")
   done
 }
