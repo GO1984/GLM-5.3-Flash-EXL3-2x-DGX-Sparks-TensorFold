@@ -1,4 +1,4 @@
-TensorFold v1.0.7..7a2461b2 (glm-v107-perf): flashnext-cuda
+TensorFold v1.0.7..7684ca52 (r107-int): flashnext-cuda
 Apply from the checkout root with: git apply 0002-zig-flashnext-cuda.patch
 
 diff --git a/zig/kernels/cuda/fn_experts_prompt.cu b/zig/kernels/cuda/fn_experts_prompt.cu

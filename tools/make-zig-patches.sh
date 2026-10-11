@@ -2,7 +2,7 @@
 # Maintainers: write zig/patches/*.patch and zig/aot/glm-aot-sm121.tar.xz from the Zig GLM port's branch, then check that
 # the patches, applied in filename order with git apply to a fresh TensorFold TF_REF tree, give exactly the branch's files
 # (minus the notes, capture tools and kernel set listed below).
-#   tools/make-zig-patches.sh <Zig port checkout> [branch, default glm-v107-perf] [base ref, default v1.0.7]
+#   tools/make-zig-patches.sh <Zig port checkout> [branch, default r107-int] [base ref, default v1.0.7]
 # The port is TensorFold's Zig engine (tensorfold-native, ashhart/TensorFold) plus the Flash Next Zig CUDA base and the
 # GLM engine on top. Each file lands in exactly one patch, by path:
 #   0001 shared runtime   every file the port modifies (lane host, native/cuda, server, build)
@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 repo=$(readlink -f "${1:?usage: tools/make-zig-patches.sh <Zig port checkout> [branch] [base ref]}")
-branch=${2:-glm-v107-perf}
+branch=${2:-r107-int}
 base=${3:-v1.0.7}
 out=$PWD/zig
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT

@@ -32,6 +32,17 @@ RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${
 RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
       if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
+# libtfgrammar (structured output: response_format, guided_*): TensorFold's grammar library over xgrammar, which the
+# server dlopens at the first structured request from <exe>/../lib. xgrammar's tag is pinned by commit
+ARG XGRAMMAR_REF=v0.2.8
+ARG XGRAMMAR_COMMIT=97787376faee5ed8466cfad57c99855e4ce2f6aa
+RUN git clone -q --depth 1 --branch ${XGRAMMAR_REF} --recurse-submodules --shallow-submodules https://github.com/mlc-ai/xgrammar /xgrammar && \
+    test "$(git -C /xgrammar rev-parse HEAD)" = "${XGRAMMAR_COMMIT}" && \
+    cd /tensorfold && /opt/zig/zig build grammar -Dxgrammar=/xgrammar -Doptimize=fast --prefix /opt/tensorfold -j"$(nproc)" && \
+    mkdir -p /opt/tensorfold/native/lib && cp /opt/tensorfold/lib/libtfgrammar.so /opt/tensorfold/native/lib/ && \
+    mkdir -p /opt/tensorfold/share/doc/tensorfold/LICENSES && \
+    cp /xgrammar/LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSES/xgrammar-Apache-2.0.txt && \
+    cp /xgrammar/NOTICE /opt/tensorfold/share/doc/tensorfold/LICENSES/xgrammar-NOTICE.txt
 # the captured Triton kernel set (aot.json + cubins) the GLM engine replays, checked against its pinned sha256
 ARG AOT_SHA256
 COPY zig/aot/glm-aot-sm121.tar.xz /tmp/glm-aot-sm121.tar.xz

@@ -314,7 +314,7 @@ export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
 # Not a request field: it changes every thinking-on prompt, and every rank reads it with the other TF_GLM_* switches.
 export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
 # Admission at saturation (patch 0075): past the lanes plus MAX_QUEUED a foreground request is refused with
-# 429 + Retry-After (529 overloaded_error through the Anthropic bridge) instead of queueing invisibly. Unset
+# 429 + Retry-After (429 with an overloaded_error body through the Anthropic bridge) instead of queueing invisibly. Unset
 # queues as every scheduler always has; 0 refuses anything past the lanes. A single-instance deployment with
 # no load balancer in front of it should set a small value (ours: 0, in scripts/local.sh).
 MAX_QUEUED="${MAX_QUEUED:-}"

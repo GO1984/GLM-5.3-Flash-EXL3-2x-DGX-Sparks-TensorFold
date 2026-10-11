@@ -1,4 +1,4 @@
-TensorFold v1.0.7..7a2461b2 (glm-v107-perf): shared-engine
+TensorFold v1.0.7..7684ca52 (r107-int): shared-engine
 Apply from the checkout root with: git apply 0001-zig-shared-engine.patch
 
 diff --git a/.gitignore b/.gitignore
@@ -321,10 +321,20 @@ index 88a205f7..63dee906 100644
      var positional: std.ArrayList([]const u8) = .empty;
      defer positional.deinit(gpa);
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index f72c13b2..8f917032 100644
+index f72c13b2..a3455576 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -216,7 +216,8 @@ pub const Open = struct {
+@@ -78,6 +78,9 @@ pub const Request = struct {
+     structure: ?Structure = null,
+     /// Stop a short exact cycle while the think block is open.
+     loop_guard: bool = false,
++    /// The recipe's loop rule (an exact cycle of 16 tokens or fewer held for 256, or one token taking half of the last
++    /// 256), not the short-cycle rule of the Mac server.
++    loop_recipe: bool = false,
+     /// The prompt row (the assistant header's last) where routed lessons decide whether they act (null: none acts).
+     decide: ?u32 = null,
+     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
+@@ -216,7 +219,8 @@ pub const Open = struct {
  };
  
  /// An opened engine; ``close`` stops its thread and frees its backend.
@@ -334,8 +344,18 @@ index f72c13b2..8f917032 100644
  
  pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
  
+@@ -245,6 +249,9 @@ pub const Status = struct {
+     streams: usize = 0,
+     /// Generated tokens held by live streams, excluding their prompts.
+     generation_tokens: u64 = 0,
++    /// The shared cache pool's rows and the free ones, for an engine that pools them (null: no pool to report).
++    pool_tokens: ?u64 = null,
++    pool_free_tokens: ?u64 = null,
+ };
+ 
+ pub const SubmitError = error{ Closed, Busy, InvalidSpans };
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 09ff0fa2..3b300282 100644
+index 09ff0fa2..b3373780 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -91,7 +91,18 @@ pub const LaneHost = struct {
@@ -400,7 +420,14 @@ index 09ff0fa2..3b300282 100644
          job.stream = lanes.Stream.init(h.gpa, .{
              .id = "request",
              .prompt = r.prompt,
-@@ -320,23 +334,112 @@ pub const LaneHost = struct {
+@@ -314,29 +328,119 @@ pub const LaneHost = struct {
+             .think_end = if (r.think_end) |t| t else -1,
+             .logprobs = r.logprobs,
+             .loop_guard = r.loop_guard,
++            .loop_rule = if (r.loop_recipe) .recipe else .mac,
+             .chunks = r.chunks,
+             .history_len = r.history_len,
+             .shared_prefixes = r.shared_prefixes,
              .reuse = reuse,
              .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
                  job.proposer.deinit();
@@ -516,7 +543,7 @@ index 09ff0fa2..3b300282 100644
          h.core.addStream(&job.stream) catch |e| return switch (e) {
              error.Cancelled => h.cancel(job),
              error.LaneMemory => h.requeue(job),
-@@ -423,7 +526,7 @@ pub const LaneHost = struct {
+@@ -423,7 +527,7 @@ pub const LaneHost = struct {
          if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
          h.lock();
          defer h.unlock();
@@ -525,7 +552,7 @@ index 09ff0fa2..3b300282 100644
      }
  
      /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
-@@ -525,7 +628,7 @@ pub const LaneHost = struct {
+@@ -525,7 +629,7 @@ pub const LaneHost = struct {
      fn run(h: *LaneHost) void {
          while (true) {
              h.takeCancels();
@@ -534,7 +561,7 @@ index 09ff0fa2..3b300282 100644
              h.fillOne();
              status.noteLive(h);
              h.lock();
-@@ -540,7 +643,7 @@ pub const LaneHost = struct {
+@@ -540,7 +644,7 @@ pub const LaneHost = struct {
                  h.closeAll();
                  continue;
              }
@@ -1119,6 +1146,18 @@ index dd60ca7f..93ed09d2 100644
          if (x.lanes.fetchRemove(s)) |kv| {
              var l = kv.value;
              freeLane(x.gpa, &l);
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 910f5016..f5015a11 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -40,6 +40,7 @@ test {
+     _ = @import("engine_test.zig");
+     _ = @import("gpu_full_test.zig");
+     _ = @import("drafted_test.zig");
++    _ = @import("loop_recipe.zig");
+ }
+ 
+ pub const learned_disk = @import("learned_disk.zig");
 diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
 index 7cddf9a0..3fce51e5 100644
 --- a/zig/src/core/lanes/open.zig
@@ -1151,10 +1190,68 @@ index 7cddf9a0..3fce51e5 100644
          const first = if (feed == .handle) value else try e.backend.read(drawn);
          try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
-index d43d01b1..4ff284d8 100644
+index d43d01b1..5578426e 100644
 --- a/zig/src/core/lanes/stream.zig
 +++ b/zig/src/core/lanes/stream.zig
-@@ -170,6 +170,7 @@ pub const Stream = struct {
+@@ -23,6 +23,9 @@ pub const Reason = enum {
+ 
+ pub const Mode = enum { pipe, drain, verify, exit };
+ 
++/// Which rule closes a collapsed think block: the Mac server's short exact cycle, or the recipe's (loop_recipe.zig).
++pub const LoopRule = enum { mac, recipe };
++
+ pub const loop_max_period: usize = 8;
+ pub const loop_min_run: usize = 256;
+ pub const loop_warm_in: usize = 64;
+@@ -49,12 +52,19 @@ fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
+     return null;
+ }
+ 
++fn firedAt(rule: LoopRule, head: []const u32, tail: []const u32, n: usize) ?u32 {
++    return switch (rule) {
++        .mac => cycleAt(head, tail, n),
++        .recipe => @import("loop_recipe.zig").collapsedAt(head, tail, n),
++    };
++}
++
+ /// Return the first token index in a candidate batch that would fire the guard.
+ pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
+     if (!s.loop_guard or !s.think_open or s.think_end < 0 or s.loop_period != null) return null;
+     for (tokens, 0..) |token, i| {
+         if (@as(i64, token) == s.think_end) return null;
+-        if (cycleAt(s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
++        if (firedAt(s.loop_rule, s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
+     }
+     return null;
+ }
+@@ -64,6 +74,10 @@ pub fn detectLoop(emitted: []const u32) ?u32 {
+     return cycleAt(emitted, &.{}, emitted.len);
+ }
+ 
++fn detectWith(s: *const Stream) ?u32 {
++    return firedAt(s.loop_rule, s.emitted(), &.{}, s.emitted().len);
++}
++
+ /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
+ pub const StopCheck = struct {
+     ptr: *anyopaque,
+@@ -113,6 +127,7 @@ pub const Spec = struct {
+     think_end: i64 = -1,
+     think_open: ?bool = null, // null: open when a budget is set (the server's rule)
+     loop_guard: bool = false,
++    loop_rule: LoopRule = .mac,
+     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
+     history_len: u32 = 0, // prompt prefix lengths a backend may keep for a later turn: the rendered history,
+     shared_prefixes: []const u32 = &.{}, // then shared system blocks
+@@ -139,6 +154,7 @@ pub const Stream = struct {
+     think_end: i64,
+     think_open: bool,
+     loop_guard: bool,
++    loop_rule: LoopRule = .mac,
+     loop_period: ?u32 = null,
+     chunks: []const u32,
+     history_len: u32,
+@@ -170,6 +186,7 @@ pub const Stream = struct {
      picks: [plan_lanes.sizes.len + 1]u32 = @splat(0), // the planner's picks: each tree size, then chain + grafts
      graft_room: ?u32 = null, // grafted rows the planner left this round's window (null: no planner)
      held_levels: u32 = 0, // head levels drafted for the held window
@@ -1162,6 +1259,23 @@ index d43d01b1..4ff284d8 100644
      round_over: ?f64 = null, // the stream's round time beyond its window and head levels (ms, recent): chains
      tree_over: ?f64 = null, // and trees
      measured: [plan_lanes.sizes.len + 1]plan_lanes.Measured = @splat(.{}), // each pick's round times past its table price
+@@ -201,6 +218,7 @@ pub const Stream = struct {
+             .think_end = spec.think_end,
+             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
+             .loop_guard = spec.loop_guard,
++            .loop_rule = spec.loop_rule,
+             .chunks = spec.chunks,
+             .history_len = spec.history_len,
+             .shared_prefixes = spec.shared_prefixes,
+@@ -351,7 +369,7 @@ pub const Stream = struct {
+                     break;
+                 }
+             }
+-            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
++            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectWith(s) else null;
+             if (s.isEos(t) or s.stopped()) {
+                 s.finished = true;
+                 s.reason = .stop;
 diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
 index a608fd61..235be92e 100644
 --- a/zig/src/cuda/abi.zig
@@ -1505,11 +1619,414 @@ index ac76da05..848a3bda 100644
  }
  
  test "variables: unset or empty means the default, anything but a whole number is refused" {
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index 4821e0f3..9c34a9cc 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -30,7 +30,7 @@ fn errorValue(a: Allocator, message: []const u8, status: u16) Allocator.Error!Va
+     const kind = switch (status) {
+         400 => "invalid_request_error",
+         404 => "not_found_error",
+-        503 => "overloaded_error",
++        429, 503 => "overloaded_error",
+         else => "api_error",
+     };
+     const inner = try json.newObject(a);
+@@ -73,7 +73,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
+         };
+         const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
+         if (count) {
+-            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400);
++            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) errors.capacity_status else 400);
+             const o = json.newObject(a) catch return;
+             o.put(a, "input_tokens", json.intValue(a, n) catch return) catch return;
+             return routes.sendValue(conn, a, 200, .{ .object = o });
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 6315e329..e98c05fc 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -13,6 +13,10 @@ const ids = @import("ids.zig");
+ const clock = @import("clock.zig");
+ const Server = @import("server.zig").Server;
+ const chunk_plan = @import("chunk_plan.zig");
++const admission = @import("admission.zig");
++const glm_calls = @import("glm_calls.zig");
++const glm_reply = @import("glm_reply.zig");
++const playout_mod = @import("playout.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+@@ -57,6 +61,11 @@ pub const Reply = struct {
+     effort: ?[]const u8 = null,
+     /// ``choices[0].logprobs`` (``{"content": [...]}``) for a request that asked; null otherwise.
+     logprobs: ?Value = null,
++    /// The GLM recipe (tool calls, patches 0036-0055): `glm` is on for the checkpoint; `glm_done` says `calls` and
++    /// `content` are settled here (the streamer's calls plus the end parser's), so the route parses nothing more.
++    glm: bool = false,
++    glm_done: bool = false,
++    calls: ?[]Value = null,
+ };
+ 
+ pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
+@@ -159,6 +168,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     if (gone.check()) return error.Cancelled;
+     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
+     if (input.prompt != null) thinking = false;
++    if (f.get("clear_thinking")) |v| cx.clear_thinking = v.truthy(); // chat_template_kwargs.clear_thinking, for every render
+     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
+     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+     if (gone.check()) return error.Cancelled;
+@@ -167,8 +177,16 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     const n: i64 = @intCast(rendered.ids.len);
+     if (window > 0) {
+         const room = window - n;
+-        if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
+-        if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
++        if (srv.config.recipe.glm) {
++            // the recipe's GlmApp.check (patch 0044): a request that sets max_tokens must fit whole, one that does not
++            // gets the default budget cut to what the window has left, never refused
++            const asked: i64 = if (input.max_tokens) |m| m else 0;
++            const need = n + (if (asked != 0) asked else 1);
++            if (need > window) return cx.fail(.context_length, "{s} {d} tokens: this request needs a {d}-token context ({s}), which exceeds the context window this server was started for; shorten the prompt or reply", .{ errors.context_limit, window, need, if (asked != 0) try std.fmt.allocPrint(a, "{d} prompt tokens plus max_tokens {d}", .{ n, asked }) else try std.fmt.allocPrint(a, "a {d}-token prompt", .{n}) });
++        } else {
++            if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
++            if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
++        }
+         limit = @min(limit, room);
+     }
+     const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+@@ -199,6 +217,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         const budget_field = f.get("thinking_budget");
+         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
+         if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
++        request.loop_recipe = request.loop_guard and srv.config.recipe.glm;
+         if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
+             if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
+             request.think_close = srv.think_close;
+@@ -236,6 +255,20 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     var box: Mailbox = .{ .io = io, .gpa = srv.gpa };
+     defer box.deinit();
+     const id = srv.next_id.fetchAdd(1, .monotonic);
++    var slot = try admission.enter(srv, cx, request.background); // TF_GLM_MAX_QUEUED: past the lanes plus the cap, 429
++    defer slot.leave();
++    // TF_GLM_STREAM_SMOOTH=1: a streamed reply's tokens go out one event each at a steady pace from a short playout buffer
++    // (playout.zig), so drafted bursts and other requests' prompt fills do not show
++    var playout: playout_mod.Playout = undefined;
++    var smoothing = false;
++    var left = Left(@TypeOf(gone)){ .gone = gone };
++    var wrapped = sink;
++    if (sink != null and srv.config.recipe.glm and srv.config.recipe.stream_smooth) {
++        playout.start(srv.gpa, io, srv.config.recipe.stream_smooth_ms, sink.?, .{ .ctx = &left, .check = Left(@TypeOf(gone)).check }) catch return cx.fail(.server, "the stream's playout could not start", .{});
++        smoothing = true;
++        wrapped = playout.sink();
++    }
++    defer if (smoothing) playout.abort(); // a no-op once closed
+     if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
+     defer if (srv.keepalive) |k| k.end();
+     srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
+@@ -245,13 +278,31 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     release(srv, preparing); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .logprobs = request.logprobs != null };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = wrapped, .smooth = if (smoothing) &playout else null, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .logprobs = request.logprobs != null, .return_ids = if (input.fields.get("return_token_ids")) |v| v.truthy() else false };
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        if (srv.glm_calls and input.tools.len > 0) {
++            // GLM's calls go out whole while they are written (one call a delta), those in the think block when the
++            // reply ends on them; one call at most under parallel_tool_calls: false, which only the end parser reads
++            const single = if (input.fields.get("tool_call_single")) |x| x.truthy() else false;
++            const streams = sink != null and !single;
++            gen.glm = .{
++                .think = if (gen.thinking) .{ .a = a, .hold = if (streams) glm_calls.think_call_hold else null } else null,
++                .streamer = if (streams) glm_calls.CallStreamer.init(a, input.tools) catch |e| break :blk e else null,
++                .single = single,
++                .quiet_since = nowNs(io),
++            };
++        } else if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
+-        break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
++        const finished = gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
++        if (smoothing) { // what is still queued goes out now, before the reply's end
++            if (finished) |_| playout.close() else |_| playout.abort();
++            if (playout.gone) {
++                if (finished) |_| break :blk error.Cancelled else |_| {}
++            }
++        }
++        break :blk finished;
+     };
+     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
+     return result;
+@@ -308,6 +359,35 @@ const Shown = struct {
+     }
+ };
+ 
++/// Whether a client who has left ends the request now: always, except under TF_GLM_PROMPT_STOP=0 while its prompt is still
++/// filling (every prompt then fills to its end).
++fn leaves(r: @import("recipe.zig").Recipe, box: *Mailbox) bool {
++    if (!r.glm or r.prompt_stop) return true;
++    box.mutex.lockUncancelable(box.io);
++    defer box.mutex.unlock(box.io);
++    return box.prefilled_ns != null or box.finished;
++}
++
++/// A client that left, asked from the playout's writer thread.
++fn Left(comptime G: type) type {
++    return struct {
++        gone: G,
++
++        fn check(ctx: *anyopaque) bool {
++            const l: *@This() = @ptrCast(@alignCast(ctx));
++            return l.gone.check();
++        }
++    };
++}
++
++/// What the recipe's GLM tool-call handling keeps while a reply streams.
++const GlmState = struct {
++    think: ?glm_calls.ThinkSplit,
++    streamer: ?glm_calls.CallStreamer,
++    single: bool,
++    quiet_since: i96, // the last event sent while a call is held (an empty delta every `keepalive_s` meanwhile)
++};
++
+ /// The token loop and the text it streams.
+ const Generation = struct {
+     srv: *Server,
+@@ -322,6 +402,10 @@ const Generation = struct {
+     max_tokens: u32,
+     tools: []const Value,
+     calls: ?tool_stream.Streamer = null,
++    glm: ?GlmState = null,
++    smooth: ?*playout_mod.Playout = null,
++    return_ids: bool = false, // return_token_ids: the reply's ids come back in the "tensorfold" block
++    string_stop: bool = false, // a stop string, not the model's end token, ended the reply
+     collected: std.ArrayList(u32) = .empty,
+     visible: reply_text.Incremental = .{},
+     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
+@@ -368,6 +452,7 @@ const Generation = struct {
+                 g.reason = "stop";
+             } else if (try g.stopHit()) {
+                 g.reason = "stop";
++                g.string_stop = true;
+                 g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
+             } else if (g.collected.items.len >= g.max_tokens) g.reason = "length";
+         }
+@@ -389,23 +474,28 @@ const Generation = struct {
+         const text = g.stops.visible(all, true);
+         if (g.visible.pending()) return; // a character still split across tokens
+         var answer = text;
++        var wrote = false;
+         if (g.thinking) {
+-            const split = try reply_text.splitThinking(g.a, text, false, g.srv.markers);
++            const split = if (g.glm) |*gl| (if (gl.think) |*t| try t.split(text, false) else try reply_text.splitThinking(g.a, text, false, g.srv.markers)) else try reply_text.splitThinking(g.a, text, false, g.srv.markers);
+             const piece = g.streamed_reasoning.after(split.reasoning, true);
+             if (piece.len > 0) {
+                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
+                 try g.emit(sink, try deltaOf(g.a, "reasoning_content", piece));
++                wrote = true;
+             }
+             answer = split.answer;
+         }
+-        const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
+-        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
++        const hiding = g.calls != null or g.glm != null;
++        const shown = if (hiding) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
++        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), hiding);
+         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
+         const delta = g.streamed.after(vis, !copied);
+         if (delta.len > 0) {
+             try g.streamed.set(g.a, vis, delta);
+             try g.emit(sink, .{ .string = delta });
++            wrote = true;
+         }
++        if (g.glm) |*gl| if (gl.streamer) |*cs| try g.streamGlmCalls(sink, gl, cs, text, wrote);
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+             try c.feed(answer, &out); // never the reasoning: a call it mentions is not made
+@@ -413,6 +503,21 @@ const Generation = struct {
+         }
+     }
+ 
++    /// The calls that became whole in this round, each as one delta; while one is held, an empty delta every
++    /// `keepalive_s` keeps an idle client waiting (past the idle cut of LiteLLM and Node's fetch).
++    fn streamGlmCalls(g: *Generation, sink: Sink, gl: *GlmState, cs: *glm_calls.CallStreamer, text: []const u8, wrote: bool) Failure!void {
++        const feed_text = if (gl.think) |t| (if (t.stream_from) |from| text[from..] else "") else text;
++        const parts = try cs.feed(feed_text);
++        const now = nowNs(g.srv.io);
++        for (parts) |d| try g.emit(sink, d);
++        if (parts.len > 0 or wrote) {
++            gl.quiet_since = now;
++        } else if (cs.open and seconds(now - gl.quiet_since) >= glm_calls.keepalive_s) {
++            try g.emit(sink, .{ .object = try json.newObject(g.a) });
++            gl.quiet_since = now;
++        }
++    }
++
+     fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
+         sink.call(sink.ctx, delta) catch {
+             g.cancel();
+@@ -458,12 +563,20 @@ const Generation = struct {
+                 g.engine_done = true;
+                 return;
+             }
+-            if (gone.check()) {
++            if (gone.check() and leaves(g.srv.config.recipe, m)) {
+                 g.cancel();
+                 return error.Cancelled;
+             }
+             const tokens = chunk orelse continue;
+-            if (g.reason == null) try g.commit(tokens);
++            if (g.smooth) |p| {
++                // token by token into the playout queue, unless the reply ends in this round (then the queue is
++                // flushed: the end is never later)
++                for (tokens) |t| {
++                    if (g.reason != null) break;
++                    try g.commit(&.{t});
++                    if (g.reason != null) p.flush();
++                }
++            } else if (g.reason == null) try g.commit(tokens);
+         }
+     }
+ 
+@@ -481,17 +594,36 @@ const Generation = struct {
+         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
+         const raw = try g.srv.text.decode(a, content_tokens);
+         const visible = g.stops.visible(raw, false);
++        // the model's end token ended the reply (not a stop string, the token limit or ignore_eos)
++        const ended = g.collected.items.len > 0 and g.eos(g.collected.items[g.collected.items.len - 1]) and !g.string_stop;
+         // closed before the think split, so a call ending an unclosed think block is the answer
+-        const close = try g.closeCall(visible);
++        const close = if (g.glm != null) (if (ended) try glm_calls.closeCall(a, visible, g.tools) else "") else try g.closeCall(visible);
+         const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
++        const recipe_glm = g.srv.config.recipe.glm;
+         var content: []const u8 = text;
+         var reasoning: ?[]const u8 = null;
+-        if (g.thinking) {
++        var settled: ?glm_reply.Result = null;
++        if (g.glm) |*gl| {
++            const r = try glm_reply.finalize(a, .{
++                .text = text,
++                .tools = g.tools,
++                .thinking = g.thinking,
++                .markers = g.srv.markers,
++                .think = if (gl.think) |*t| t else null,
++                .streamer = if (gl.streamer) |*cs| cs else null,
++                .single = gl.single,
++                .ended = ended,
++            });
++            settled = r;
++            content = r.content;
++            reasoning = if (r.reasoning.len > 0) r.reasoning else null;
++        } else if (g.thinking) {
+             const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
+-            const r = reply_text.pyStrip(split.reasoning);
++            // the recipe's server returns the reasoning as the model wrote it
++            const r = if (recipe_glm) split.reasoning else reply_text.pyStrip(split.reasoning);
+             reasoning = if (r.len > 0) r else null;
+             content = split.answer;
+-        } else {
++        } else if (!recipe_glm) {
+             const h = reply_text.parseHarmony(text);
+             content = h.content;
+             reasoning = h.reasoning;
+@@ -500,15 +632,23 @@ const Generation = struct {
+             const thought = g.streamed_reasoning.text.items;
+             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
+                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+-            const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
+-            const sent = g.streamed.text.items;
+-            if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
+-            if (g.calls) |*c| if (close.len > 0) {
+-                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+-                var out: std.ArrayList(Value) = .empty;
+-                try c.feed(if (g.thinking) content else text, &out);
+-                for (out.items) |d| try g.emit(sink, d);
+-            };
++            if (settled) |r| {
++                const sent = g.streamed.text.items;
++                if (std.mem.startsWith(u8, r.content, sent) and r.content.len > sent.len) try g.emit(sink, .{ .string = r.content[sent.len..] });
++                for (r.call_deltas) |d| try g.emit(sink, d); // the calls that became whole at the end
++                // under parallel_tool_calls: false the route sends the one call, the stream filter drops it here
++                if (r.calls) |all| if (!g.glm.?.single) for (all[r.streamed..], r.streamed..) |call, i| try g.emit(sink, try glm_reply.wholeDelta(a, i, call));
++            } else {
++                const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
++                const sent = g.streamed.text.items;
++                if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
++                if (g.calls) |*c| if (close.len > 0) {
++                    // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
++                    var out: std.ArrayList(Value) = .empty;
++                    try c.feed(if (g.thinking) content else text, &out);
++                    for (out.items) |d| try g.emit(sink, d);
++                };
++            }
+         }
+         const prefilled = m.prefilled_ns;
+         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
+@@ -532,10 +672,17 @@ const Generation = struct {
+         const sha = @import("tokens.zig").tokenSha(g.collected.items);
+         try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
+         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
++        if (g.return_ids) { // the reply's ids in the "tensorfold" block, for exactness checks (tools/end_of_turn.py)
++            const list = try a.alloc(Value, g.collected.items.len);
++            for (g.collected.items, list) |t, *slot| slot.* = try json.intValue(a, t);
++            try runtime.put(a, "token_ids", .{ .array = list });
++        }
+         if (m.stats.loop_period) |period| {
+             const loop_field = try json.newObject(a);
+             try loop_field.put(a, "period", try json.intValue(a, period));
+             try runtime.put(a, "loop", .{ .object = loop_field });
++            // the think block collapsed and was closed (TF_GLM_LOOP_GUARD): `usage.tensorfold.loop_guard` counts it
++            if (recipe_glm) try runtime.put(a, "loop_guard", .{ .int = "1" });
+         }
+         const s = m.stats;
+         const spec = try json.newObject(a);
+@@ -550,8 +697,11 @@ const Generation = struct {
+             .content = content,
+             .stop_sequence = g.stops.matched(raw),
+             .reasoning = reasoning,
+-            .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
+-            .finish_reason = reason,
++            .tool_calls_streamed = if (settled) |r| (r.calls != null and !g.glm.?.single) else g.calls != null and g.calls.?.streamed,
++            .glm = recipe_glm,
++            .glm_done = settled != null,
++            .calls = if (settled) |r| r.calls else null,
++            .finish_reason = if (settled) |r| (if (r.calls != null and !r.cut) "tool_calls" else reason) else reason,
+             .prompt_tokens = prompt_len,
+             .cached_tokens = m.cached orelse 0,
+             .completion_tokens = g.collected.items.len,
+@@ -597,3 +747,13 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
+     try o.put(a, key, .{ .string = text });
+     return .{ .object = o };
+ }
++
++test "a client that left ends the request at once, or after its prompt under TF_GLM_PROMPT_STOP=0" {
++    var box: Mailbox = .{ .io = std.testing.io, .gpa = std.testing.allocator };
++    defer box.deinit();
++    try std.testing.expect(leaves(.{}, &box)); // not the recipe's checkpoint
++    try std.testing.expect(leaves(.{ .glm = true }, &box)); // the default: the prompt stops at its next chunk
++    try std.testing.expect(!leaves(.{ .glm = true, .prompt_stop = false }, &box)); // filling: it fills to its end
++    box.prefilled_ns = 1;
++    try std.testing.expect(leaves(.{ .glm = true, .prompt_stop = false }, &box)); // decoding: the reply stops
++}
 diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
-index 40ee1e0e..e0496b7c 100644
+index 40ee1e0e..aaef59aa 100644
 --- a/zig/src/server/cli.zig
 +++ b/zig/src/server/cli.zig
-@@ -218,6 +218,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+@@ -115,7 +115,9 @@ pub const flags = [_]Flag{
+ 
+ /// The variables this binary honours as the Python engine does, then the CUDA build's.
+ pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" } ++
+-    (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
++    (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{}) ++
++    // the GLM recipe's server switches (recipe.zig; scripts/config.sh exports them)
++    (if (cuda_build) [_][]const u8{ "TF_GLM_EFFORT_TAIL", "TF_GLM_CLEAR_THINKING", "TF_GLM_STREAM_SMOOTH", "TF_GLM_STREAM_SMOOTH_MS", "TF_GLM_LOOP_GUARD", "TF_GLM_MAX_QUEUED", "TF_GLM_KEEP_REASONING", "TF_GLM_KEEP_REASONING_MB", "TF_GLM_ASSISTANT_ENDS", "TF_GLM_PROMPT_STOP" } else [_][]const u8{});
+ 
+ pub const Args = struct {
+     model: []const u8 = "",
+@@ -218,6 +220,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
      }
      out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
      try ranks(u, a, out);
@@ -1517,19 +2034,54 @@ index 40ee1e0e..e0496b7c 100644
      out.alias = alias.items;
      out.api_key = keys.items;
      return out;
+diff --git a/zig/src/server/errors.zig b/zig/src/server/errors.zig
+index c18c443e..f7b96556 100644
+--- a/zig/src/server/errors.zig
++++ b/zig/src/server/errors.zig
+@@ -15,6 +15,9 @@ pub const Kind = enum {
+     server,
+ };
+ 
++/// What a capacity refusal answers: 503 (the engine is busy), or 429 with `Retry-After: 5` under the GLM recipe (patch 0081).
++pub var capacity_status: u16 = 503;
++
+ pub const context_limit = "This server's maximum context length is"; // OpenAI's wording, which clients match to compact
+ 
+ pub const Refused = error{ Refused, OutOfMemory };
+@@ -24,6 +27,8 @@ pub const Cx = struct {
+     a: Allocator,
+     kind: Kind = .request,
+     message: []const u8 = "",
++    /// The request's own `chat_template_kwargs.clear_thinking` (null: the server's default), read by every render.
++    clear_thinking: ?bool = null,
+ 
+     pub fn fail(cx: *Cx, kind: Kind, comptime fmt: []const u8, args: anytype) Refused {
+         cx.kind = kind;
+@@ -45,7 +50,7 @@ pub const Cx = struct {
+ 
+     pub fn status(cx: *const Cx) u16 {
+         return switch (cx.kind) {
+-            .capacity => 503,
++            .capacity => capacity_status,
+             .server => 500,
+             else => 400,
+         };
 diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
-index 22e4b976..5a242d2d 100644
+index 22e4b976..d6b41e62 100644
 --- a/zig/src/server/hf_text.zig
 +++ b/zig/src/server/hf_text.zig
-@@ -12,6 +12,7 @@ pub const HfText = struct {
+@@ -12,6 +12,10 @@ pub const HfText = struct {
      arena: std.heap.ArenaAllocator,
      tok: tokenizer.Tokenizer,
      source: []const u8 = "",
 +    glm: bool = false,
++    /// The recipe's TF_GLM_EFFORT_TAIL and TF_GLM_CLEAR_THINKING (recipe.zig), set after the load for a GLM checkpoint.
++    effort_tail: bool = false,
++    clear_thinking: bool = false,
      tool_source: []const u8 = "",
      compiled: ?template.Compiled = null,
      tool_compiled: ?template.Compiled = null,
-@@ -34,6 +35,9 @@ pub const HfText = struct {
+@@ -34,6 +38,9 @@ pub const HfText = struct {
          errdefer t.tok.deinit();
          const config = readJson(io, a, dir, "tokenizer_config.json");
          const model_config = readJson(io, a, dir, "config.json");
@@ -1539,7 +2091,26 @@ index 22e4b976..5a242d2d 100644
          if (template_override) |path| {
              t.source = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| {
                  problem.* = try std.fmt.allocPrint(pa, "cannot read chat template override ({s})", .{@errorName(e)});
-@@ -122,7 +126,8 @@ pub const HfText = struct {
+@@ -55,6 +62,18 @@ pub const HfText = struct {
+         return t;
+     }
+ 
++    /// The recipe's switches for a GLM checkpoint: the effort line's place, earlier turns' reasoning, and
++    /// `<|assistant|>` ending a reply (TF_GLM_ASSISTANT_ENDS, patch 0075: the model sometimes started a second answer
++    /// with it, and the raw token reached the reply's text, issue #60).
++    pub fn applyRecipe(t: *HfText, r: @import("recipe.zig").Recipe) Allocator.Error!void {
++        t.effort_tail = r.effort_tail;
++        t.clear_thinking = r.clear_thinking;
++        // a special added token of the checkpoint's tokenizer (`assistant_end` of weights.py), not any vocabulary entry
++        if (r.assistant_ends) if (if (t.tok.specials.contains("<|assistant|>")) t.tok.specialTokenId("<|assistant|>") else null) |id| {
++            if (std.mem.indexOfScalar(u32, t.eos, id) == null) t.eos = try std.mem.concat(t.arena.allocator(), u32, &.{ t.eos, &.{id} });
++        };
++    }
++
+     pub fn deinit(t: *HfText) void {
+         if (t.compiled) |*c| c.deinit();
+         if (t.tool_compiled) |*c| c.deinit();
+@@ -122,7 +141,8 @@ pub const HfText = struct {
          return .{ .object = out };
      }
  
@@ -1549,24 +2120,110 @@ index 22e4b976..5a242d2d 100644
      fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
          var out: std.ArrayList(u32) = .empty;
          if (model_config == .object) {
-@@ -270,6 +275,7 @@ pub const HfText = struct {
+@@ -270,6 +290,9 @@ pub const HfText = struct {
              var it = t.specials.object.iterator();
              while (it.next()) |e| try context.put(a, e.key_ptr.*, e.value_ptr.*);
          }
-+        if (t.glm) try context.put(a, "clear_thinking", .{ .bool = false });
++        // earlier turns keep their reasoning unless the request (chat_template_kwargs) or TF_GLM_CLEAR_THINKING says
++        // otherwise, as in zai-org's current template; a request's own switch wins
++        if (t.glm or options.clear_thinking != null) try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse t.clear_thinking });
          try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
          try context.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
          if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
-@@ -280,6 +286,7 @@ pub const HfText = struct {
+@@ -280,7 +303,12 @@ pub const HfText = struct {
              problem.* = diag.msg;
              return error.Template;
          };
-+        if (t.glm and !options.enable_thinking) return @import("glm_prompts.zig").thinkingOff(a, out);
-         return out;
+-        return out;
++        if (!t.glm) return out;
++        const prompts = @import("glm_prompts.zig");
++        // TF_GLM_EFFORT_TAIL=1 (issue #93): the effort line goes last, not first; then thinking off, as ThinkingOffTemplate
++        const placed = if (t.effort_tail) try prompts.effortToTail(a, out, options.enable_thinking) else out;
++        if (!options.enable_thinking) return prompts.thinkingOff(a, placed);
++        return placed;
      }
  };
+ 
+@@ -367,3 +395,33 @@ test "explicit template overrides checkpoint templates including tool prompts an
+     defer empty.deinit();
+     try std.testing.expectError(error.Template, empty.text().render(a, messages, .{}, &problem));
+ }
++
++test "TF_GLM_ASSISTANT_ENDS: <|assistant|> ends a reply beside the checkpoint's end tokens (0075)" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
++        \\{"model":{"type":"BPE","vocab":{"H":0,"<|endoftext|>":1,"<|user|>":2,"<|assistant|>":3,"<|plain|>":4},"merges":[]},"added_tokens":[{"id":1,"content":"<|endoftext|>","special":true},{"id":2,"content":"<|user|>","special":true},{"id":3,"content":"<|assistant|>","special":true},{"id":4,"content":"<|plain|>","special":false}]}
++    });
++    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"glm5_next\",\"eos_token_id\":[1,2]}" });
++    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    var problem: []const u8 = "";
++    const on = try HfText.load(gpa, io, dir, null, a, &problem);
++    defer on.deinit();
++    try std.testing.expect(on.glm);
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, on.eos);
++    try on.applyRecipe(.{ .glm = true });
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, on.eos); // the role token ends a reply too
++    try on.applyRecipe(.{ .glm = true }); // once
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, on.eos);
++    const off = try HfText.load(gpa, io, dir, null, a, &problem);
++    defer off.deinit();
++    try off.applyRecipe(.{ .glm = true, .assistant_ends = false, .effort_tail = true, .clear_thinking = true });
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, off.eos); // TF_GLM_ASSISTANT_ENDS=0 keeps the checkpoint's
++    try std.testing.expect(off.effort_tail and off.clear_thinking);
++}
+diff --git a/zig/src/server/http_body.zig b/zig/src/server/http_body.zig
+index ad2951eb..b618e32e 100644
+--- a/zig/src/server/http_body.zig
++++ b/zig/src/server/http_body.zig
+@@ -138,7 +138,17 @@ fn trailerName(line: []const u8) bool {
+ 
+ /// The body as JSON (an empty body reads as ``{}``): a framing refusal, or the decoder's message as another exception.
+ pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
+-    const raw = switch (try read(conn, cx.a, limit)) {
++    return readJsonUpTo(conn, cx, limit);
++}
++
++/// The chat routes' cap: 96 MiB under the GLM recipe (patch 0094: up to 50 pictures or 4 clips as data URLs, tool results'
++/// among them), 32 MiB otherwise.
++pub fn chatLimit(glm: bool) usize {
++    return if (glm) 96 * 1024 * 1024 else limit;
++}
++
++pub fn readJsonUpTo(conn: *Conn, cx: *errors.Cx, max: usize) errors.Refused!json.Value {
++    const raw = switch (try read(conn, cx.a, max)) {
+         .ok => |b| b,
+         .refused => |message| return cx.refuse(message),
+     };
+@@ -147,3 +157,8 @@ pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
+         .err => |message| cx.other(message),
+     };
+ }
++
++test "the chat routes' body cap is the recipe's 96 MiB, others 32 MiB" {
++    try std.testing.expectEqual(@as(usize, 96 << 20), chatLimit(true));
++    try std.testing.expectEqual(@as(usize, 32 << 20), chatLimit(false));
++}
+diff --git a/zig/src/server/http_conn.zig b/zig/src/server/http_conn.zig
+index f29d9f86..b53075ab 100644
+--- a/zig/src/server/http_conn.zig
++++ b/zig/src/server/http_conn.zig
+@@ -309,6 +309,7 @@ pub const Conn = struct {
+         try c.addHeader("Content-Type", "application/json");
+         var len: [24]u8 = undefined;
+         try c.addHeader("Content-Length", try std.fmt.bufPrint(&len, "{d}", .{body.len}));
++        if (code == 429) try c.addHeader("Retry-After", "5"); // a capacity refusal tells its client when to come back (patch 0081)
+         if (c.close) try c.addHeader("Connection", "close");
+         try c.finish(body);
+     }
 diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
-index a5ef71bd..dfa69497 100644
+index a5ef71bd..be6870b0 100644
 --- a/zig/src/server/late_system_test.zig
 +++ b/zig/src/server/late_system_test.zig
 @@ -21,8 +21,8 @@ const misplaced_body =
@@ -1593,7 +2250,7 @@ index a5ef71bd..dfa69497 100644
          return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
      }
  
-@@ -110,14 +110,18 @@ const Capture = struct {
+@@ -110,14 +110,28 @@ const Capture = struct {
      }
  };
  
@@ -1606,6 +2263,16 @@ index a5ef71bd..dfa69497 100644
 +}
 +
 +pub fn exchangeMethod(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) !Reply {
++    const raw = try exchangeRaw(srv, method, path, body);
++    defer std.testing.allocator.free(raw);
++    const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadReply;
++    const status = std.fmt.parseInt(u16, raw["HTTP/1.1 ".len..][0..3], 10) catch return error.BadReply;
++    const payload = try std.testing.allocator.dupe(u8, raw[split + 4 ..]);
++    return .{ .status = status, .body = payload };
++}
++
++/// The whole response, head and body, as the client reads it (the caller frees it).
++pub fn exchangeRaw(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) ![]u8 {
      var pair: [2]std.c.fd_t = undefined;
      if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
      defer _ = std.c.close(pair[0]);
@@ -1615,16 +2282,646 @@ index a5ef71bd..dfa69497 100644
      defer std.testing.allocator.free(head);
      try writeAll(pair[0], head);
      try writeAll(pair[0], body);
+@@ -129,13 +143,7 @@ fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
+     const a = arena.allocator();
+     if (try conn.readRequest(a, false) != .ready) return error.BadRequest;
+     routes.dispatch(srv, &conn, a);
+-    const raw = try readReady(std.testing.allocator, pair[0]);
+-    errdefer std.testing.allocator.free(raw);
+-    const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadReply;
+-    const status = std.fmt.parseInt(u16, raw["HTTP/1.1 ".len..][0..3], 10) catch return error.BadReply;
+-    const payload = try std.testing.allocator.dupe(u8, raw[split + 4 ..]);
+-    std.testing.allocator.free(raw);
+-    return .{ .status = status, .body = payload };
++    return readReady(std.testing.allocator, pair[0]);
+ }
+ 
+ fn writeAll(fd: std.c.fd_t, data: []const u8) !void {
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 5ca1fd32..a37c0946 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -8,6 +8,7 @@ const engines = @import("engines.zig");
+ const serve = @import("serve.zig");
+ const hf_text = @import("hf_text.zig");
+ const startup = @import("startup.zig");
++const recipe = @import("recipe.zig");
+ const checkpoint_cli = @import("checkpoint_cli");
+ 
+ const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
+@@ -66,6 +67,15 @@ pub fn main(init: std.process.Init) !u8 {
+         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
+         return 0;
+     }
++    // the GLM recipe's TF_GLM_* switches: a typo fails here, before the weights load
++    var recipe_cfg: recipe.Recipe = .{};
++    if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5")) {
++        recipe_cfg = recipe.Recipe.parse(a, init.environ_map, &problem) catch |e| switch (e) {
++            error.Invalid => return fail(problem),
++            error.OutOfMemory => return e,
++        };
++        recipe_cfg.glm = true;
++    }
+     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
+     defer text_arena.deinit();
+     var text_problem: []const u8 = "";
+@@ -76,6 +86,7 @@ pub fn main(init: std.process.Init) !u8 {
+     } orelse return fail(problem);
+     defer up.text.deinit();
+     defer up.engine.close(up.engine.ctx);
++    if (recipe_cfg.glm) try up.text.applyRecipe(recipe_cfg);
+     return serve.run(gpa, io, args, .{
+         .engine = up.engine.engine,
+         .text = up.text.text(),
+@@ -83,6 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
+         .model_dir = dir,
+         .sampling = try sampling(a, io, dir, args),
+         .environ = init.environ_map,
++        .recipe = recipe_cfg,
+         .started = started,
+     });
+ }
+diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
+index 0b36055a..2713463e 100644
+--- a/zig/src/server/model_text.zig
++++ b/zig/src/server/model_text.zig
+@@ -10,6 +10,8 @@ pub const RenderOptions = struct {
+     /// Also ``thinking_mode`` ("thinking" or "chat") for templates that read that switch.
+     enable_thinking: bool = false,
+     reasoning_effort: ?[]const u8 = null,
++    /// A request's `chat_template_kwargs.clear_thinking`: drop earlier turns' reasoning (null: the server's default).
++    clear_thinking: ?bool = null,
+ };
+ 
+ pub const Error = error{ Template, OutOfMemory };
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 91d02cce..fd8c0cdb 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -17,6 +17,9 @@ const sse = @import("sse.zig");
+ const http_body = @import("http_body.zig");
+ const routes = @import("routes.zig");
+ const warm = @import("warm.zig");
++const admission = @import("admission.zig");
++const glm_reply = @import("glm_reply.zig");
++const glm_history = @import("glm_history.zig");
+ const Server = @import("server.zig").Server;
+ const Conn = @import("http_conn.zig").Conn;
+ const Value = json.Value;
+@@ -41,7 +44,7 @@ pub const Out = struct {
+ /// POST /v1/chat/completions or /v1/completions, read from the client and answered to it.
+ pub fn post(srv: *Server, conn: *Conn, a: Allocator, is_chat: bool) void {
+     var cx: Cx = .{ .a = a };
+-    const body = http_body.readJson(conn, &cx) catch {
++    const body = http_body.readJsonUpTo(conn, &cx, http_body.chatLimit(srv.config.recipe.glm)) catch {
+         const err = errorBody(a, &cx, if (is_chat) "messages" else "prompt") catch return;
+         return routes.sendValue(conn, a, cx.status(), wrapError(a, err) catch return);
+     };
+@@ -125,7 +128,9 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+     var input: chat.Input = .{ .fields = undefined };
+     if (is_chat) {
+-        input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
++        // the recipe: a tool result's pictures render as the template's reminder (0056); a user's are refused below
++        const sent: ?Value = if (srv.config.recipe.glm and body.get("messages") != null) try glm_history.toolMedia(cx.a, body.get("messages").?) else body.get("messages");
++        input.messages = try messages.normalize(cx, sent, "system", srv.needs_user_after_tool);
+         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+         input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
+@@ -143,13 +148,14 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
+     };
+     const sampling = try json.newObject(cx.a);
+-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
++    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop", "return_token_ids" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+     try grammar.refusal(cx, body);
+     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
+     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
+     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
+     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
++    if (body.field("chat_template_kwargs")) |kw| if (kw == .object) if (kw.get("clear_thinking")) |c| try sampling.put(cx.a, "clear_thinking", c);
+     input.fields = .{ .object = sampling };
+     const streamed = if (body.get("stream")) |s| s.truthy() else false;
+     if (logprobs != null) {
+@@ -314,6 +320,13 @@ const Run = struct {
+     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
+         const tools = r.plan.input.tools;
+         if (tools.len == 0) return null;
++        if (reply.glm_done) { // settled with the streamer's calls (chat.finish): nothing to parse again
++            reply.content = try r.plan.policy.content(r.a, reply.content);
++            // the calls' reasoning, for a client that will not send it back (TF_GLM_KEEP_REASONING)
++            if (reply.calls != null and std.mem.eql(u8, reply.finish_reason, "tool_calls")) if (r.srv.kept_reasoning) |k|
++                try k.remember(r.a, r.plan.input.messages, reply.calls.?, reply.reasoning);
++            return reply.calls;
++        }
+         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+         const calls = parsed.calls orelse {
+             if (r.plan.policy.single) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+@@ -329,7 +342,7 @@ const Run = struct {
+         const a = r.a;
+         const kind_ok = cx.kind != .other and cx.kind != .server;
+         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
+-        r.out.vt.reply(r.out.ctx, if (kind_ok) 400 else 500, wrapError(a, body) catch return);
++        r.out.vt.reply(r.out.ctx, if (cx.kind == .capacity) errors.capacity_status else if (kind_ok) 400 else 500, wrapError(a, body) catch return);
+     }
+ 
+     /// A reply that ended before anything was sent: a refusal's 400, a failure's 500, nothing when the client left.
+@@ -389,7 +402,9 @@ const Run = struct {
+         if (r.is_chat) {
+             const message = try json.newObject(a);
+             try message.put(a, "role", .{ .string = "assistant" });
+-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
++            // the recipe keeps the text before a call, and answers null for none (`result["content"] or None`)
++            const keep = if (reply.glm) reply.content.len > 0 else calls == null;
++            try message.put(a, "content", if (keep) .{ .string = reply.content } else .null);
+             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
+             try choice.put(a, "message", .{ .object = message });
+@@ -418,6 +433,10 @@ const Run = struct {
+                 if (!r.is_chat and delta != .string) return; // completions stream text only
+                 return r.emit(r.chunk(delta, null) catch return error.Closed);
+             }
++            if (r.srv.glm_calls and delta == .object and delta.object.count() == 0) { // the recipe's keepalive while a call is held
++                try r.prose();
++                return r.emit(r.chunk(delta, null) catch return error.Closed);
++            }
+             const filtered = r.policyDelta(delta) catch return error.Closed;
+             const d = filtered orelse return;
+             try r.prose();
+@@ -465,11 +484,11 @@ const Run = struct {
+         // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
+         var compaction: ?compact.Stamp = null;
+         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
+-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
++            if (e == error.Refused and cx.kind == .context_length and !r.srv.config.recipe.glm) return r.streamedContext(&cx, tools, field); // the recipe answers 400 before a stream opens
+             return r.unsent(&cx, e, field);
+         } else blk: {
+             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
+-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
++                if (e == error.Refused and cx.kind == .context_length and !r.srv.config.recipe.glm) return r.streamedContext(&cx, tools, field); // the recipe answers 400 before a stream opens
+                 return r.unsent(&cx, e, field);
+             };
+             compaction = ready.stamp;
+@@ -477,6 +496,8 @@ const Run = struct {
+         };
+         var handed = false; // generate gives the preparing count back from here on
+         defer if (!handed) chat.release(r.srv, prepared.preparing);
++        // a full server answers 429 here, before the stream's 200 (patch 0095), not a 200 and an error event
++        admission.check(r.srv, &cx, prepared.request.background) catch |e| return r.unsent(&cx, e, field);
+         r.out.vt.open(r.out.ctx) catch return;
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+@@ -513,8 +534,12 @@ const Run = struct {
+             }
+             if (calls != null and !reply.tool_calls_streamed) {
+                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+-                const deltas = tool_parse.deltas(a, calls.?) catch return;
+-                for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
++                if (reply.glm) { // the recipe sends a call whole: header and arguments in one delta
++                    for (calls.?, 0..) |call, i| r.emit(r.chunk(glm_reply.wholeDelta(a, i, call) catch return, null) catch return) catch return;
++                } else {
++                    const deltas = tool_parse.deltas(a, calls.?) catch return;
++                    for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
++                }
+             } else if (reply.content.len > 0 and !r.streamed_prose) {
+                 r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
+             } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index e68363bf..01f73c89 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -5,6 +5,7 @@ const errors = @import("errors.zig");
+ const messages_mod = @import("messages.zig");
+ const model_text = @import("model_text.zig");
+ const chat = @import("chat.zig");
++const glm_history = @import("glm_history.zig");
+ const Server = @import("server.zig").Server;
+ const Value = json.Value;
+ const Cx = errors.Cx;
+@@ -27,9 +28,12 @@ pub const isTitle = messages_mod.isTitleRequest;
+ 
+ /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
+ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+-    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool));
++    // the recipe's history repairs, on the messages as the client sent them (glm_history.zig)
++    const sent = if (srv.config.recipe.glm) try glm_history.agentHistory(cx.a, try glm_history.promoteReasoning(cx.a, if (srv.kept_reasoning) |k| try k.restore(cx.a, messages) else messages)) else messages;
++    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, sent, srv.late_system, srv.needs_user_after_tool));
+     var problem: []const u8 = "";
+     const options: model_text.RenderOptions = .{
++        .clear_thinking = cx.clear_thinking,
+         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
+         .add_generation_prompt = generation,
+         .enable_thinking = thinking,
+@@ -119,7 +123,7 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
+     const user = json.copyObject(cx.a, messages.array[user_index].object) catch return 0;
+     user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
+     list[user_index] = .{ .object = user };
+-    var scratch: Cx = .{ .a = cx.a };
++    var scratch: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking };
+     const probe = renderIds(srv, &scratch, .{ .array = list }, tools, thinking, effort, true) catch return 0;
+     const i = std.mem.indexOfDiff(u32, prompt, probe) orelse return 0;
+     return if (i < prompt.len) i else 0;
+@@ -138,7 +142,7 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
+     user.put(cx.a, "role", .{ .string = "user" }) catch return 0;
+     user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
+     probe[first_user] = .{ .object = user };
+-    var scratch: Cx = .{ .a = cx.a };
++    var scratch: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking };
+     const other = renderIds(srv, &scratch, .{ .array = probe }, tools, thinking, effort, true) catch return 0;
+     var shared: usize = 0;
+     while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index ecc81c57..6df4ea13 100644
+index ecc81c57..e6a2dcf7 100644
 --- a/zig/src/server/root.zig
 +++ b/zig/src/server/root.zig
-@@ -41,6 +41,8 @@ test {
+@@ -12,6 +12,7 @@ pub const server = @import("server.zig");
+ pub const serve = @import("serve.zig");
+ pub const hub = @import("hub.zig");
+ pub const tool_specs = @import("tool_specs.zig");
++pub const recipe = @import("recipe.zig");
+ pub const Server = server.Server;
+ pub const Config = server.Config;
+ 
+@@ -41,6 +42,21 @@ test {
      _ = @import("stream_preflight_test.zig");
      _ = @import("logprobs_test.zig");
      _ = @import("late_system_test.zig");
 +    _ = @import("glm_chat_test.zig");
 +    _ = @import("glm_prompts.zig");
++    _ = @import("glm_history.zig");
++    _ = @import("glm_keys.zig");
++    _ = @import("chat.zig");
++    _ = @import("http_body.zig");
++    _ = @import("glm_health.zig");
++    _ = @import("playout.zig");
++    _ = @import("glm_kept.zig");
++    _ = @import("glm_calls.zig");
++    _ = @import("glm_calls_test.zig");
++    _ = @import("glm_calls_http_test.zig");
++    _ = @import("admission.zig");
++    _ = @import("glm_recipe_test.zig");
++    _ = @import("recipe.zig");
      _ = @import("compact_test.zig");
      _ = @import("completion_prompt_test.zig");
      _ = @import("decisions.zig");
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index 967c0979..859c3850 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -70,6 +70,8 @@ pub const Setup = struct {
+     /// Sampling defaults from generation_config.json and the flags, as a JSON object; null: greedy.
+     sampling: ?json.Value = null,
+     environ: ?*const std.process.Environ.Map = null,
++    /// The GLM recipe's switches (main reads them before the weights load).
++    recipe: @import("recipe.zig").Recipe = .{},
+     started: i96 = 0,
+     /// Called once the socket listens, with its port (tests read it).
+     on_listen: ?*const fn (port: u16) void = null,
+@@ -113,6 +115,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .reasoning_effort = args.reasoning_effort,
+         .thinking_budget = args.thinking_budget,
+         .loop_guard = args.loop_guard,
++        .recipe = s.recipe,
+         .keep_warm_s = args.keep_warm,
+         .default_sampling = s.sampling,
+         .use_drafts = !args.no_drafts,
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 255b02a2..b63a55d6 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -22,6 +22,7 @@ const log = @import("log.zig");
+ const live = @import("live.zig");
+ const slide_graph = @import("slide_graph.zig");
+ const slide_lesson = @import("slide_lesson.zig");
++const recipe_mod = @import("recipe.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+@@ -57,6 +58,8 @@ pub const Config = struct {
+     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
+     slide_graph: ?[]const u8 = null,
+     timeouts: http_conn.Timeouts = .{},
++    /// The GLM recipe's switches (TF_GLM_*), read at start; `recipe.glm` turns its server behaviours on.
++    recipe: recipe_mod.Recipe = .{},
+ };
+ 
+ pub const Server = struct {
+@@ -73,6 +76,8 @@ pub const Server = struct {
+     chunks: chunk_plan.Plan = .{},
+     effort_levels: []const []const u8 = &.{},
+     eos: []const u32 = &.{},
++    /// The recipe's GLM tool-call handling applies: the tokenizer has `<tool_call>`, `<arg_key>` and `</arg_value>`.
++    glm_calls: bool = false,
+     think_close: []const u32 = &.{},
+     think_close_end: ?u32 = null,
+     metrics: metrics.Metrics,
+@@ -83,6 +88,10 @@ pub const Server = struct {
+     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
+     keepalive: ?*api.keepalive.Keepalive = null,
+     preparing: std.atomic.Value(i64) = .init(0),
++    /// The reasoning of GLM's tool-calling replies, put back where a client dropped it (TF_GLM_KEEP_REASONING).
++    kept_reasoning: ?*@import("glm_kept.zig").KeptReasoning = null,
++    /// Requests the engine holds now, running or waiting, background ones included (admission.zig).
++    in_system: std.atomic.Value(u32) = .init(0),
+     arena: std.heap.ArenaAllocator,
+     /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
+     grammars: ?*api.grammar.Compiler = null,
+@@ -94,6 +103,8 @@ pub const Server = struct {
+ 
+     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
+     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
++        @import("glm_keys.zig").enabled = config.recipe.glm; // a missing <arg_key> is put back by the end parser
++        errors.capacity_status = if (config.recipe.glm) 429 else 503; // the recipe: 429 + Retry-After: 5, not a bare 503 (patch 0081)
+         const srv = try gpa.create(Server);
+         srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
+@@ -106,6 +117,13 @@ pub const Server = struct {
+         srv.eos = try a.dupe(u32, text.eosIds());
+         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+         srv.effort_levels = try fields.effortLevels(a, text.templateSource());
++        srv.glm_calls = config.recipe.glm and text.tokenId("<tool_call>") != null and text.tokenId("<arg_key>") != null and text.tokenId("</arg_value>") != null;
++        if (config.recipe.glm and config.recipe.keep_reasoning > 0) {
++            const kept = try gpa.create(@import("glm_kept.zig").KeptReasoning);
++            kept.* = .init(gpa, io, config.recipe.keep_reasoning, config.recipe.keep_reasoning_mb);
++            srv.kept_reasoning = kept;
++        }
++        srv.config.loop_guard = config.loop_guard or (config.recipe.glm and config.recipe.loop_guard); // TF_GLM_LOOP_GUARD=1
+         srv.late_system = try lateSystem(a, text);
+         srv.needs_user_after_tool = needsUserAfterTool(text.templateSource());
+         if (text.tokenId("</think>")) |end| {
+@@ -123,6 +141,10 @@ pub const Server = struct {
+     }
+ 
+     pub fn deinit(srv: *Server) void {
++        if (srv.kept_reasoning) |k| {
++            k.deinit();
++            srv.gpa.destroy(k);
++        }
+         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
+         if (srv.grammars) |g| g.close();
+         srv.metrics.deinit();
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 89ee5c84..a011329c 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -31,6 +31,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     }
+     try o.put(a, "memory", .{ .object = memory });
+     try o.put(a, "live", try live.snapshot(a, srv.engine));
++    if (srv.config.recipe.glm) try @import("glm_health.zig").add(srv, a, o, status);
+     routes.sendValue(conn, a, 200, .{ .object = o });
+ }
+ 
+@@ -64,6 +65,7 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64) Alloca
+ pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
+     var out: std.Io.Writer.Allocating = .init(a);
+     srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
++    if (srv.config.recipe.glm) @import("glm_health.zig").metrics(srv, &out.writer) catch return;
+     const body = out.written();
+     conn.startResponse(200, null) catch return;
+     conn.addHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8") catch return;
+diff --git a/zig/src/server/tokens.zig b/zig/src/server/tokens.zig
+index 3a2e3519..bf4fed31 100644
+--- a/zig/src/server/tokens.zig
++++ b/zig/src/server/tokens.zig
+@@ -94,7 +94,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator, detok: bool) void {
+     o.put(a, "type", .{ .string = "invalid_request_error" }) catch return;
+     const wrapped = json.newObject(a) catch return;
+     wrapped.put(a, "error", .{ .object = o }) catch return;
+-    routes.sendValue(conn, a, if (cx.kind == .capacity) 503 else 400, .{ .object = wrapped });
++    routes.sendValue(conn, a, if (cx.kind == .capacity) errors.capacity_status else 400, .{ .object = wrapped });
+ }
+ 
+ /// The reply's token ids hashed: drafted and ``"draft": false`` replies must match.
+diff --git a/zig/src/server/tool_params.zig b/zig/src/server/tool_params.zig
+index c59d11cf..b71254d9 100644
+--- a/zig/src/server/tool_params.zig
++++ b/zig/src/server/tool_params.zig
+@@ -43,25 +43,94 @@ pub fn schemaOf(s: *const Schemas, name: []const u8, key: []const u8, a: Allocat
+     return props.get(key) orelse .{ .object = try json.newObject(a) };
+ }
+ 
+-const Kind = enum { array, object, boolean, integer, number, null };
++/// The JSON types a parameter schema admits, as bits (``schema_types`` of the recipe's tool_parameters.py).
++pub const Types = u8;
++const t_array: Types = 1;
++const t_object: Types = 2;
++const t_boolean: Types = 4;
++const t_integer: Types = 8;
++const t_number: Types = 16;
++const t_null: Types = 32;
++const t_string: Types = 64;
++const t_other: Types = 128; // a type name this decoder does not know: never typed
++const t_typed: Types = t_array | t_object | t_boolean | t_integer | t_number | t_null;
+ 
+-fn kindOf(schema: Value) ?Kind {
+-    const t = schema.get("type") orelse return null;
+-    if (t != .string) return null;
+-    return std.meta.stringToEnum(Kind, t.string);
++fn nameBit(name: []const u8) Types {
++    const names = [_]struct { []const u8, Types }{ .{ "array", t_array }, .{ "object", t_object }, .{ "boolean", t_boolean }, .{ "integer", t_integer }, .{ "number", t_number }, .{ "null", t_null }, .{ "string", t_string } };
++    for (names) |n| if (std.mem.eql(u8, n[0], name)) return n[1];
++    return t_other;
+ }
+ 
+-fn valid(kind: Kind, v: Value) bool {
+-    return switch (kind) {
+-        .array => v == .array,
+-        .object => v == .object,
+-        .boolean => v == .bool,
+-        .integer => v == .int,
+-        .number => v == .int or v == .float,
+-        .null => v == .null,
++/// ``_KINDS.get(type(v), "string")``: the kind of an enum or const value.
++fn valueBit(v: Value) Types {
++    return switch (v) {
++        .bool => t_boolean,
++        .int => t_integer,
++        .float => t_number,
++        .string => t_string,
++        .null => t_null,
++        .array => t_array,
++        .object => t_object,
+     };
+ }
+ 
++/// ``schema_types``: its ``type`` (a name or a list of names), else those of its ``anyOf`` / ``oneOf`` members (none if
++/// a member is untyped), else those of its ``enum`` values or ``const``.
++pub fn schemaTypes(schema: Value) Types {
++    if (schema != .object) return 0;
++    if (schema.get("type")) |kind| switch (kind) {
++        .string => |name| return nameBit(name),
++        .array => |names| {
++            var out: Types = 0;
++            for (names) |n| if (n == .string) {
++                out |= nameBit(n.string);
++            };
++            return out;
++        },
++        else => {},
++    };
++    for ([_][]const u8{ "anyOf", "oneOf" }) |key| {
++        const members = schema.get(key) orelse continue;
++        if (members != .array or members.array.len == 0) continue;
++        var out: Types = 0;
++        for (members.array) |m| {
++            const found = schemaTypes(m);
++            if (found == 0) return 0;
++            out |= found;
++        }
++        return out;
++    }
++    if (schema.get("enum")) |values| if (values == .array and values.array.len > 0) {
++        var out: Types = 0;
++        for (values.array) |v| out |= valueBit(v);
++        return out;
++    };
++    if (schema.get("const")) |c| return valueBit(c);
++    return 0;
++}
++
++/// ``typed_parameter``: every type the schema admits is a JSON one other than string (a union with string, such as
++/// ``["string", "null"]``, keeps the text as written).
++pub fn typedParameter(schema: Value) bool {
++    const kinds = schemaTypes(schema);
++    return kinds != 0 and kinds & ~t_typed == 0;
++}
++
++/// ``nullable_text``: a text value that may also be null (``["string", "null"]``, pydantic's ``Optional[str]``).
++pub fn nullableText(schema: Value) bool {
++    const kinds = schemaTypes(schema);
++    return kinds & t_string != 0 and kinds & t_null != 0;
++}
++
++fn admitted(kinds: Types, v: Value) bool {
++    return (kinds & t_array != 0 and v == .array) or
++        (kinds & t_object != 0 and v == .object) or
++        (kinds & t_boolean != 0 and v == .bool) or
++        (kinds & t_integer != 0 and v == .int) or
++        (kinds & t_number != 0 and (v == .int or v == .float)) or
++        (kinds & t_null != 0 and v == .null);
++}
++
+ /// ``json.dumps(v, allow_nan=False)`` succeeds: no NaN or infinity anywhere.
+ pub fn finite(v: Value) bool {
+     return switch (v) {
+@@ -102,10 +171,13 @@ pub fn closedJson(a: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
+     return try std.mem.concat(a, u8, &.{ reply_text.pyRstrip(text), closers.items });
+ }
+ 
+-/// ``decode_parameter``: the schema's type when the text spells one, else the text; ``python`` also reads Python's spelling.
++/// ``decode_parameter``: a string schema keeps the text (a nullable one reads ``null`` as null); a typed one reads JSON
++/// of an admitted type, or the value closed (#87), and with ``python`` (Qwen's parsers) Python's spelling of one;
++/// anything else stays as written, so a resent history renders the tokens the model wrote.
+ pub fn decode(a: Allocator, value: []const u8, schema: Value, python: bool) Allocator.Error!Value {
+-    const kind = kindOf(schema) orelse return .{ .string = value };
+-    const closed: ?[]const u8 = if (kind == .array or kind == .object) try closedJson(a, value) else null;
++    if (!typedParameter(schema)) return if (nullableText(schema) and std.mem.eql(u8, value, "null")) .null else .{ .string = value };
++    const kinds = schemaTypes(schema);
++    const closed: ?[]const u8 = if (kinds & (t_array | t_object) != 0) try closedJson(a, value) else null;
+     for ([_]?[]const u8{ value, closed }) |candidate| {
+         const text = candidate orelse continue;
+         const parsed = switch (try json.parseText(a, text)) {
+@@ -113,12 +185,12 @@ pub fn decode(a: Allocator, value: []const u8, schema: Value, python: bool) Allo
+             .err => continue,
+         };
+         if (!finite(parsed)) continue;
+-        return if (valid(kind, parsed)) parsed else .{ .string = value };
++        return if (admitted(kinds, parsed)) parsed else .{ .string = value };
+     }
+     if (!python) return .{ .string = value };
+     const parsed = (try pythonLiteral(a, value)) orelse return .{ .string = value };
+     if (!finite(parsed)) return .{ .string = value };
+-    return if (valid(kind, parsed)) parsed else .{ .string = value };
++    return if (admitted(kinds, parsed)) parsed else .{ .string = value };
+ }
+ 
+ /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
+@@ -379,3 +451,47 @@ test "decode parameters" {
+     try std.testing.expectEqualStrings("[\"a\", null, true]", try json.stringify(a, py, .{}));
+     try std.testing.expectEqual(Value.null, (try decode(a, " None ", (try json.parse(a, "{\"type\": \"null\"}")).ok, true)));
+ }
++
++fn schemaOfText(a: Allocator, text: []const u8) !Value {
++    return (try json.parse(a, text)).ok;
++}
++
++test "schemas typed by a type list, anyOf, enum or const decode as the recipe's tool_parameters.py does" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // ["integer", "null"]: typed, a number or null
++    const opt = try schemaOfText(a, "{\"type\":[\"integer\",\"null\"]}");
++    try std.testing.expect(typedParameter(opt));
++    try std.testing.expectEqualStrings("7", (try decode(a, "7", opt, false)).int);
++    try std.testing.expect((try decode(a, "null", opt, false)) == .null);
++    // ["string", "null"]: the text as written, except a bare null
++    const nullable = try schemaOfText(a, "{\"type\":[\"string\",\"null\"]}");
++    try std.testing.expect(!typedParameter(nullable) and nullableText(nullable));
++    try std.testing.expect((try decode(a, "null", nullable, false)) == .null);
++    try std.testing.expectEqualStrings("nullx", (try decode(a, "nullx", nullable, false)).string);
++    try std.testing.expectEqualStrings("5", (try decode(a, "5", nullable, false)).string);
++    // a plain string schema keeps "null" as text
++    const plain = try schemaOfText(a, "{\"type\":\"string\"}");
++    try std.testing.expectEqualStrings("null", (try decode(a, "null", plain, false)).string);
++    // anyOf of typed members is typed; one untyped member makes none
++    const any = try schemaOfText(a, "{\"anyOf\":[{\"type\":\"array\"},{\"type\":\"null\"}]}");
++    try std.testing.expect(typedParameter(any));
++    try std.testing.expectEqual(@as(usize, 2), (try decode(a, "[1,2]", any, false)).array.len);
++    try std.testing.expect(!typedParameter(try schemaOfText(a, "{\"anyOf\":[{\"type\":\"array\"},{}]}")));
++    // enum and const are typed by their values
++    const en = try schemaOfText(a, "{\"enum\":[1,2,3]}");
++    try std.testing.expect(typedParameter(en));
++    try std.testing.expectEqualStrings("2", (try decode(a, "2", en, false)).int);
++    const named = try schemaOfText(a, "{\"enum\":[\"a\",\"b\"]}");
++    try std.testing.expect(!typedParameter(named));
++    const fixed = try schemaOfText(a, "{\"const\":true}");
++    try std.testing.expect((try decode(a, "true", fixed, false)).bool);
++    // a type the decoder does not know is untyped
++    try std.testing.expect(!typedParameter(try schemaOfText(a, "{\"type\":\"str\"}")));
++    // a typed value of another type stays as written
++    const arr = try schemaOfText(a, "{\"type\":\"array\"}");
++    try std.testing.expectEqualStrings("{\"a\":1}", (try decode(a, "{\"a\":1}", arr, false)).string);
++    // an array left one closer short is closed (#87)
++    try std.testing.expectEqual(@as(usize, 2), (try decode(a, "[1,2", arr, false)).array.len);
++}
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 58ce898d..9f06de0a 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -6,6 +6,7 @@ const reply_text = @import("reply_text.zig");
+ const tool_params = @import("tool_params.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const tool_streaming = @import("tool_streaming.zig");
++const glm_keys = @import("glm_keys.zig");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ const strip = reply_text.pyStrip;
+@@ -278,7 +279,7 @@ fn payload(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas
+     if (try functionBlock(a, block, schemas, complete)) |c| return c;
+     if (decoded == null) {
+         const lead = std.mem.trimStart(u8, block, " \t\r\n\x0b\x0c");
+-        if (lead.len == 0 or (lead[0] != '{' and lead[0] != '[' and lead[0] != '<')) return glmCall(a, block, schemas, complete);
++        if (lead.len == 0 or (lead[0] != '{' and lead[0] != '[' and lead[0] != '<')) return glmCall(a, if (glm_keys.enabled) try glm_keys.repair(a, block) else block, schemas, complete);
+     }
+     return null;
+ }
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index a02ee06d..f77a2d63 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -188,12 +188,7 @@ fn trimTail(rest: []const u8, tail: usize) usize {
+     return rest.len - reply_text.afterChars(rest, chars - tail).len;
+ }
+ 
+-fn typedSchema(schema: Value) bool {
+-    const t = schema.get("type") orelse return false;
+-    if (t != .string) return false;
+-    for ([_][]const u8{ "array", "object", "boolean", "integer", "number", "null" }) |k| if (std.mem.eql(u8, k, t.string)) return true;
+-    return false;
+-}
++const typedSchema = tool_params.typedParameter;
+ 
+ const wrap = @import("tool_parse.zig").wrapCalls;
+ 
