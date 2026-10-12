@@ -2,8 +2,7 @@
 
 `ENGINE=zig ./start.sh` serves the same checkpoint with TensorFold v1.0.7's Zig engine (`tensorfold-native`) instead of
 the Python engine (TensorFold v0.6.0 plus `patches/`). The scripts, ports, pinned revisions, NFS worker weights, banner,
-`DRY_RUN`, `./stop.sh` and the health check are the same; `ENGINE=python` (the default for now) is untouched.
-The default flips to `zig` once the Zig engine is verified on the GPUs end to end.
+`DRY_RUN`, `./stop.sh` and the health check are the same. `ENGINE=zig` is the default. `ENGINE=python` selects the Python engine.
 
 Status: the image builds and the commands print (`DRY_RUN=1`); the server has not been qualified through these scripts
 yet. The Zig engine's greedy replies equal the Python engine's on two prompts at TP=2 (drafts off and on).

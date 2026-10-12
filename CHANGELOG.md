@@ -3,7 +3,7 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## Unreleased: `ENGINE=zig`, TensorFold v1.0.7's Zig engine (work in progress; `ENGINE=python` stays the default)
+## Unreleased: `ENGINE=zig` is the default (TensorFold v1.0.7's Zig engine; `ENGINE=python` selects v0.6.0)
 
 `ENGINE=zig` makes the same scripts build and start `tensorfold-native` (TensorFold v1.0.7 plus `zig/patches/`, the captured
 kernel set `zig/aot/`, a CUDA runtime image: `zig/Dockerfile`) instead of the Python engine: `./start.sh`, `./stop.sh`,

@@ -49,10 +49,10 @@ fi
 MASTER_ADDR="${MASTER_ADDR:-$_ma}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 
-# The engine each rank runs: python (default), TensorFold v0.6.0's Python engine with this repository's patches/, or zig,
-# TensorFold v1.0.7's Zig engine (tensorfold-native) with the GLM port in zig/patches/ (docs/zig-engine.md: what it serves
-# so far, and every setting below that it does not read yet). The same scripts, ports, pins and health check serve both.
-ENGINE="${ENGINE:-python}"
+# The engine each rank runs: zig (default), TensorFold v1.0.7's Zig engine (tensorfold-native) with the GLM port in
+# zig/patches/ (docs/zig-engine.md), or python, TensorFold v0.6.0's Python engine with this repository's patches/.
+# The same scripts, ports, pins and health check serve both. ENGINE=python selects the Python engine.
+ENGINE="${ENGINE:-zig}"
 [[ "$ENGINE" == python || "$ENGINE" == zig ]] || { echo "config.sh: ENGINE is python or zig, not $ENGINE" >&2; exit 1; }
 
 # ABLIT=1 serves the Ablit weights, Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit (the same checkpoint,

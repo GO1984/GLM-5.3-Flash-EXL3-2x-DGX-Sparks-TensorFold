@@ -110,7 +110,7 @@ if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no
 if [[ "$ENGINE" == zig ]]; then
   # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
   # cannot do yet is refused here, before anything is stopped, never silently dropped
-  zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); use ENGINE=python or leave it at its default"; }
+  zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
   # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image.
   ZIG_HAS="${ZIG_HAS:-mtp displaykv}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"

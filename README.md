@@ -18,12 +18,12 @@ in NVIDIA's PyTorch container, plus 106 patches (65 of v1.4, 3 for 3 Sparks, exp
 faster prompt kernels, a one-shot RoCE all-gather between the Sparks, several requests over one shared cache pool,
 vision, tool calling, `/tokenize` and `/metrics`.
 
-**Zig engine (work in progress):** `ENGINE=zig ./start.sh` serves the same checkpoint with
+**Zig engine (the default):** `./start.sh` serves the same checkpoint with
 [TensorFold](https://github.com/ashhart/TensorFold) v1.0.7's Zig engine, `tensorfold-native`, by Ash Hart
 ([ashhart](https://github.com/ashhart)) and the TensorFold contributors, whose native CUDA server is
 [jschmied](https://github.com/jschmied)'s ([PR #443](https://github.com/ashhart/TensorFold/pull/443)) and whose RoCE
 all-gather is [b12x](https://github.com/local-inference-lab/b12x)'s RoCEnante by local-inference-lab; the GLM port on top
-is Mia's AI Lab's. `ENGINE=python` (the default for now) is the engine described below. What the Zig engine serves so far,
+is Mia's AI Lab's. `ENGINE=zig` is the default. `ENGINE=python` is the engine described below. What the Zig engine serves so far,
 and each setting's status: [`docs/zig-engine.md`](docs/zig-engine.md).
 
 **Unreleased, two to four Sparks** (patches 0098-0109; 0099-0109 ported from the
