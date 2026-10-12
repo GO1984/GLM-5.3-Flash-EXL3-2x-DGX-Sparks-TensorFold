@@ -1,4 +1,4 @@
-TensorFold v1.0.7..c50af40f (r107-int): glm-tests
+TensorFold v1.0.7..a10c8647 (r107-int): glm-tests
 Apply from the checkout root with: git apply 0005-zig-glm-tests.patch
 
 diff --git a/REPORT.md b/REPORT.md

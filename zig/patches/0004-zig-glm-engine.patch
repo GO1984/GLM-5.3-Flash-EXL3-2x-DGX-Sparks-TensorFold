@@ -1,4 +1,4 @@
-TensorFold v1.0.7..c50af40f (r107-int): glm-engine
+TensorFold v1.0.7..a10c8647 (r107-int): glm-engine
 Apply from the checkout root with: git apply 0004-zig-glm-engine.patch
 
 diff --git a/zig/src/cli/glm_cuda.zig b/zig/src/cli/glm_cuda.zig
@@ -4461,10 +4461,10 @@ index 00000000..f9af7c04
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_entries.zig b/zig/src/families/glm_cuda/cuda_entries.zig
 new file mode 100644
-index 00000000..ce89d0fe
+index 00000000..6d7a580b
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_entries.zig
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,875 @@
 +//! Plain launches for TensorFold glm5_next/cuda/exl3.cu and cuda/kernels/qmm*.cu.
 +//! Device math authored by Ash Hart and TensorFold contributors; launch pattern by jschmied (PR #443).
 +const std = @import("std");
@@ -4973,6 +4973,40 @@ index 00000000..ce89d0fe
 +        a.add(E);
 +        try e.launch(2, "glm_exl3_grouped", config, stream, &a);
 +    }
++    pub fn glm_exl3_grouped_seq(e: *const Entries, config: cuda.launch.Config, stream: cuda.Stream, X0: u64, X1: u64, T0: u64, T1: u64, items: u64, counts: u64, members: u64, Z: u64, K: c_int, N: c_int, P: c_int, SK: c_int, E: c_int) !void {
++        var a: cuda.Args = .{};
++        a.add(X0);
++        a.add(X1);
++        a.add(T0);
++        a.add(T1);
++        a.add(items);
++        a.add(counts);
++        a.add(members);
++        a.add(Z);
++        a.add(K);
++        a.add(N);
++        a.add(P);
++        a.add(SK);
++        a.add(E);
++        try e.launch(2, "glm_exl3_grouped_seq", config, stream, &a);
++    }
++    pub fn glm_exl3_grouped_nf(e: *const Entries, config: cuda.launch.Config, stream: cuda.Stream, X0: u64, X1: u64, T0: u64, T1: u64, items: u64, counts: u64, members: u64, Z: u64, K: c_int, N: c_int, P: c_int, SK: c_int, E: c_int) !void {
++        var a: cuda.Args = .{};
++        a.add(X0);
++        a.add(X1);
++        a.add(T0);
++        a.add(T1);
++        a.add(items);
++        a.add(counts);
++        a.add(members);
++        a.add(Z);
++        a.add(K);
++        a.add(N);
++        a.add(P);
++        a.add(SK);
++        a.add(E);
++        try e.launch(2, "glm_exl3_grouped_nf", config, stream, &a);
++    }
 +    pub fn glm_exl3_dec_8_0_0(e: *const Entries, config: cuda.launch.Config, stream: cuda.Stream, X0: u64, X1: u64, T0: u64, T1: u64, items: u64, counts: u64, members: u64, Z: u64, K: c_int, N: c_int, P: c_int, SK: c_int, E: c_int, slots: c_int, sv0: u64, sv1: u64, su2: u64, out: u64, limit: f32, done: u64) !void {
 +        var a: cuda.Args = .{};
 +        a.add(X0);
@@ -5286,6 +5320,8 @@ index 00000000..ce89d0fe
 +    .{ .image = 2, .symbol = "glm_exl3_gateup", .shared = 0 },
 +    .{ .image = 2, .symbol = "glm_exl3_down", .shared = 0 },
 +    .{ .image = 2, .symbol = "glm_exl3_grouped", .shared = 0 },
++    .{ .image = 2, .symbol = "glm_exl3_grouped_seq", .shared = 0 },
++    .{ .image = 2, .symbol = "glm_exl3_grouped_nf", .shared = 0 },
 +    .{ .image = 2, .symbol = "glm_exl3_dec_8_0_0", .shared = 0 },
 +    .{ .image = 2, .symbol = "glm_exl3_dec_8_1_0", .shared = 0 },
 +    .{ .image = 2, .symbol = "glm_exl3_dec_10_0_0", .shared = 0 },
@@ -5306,10 +5342,10 @@ index 00000000..ce89d0fe
 +};
 diff --git a/zig/src/families/glm_cuda/cuda_experts.zig b/zig/src/families/glm_cuda/cuda_experts.zig
 new file mode 100644
-index 00000000..bccb6a9c
+index 00000000..a70a495a
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_experts.zig
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,155 @@
 +//! TensorFold glm5_next/cuda/exl3_mm.py routed and cuda/experts.py route, authored by Ash Hart and contributors.
 +//! Reuses TensorFold's experts image and jschmied's Zig CUDA launch interface (PR #443).
 +const std = @import("std");
@@ -5372,12 +5408,21 @@ index 00000000..bccb6a9c
 +        try e.glm_exl3_prompt_down(cfg(ex.dims / 256, items, 1, 256, mm.promptShared(false)), stream, s.xd, ex.dt, p.items, p.counts, p.members, ex.svh_d, y, ci(ex.width), ci(ex.dims), ci(ex.count), s.order);
 +        return;
 +    }
-+    const gc = cfg(items, ex.width / 128, 8, 128, 0);
++    // exl3_mm.py: R >= 64 leaves dec and runs grouped_kernel with n blocks of an item adjacent. Gate/up also sums
++    // its K splits in the program (SEQ) and the epilogue reads that one partial. Same bits as the split epilogue.
++    const wide = !dec and rows >= 64;
++    const logging = try loggingOn(stream);
++    const t0: ?cuda.Event = if (logging) try mark(stream) else null;
++    const gc = if (wide) cfg(ex.width / 128, items, 2, 128, 0) else cfg(items, ex.width / 128, 8, 128, 0);
 +    if (dec) {
 +        if (shared) try e.glm_exl3_dec_16_0_1(gc, stream, s.xg, xu, ex.gt, ex.ut, p.items, p.counts, p.members, s.z, ci(ex.dims), ci(ex.width), ci(pairs), 4, ci(ex.count), ci(s.slots), ex.svh_g, ex.svh_u, ex.suh_d, s.xd, limit, s.done) else try e.glm_exl3_dec_16_0_0(gc, stream, s.xg, xu, ex.gt, ex.ut, p.items, p.counts, p.members, s.z, ci(ex.dims), ci(ex.width), ci(pairs), 4, ci(ex.count), ci(s.slots), ex.svh_g, ex.svh_u, ex.suh_d, s.xd, limit, s.done);
++    } else if (wide) {
++        try e.glm_exl3_grouped_seq(gc, stream, s.xg, xu, ex.gt, ex.ut, p.items, p.counts, p.members, s.z, ci(ex.dims), ci(ex.width), ci(pairs), 4, ci(ex.count));
 +    } else try e.glm_exl3_grouped(gc, stream, s.xg, xu, ex.gt, ex.ut, p.items, p.counts, p.members, s.z, ci(ex.dims), ci(ex.width), ci(pairs), 4, ci(ex.count));
-+    try e.glm_exl3_gateup(cfg(rows * s.slots, ex.width / 128, 1, 32, 0), stream, s.z, picks, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, ci(pairs), ci(ex.width), 4, ci(s.slots), limit);
-+    const dc = cfg(items, ex.dims / 128, 1, 128, 0);
++    const gsk: c_int = if (wide) 1 else 4;
++    try e.glm_exl3_gateup(cfg(rows * s.slots, ex.width / 128, 1, 32, 0), stream, s.z, picks, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, ci(pairs), ci(ex.width), gsk, ci(s.slots), limit);
++    const t1: ?cuda.Event = if (logging) try mark(stream) else null;
++    const dc = if (wide) cfg(ex.dims / 128, items, 1, 128, 0) else cfg(items, ex.dims / 128, 1, 128, 0);
 +    if (dec) {
 +        var args: cuda.Args = .{};
 +        for ([_]u64{ s.xd, s.xd, ex.dt, ex.dt, p.items, p.counts, p.members, s.z }) |v| args.add(v);
@@ -5388,10 +5433,15 @@ index 00000000..bccb6a9c
 +        var buf: [48]u8 = undefined;
 +        const symbol = try printZ(&buf, "glm_exl3_dec_{d}_1_0", .{ex.width / 64});
 +        try e.launch(2, symbol, dc, stream, &args);
++    } else if (wide) {
++        try e.glm_exl3_grouped_nf(dc, stream, s.xd, s.xd, ex.dt, ex.dt, p.items, p.counts, p.members, s.z, ci(ex.width), ci(ex.dims), ci(pairs), 1, ci(ex.count));
++        try e.glm_exl3_down(cfg(rows * s.slots, ex.dims / 128, 1, 32, 0), stream, s.z, picks, ex.svh_d, y, ci(pairs), ci(ex.dims), 1, ci(s.slots));
 +    } else {
 +        try e.glm_exl3_grouped(dc, stream, s.xd, s.xd, ex.dt, ex.dt, p.items, p.counts, p.members, s.z, ci(ex.width), ci(ex.dims), ci(pairs), 1, ci(ex.count));
 +        try e.glm_exl3_down(cfg(rows * s.slots, ex.dims / 128, 1, 32, 0), stream, s.z, picks, ex.svh_d, y, ci(pairs), ci(ex.dims), 1, ci(s.slots));
 +    }
++    const t2: ?cuda.Event = if (logging) try mark(stream) else null;
++    try noteItems(stream, p.counts, rows, t0, t1, t2);
 +}
 +test "plan bounds and prompt shared memory match reference" {
 +    try std.testing.expectEqual(@as(usize, 9), maxItems(9, 289, 16));
@@ -5403,12 +5453,60 @@ index 00000000..bccb6a9c
 +fn printZ(buf: []u8, comptime format: []const u8, args: anytype) ![:0]u8 {
 +    return std.fmt.bufPrintSentinel(buf, format, args, 0);
 +}
++
++/// TF_GLM_EXL3_LOG=1 and TF_GLM_EAGER=1: expert-tile count and the two expert launches' GPU time. Graphs skip it.
++const Acc = struct { rows: usize = 0, layers: u32 = 0, items: u64 = 0, gu: f32 = 0, dn: f32 = 0 };
++var acc: Acc = .{};
++
++fn loggingOn(stream: cuda.Stream) !bool {
++    if (std.c.getenv("TF_GLM_EXL3_LOG") == null) return false;
++    return try cuda.graph.captureStatus(stream) == .none;
++}
++
++fn mark(stream: cuda.Stream) !cuda.Event {
++    const ev = try cuda.Event.init(stream.d, true);
++    try ev.record(stream);
++    return ev;
++}
++
++fn take(ev: ?cuda.Event) void {
++    var e = ev orelse return;
++    e.deinit();
++}
++
++fn noteItems(stream: cuda.Stream, counts: u64, rows: usize, t0: ?cuda.Event, t1: ?cuda.Event, t2: ?cuda.Event) !void {
++    defer {
++        take(t0);
++        take(t1);
++        take(t2);
++    }
++    if (t0 == null) return;
++    try stream.synchronize();
++    var raw: [4]u8 = undefined;
++    try stream.d.check(stream.d.api.cuMemcpyDtoH_v2(&raw, counts, 4), "exl3 counts");
++    const n = std.mem.readInt(i32, &raw, .little);
++    acc.rows = rows;
++    acc.layers += 1;
++    if (n > 0) acc.items += @intCast(n);
++    if (t0 != null and t1 != null) acc.gu += try t0.?.elapsedMs(t1.?);
++    if (t1 != null and t2 != null) acc.dn += try t1.?.elapsedMs(t2.?);
++}
++
++pub fn logFlush() void {
++    if (acc.layers == 0) return;
++    const layers: f32 = @floatFromInt(acc.layers);
++    const items: f32 = @floatFromInt(acc.items);
++    // 8-row TP=2 decode launches glm_exl3_dec_16_0_1 as (maxItems, width/128, 8) and glm_exl3_dec_16_1_0 as
++    // (maxItems, dims/128, 1). maxItems(72, 289, 16) is 76; blocks past the tile count return before the trellis load.
++    std.log.info("exl3 rows={d} moe-layers={d} expert-tiles={d} ({d:.1}/layer) gate+up {d:.2} ms down {d:.2} ms", .{ acc.rows, acc.layers, acc.items, items / layers, acc.gu, acc.dn });
++    acc = .{};
++}
 diff --git a/zig/src/families/glm_cuda/cuda_forward.zig b/zig/src/families/glm_cuda/cuda_forward.zig
 new file mode 100644
-index 00000000..1625e6e7
+index 00000000..dd0cdc03
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_forward.zig
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,328 @@
 +//! Decode layer loop: glm5_next/cuda/forward.py kda_segments, dsa_segments, moe_block, _compute.
 +//! Ash Hart and TensorFold contributors; CUDA launch patterns by jschmied (PR #443).
 +const std = @import("std");
@@ -5714,6 +5812,7 @@ index 00000000..1625e6e7
 +        const cfg = mm.headConfig(rows);
 +        try f.tri.fmm(.{ (rows + cfg.bm - 1) / cfg.bm, (f.g.vocab + cfg.bn - 1) / cfg.bn, 1 }, f.b.normed, f.weights.head, f.weights.head_scale, f.b.logits, f.b.logits, ci(rows), 4096, .{ .N = c(f.g.vocab), .K = 4096, .SK = 1, .BM = c(cfg.bm), .BLOCK_N = c(cfg.bn), .BK = 64, .F32 = 0, .SEQ = 0 });
 +        if (f.pf) |pre| try pre.join(f.tri.s);
++        ex.logFlush();
 +    }
 +};
 +/// P8 binds this. Decode `compute` does not call it, so the two packages do not import each other.
@@ -11592,7 +11691,7 @@ index 00000000..efe2decb
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
 new file mode 100644
-index 00000000..0df68fad
+index 00000000..a5b26a4b
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_native.zig
 @@ -0,0 +1,542 @@
@@ -11711,7 +11810,7 @@ index 00000000..0df68fad
 +        .rank = o.rank,
 +        .world = o.tp,
 +        .comm = if (own.comm) |*c| c else null,
-+        .eager = o.eager,
++        .eager = o.eager or envText("TF_GLM_EAGER") != null,
 +        .draft_dir = draft_dir,
 +        .draft_choice = choice,
 +        .vision = o.vision,

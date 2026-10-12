@@ -1,12 +1,12 @@
-TensorFold v1.0.7..c50af40f (r107-int): glm-kernels
+TensorFold v1.0.7..a10c8647 (r107-int): glm-kernels
 Apply from the checkout root with: git apply 0003-zig-glm-kernels.patch
 
 diff --git a/zig/kernels/cuda/glm_exl3.cu b/zig/kernels/cuda/glm_exl3.cu
 new file mode 100644
-index 00000000..39bfca77
+index 00000000..0fb1a118
 --- /dev/null
 +++ b/zig/kernels/cuda/glm_exl3.cu
-@@ -0,0 +1,3535 @@
+@@ -0,0 +1,3552 @@
 +// Port of TensorFold families/glm5_next/cuda/exl3.cu; authored by Ash Hart and TensorFold contributors.
 +// Zig CUDA launch pattern authored by jschmied (TensorFold PR #443).
 +// GLM-5.3-Flash's EXL3 routed experts on CUDA: the grouped trellis GEMV and the Hadamard rotations around it.
@@ -90,7 +90,7 @@ index 00000000..39bfca77
 +// ((0 + split 0) + split 1) + ..., the epilogue's own sum, so an SK = 1 epilogue gives the same bits without the
 +// SK fp32 partials' round trip through memory.
 +template <int NT, int W, bool NFIRST, bool PF, bool SEQ>
-+__global__ void __launch_bounds__(W * 32) grouped_kernel(
++__device__ __forceinline__ void grouped_body(
 +    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
 +    const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
 +    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E) {
@@ -224,6 +224,23 @@ index 00000000..39bfca77
 +            if (r >= 0) Z[((size_t)mat * P + r) * N + nt0 * 16 + col] = tot[j];
 +        }
 +    }
++}
++
++// Rows >= 64 leave the decode kernel (exl3_mm.py: R < PROMPT_ROWS). Python then launches grouped_kernel with the
++// n blocks of an item adjacent (NFIRST), the next k step prefetched (PF) and, for gate/up, the K splits summed in
++// one program (SEQ) so the epilogue reads SK = 1. Same chains and the same sum order as the expanded grouped kernel.
++extern "C" __global__ void __launch_bounds__(4 * 32) glm_exl3_grouped_seq(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E) {
++    grouped_body<8, 4, true, true, true>(X0, X1, T0, T1, items, counts, members, Z, K, N, P, SK, E);
++}
++
++extern "C" __global__ void __launch_bounds__(4 * 32) glm_exl3_grouped_nf(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E) {
++    grouped_body<8, 4, true, true, false>(X0, X1, T0, T1, items, counts, members, Z, K, N, P, SK, E);
 +}
 +
 +// Fast Walsh-Hadamard transform of 128 values held 4 per lane (lane L: values 4L..4L+3), natural order, fixed

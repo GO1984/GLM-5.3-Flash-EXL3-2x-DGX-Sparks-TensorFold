@@ -1,4 +1,4 @@
-TensorFold v1.0.7..c50af40f (r107-int): shared-engine
+TensorFold v1.0.7..a10c8647 (r107-int): shared-engine
 Apply from the checkout root with: git apply 0001-zig-shared-engine.patch
 
 diff --git a/.gitignore b/.gitignore
