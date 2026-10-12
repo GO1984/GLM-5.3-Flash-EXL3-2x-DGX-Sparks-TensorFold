@@ -1,4 +1,4 @@
-TensorFold v1.0.7..ac66993d (r107-int): glm-engine
+TensorFold v1.0.7..c50af40f (r107-int): glm-engine
 Apply from the checkout root with: git apply 0004-zig-glm-engine.patch
 
 diff --git a/zig/src/cli/glm_cuda.zig b/zig/src/cli/glm_cuda.zig

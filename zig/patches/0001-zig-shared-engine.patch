@@ -1,4 +1,4 @@
-TensorFold v1.0.7..ac66993d (r107-int): shared-engine
+TensorFold v1.0.7..c50af40f (r107-int): shared-engine
 Apply from the checkout root with: git apply 0001-zig-shared-engine.patch
 
 diff --git a/.gitignore b/.gitignore
@@ -985,7 +985,7 @@ index 85361bd8..45ec7188 100644
              .head_trees = m.head_trees,
              .depth_prior = depth_prior,
 diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
-index 78185920..0637002b 100644
+index 78185920..43ac4f51 100644
 --- a/zig/src/core/lanes/depth.zig
 +++ b/zig/src/core/lanes/depth.zig
 @@ -55,6 +55,12 @@ pub const Rule = struct {
@@ -1001,7 +1001,7 @@ index 78185920..0637002b 100644
      batch_rows: u32,
      round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
      overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
-@@ -124,10 +130,16 @@ pub const Rule = struct {
+@@ -124,14 +130,23 @@ pub const Rule = struct {
          return modeled;
      }
  
@@ -1017,8 +1017,17 @@ index 78185920..0637002b 100644
 +        if (r.stopsNow()) return most;
          const p = try r.rates(who);
          if (r.family_costs.empty()) {
-             const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
-@@ -188,6 +200,11 @@ pub const Rule = struct {
+-            const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
+-            return @max(1, @min(most, want));
++            // GLM's CUDA server never times family rounds, so this table stays empty. The served policy is fnc7:0.3:
++            // every round asks for 7 drafts and the drafter's confidence product cuts the chain. The 1/2/3 ladder
++            // (family_depth.py, for a measured-cost engine) left a repetitive reply at about 4 tokens a round.
++            if (p.len == 0) return 1;
++            return @max(1, @min(most, 7));
+         }
+         var best: i64 = 1;
+         var best_rate: f64 = -1.0;
+@@ -188,6 +203,11 @@ pub const Rule = struct {
  
      /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
      pub fn budgets(r: *Rule, whos: []Who, probe: Probe, out: []i64) !void {
