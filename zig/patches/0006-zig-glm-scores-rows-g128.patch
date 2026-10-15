@@ -1,0 +1,21 @@
+zig-engine fix: launch the GLM prompt-tail indexer scores (_scores_rows) at G=128
+Apply from the checkout root with: git apply 0006-zig-glm-scores-rows-g128.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_prefill.zig b/zig/src/families/glm_cuda/cuda_prefill.zig
+index 7632b0a..c316daf 100644
+--- a/zig/src/families/glm_cuda/cuda_prefill.zig
++++ b/zig/src/families/glm_cuda/cuda_prefill.zig
+@@ -677,7 +677,12 @@ pub const Engine = struct {
+         }
+         const bucket = grid.poolBucket(pos, rows, np_max);
+         if (rows > e.s.select or bucket > e.s.pools) return error.ScoresScratch;
+-        const g = @min(grid.row_score_g, cdiv(bucket, 64));
++        // G (the programs a row) is speed only: program g scores pool blocks g, g+G, ... and stores each block's scores
++        // on its own, with no reduction across programs, and programs past the last block return (sparse.py _scores_rows).
++        // The captured kernel set has `_scores_rows` at G=128 in every argument class but only some smaller G (no G=88,
++        // which a 20,995-token prompt with a 200-token budget needs), so launch at G=128: the same scores, no
++        // MissingTritonVariant. Python launches min(128, cdiv(np_max, 64)) programs; the results do not depend on it.
++        const g = grid.row_score_g;
+         try e.tri.scores_rows(.{ rows, g, 1 }, e.s.qi, e.s.ikr + 128 * 2, 160, pk, pk, e.s.scores, try ci(bucket), e.pos_dev, e.pos_dev, e.pos_dev, try ci(rows), try ci(bucket), grid.score_scale, grid.wscale_h32, .{ .H = 32, .HP = 32, .D = 128, .BP = 64, .G = cz(g), .SEG = 0, .RS = 144, .FP8 = 1, .K = grid.topk_pools });
+         try e.choose(rows, bucket, e.pos_dev, false, e.s.tokens, e.s.counts);
+     }

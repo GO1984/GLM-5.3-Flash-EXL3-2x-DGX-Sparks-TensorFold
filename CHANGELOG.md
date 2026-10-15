@@ -11,6 +11,8 @@ kernel set `zig/aot/`, a CUDA runtime image: `zig/Dockerfile`) instead of the Py
 read yet are listed, with their status, in [`docs/zig-engine.md`](docs/zig-engine.md); the ones it cannot honour are refused.
 Credits: Ash Hart and the TensorFold contributors, jschmied (PR #443), b12x by local-inference-lab ([`CREDITS.md`](CREDITS.md)).
 
+- `ENGINE=zig`: `zig/patches/0006` launches the prompt-tail indexer scores (`_scores_rows`) at G=128, which the captured kernel set has in every argument class, instead of `min(128, cdiv(bucket, 64))`: a 20,995-token prompt with a 200-token reply budget needed G=88, which is not captured, and both ranks exited with `MissingTritonVariant`. G only splits the work (each block is scored on its own), so the scores are unchanged.
+
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
 Image: `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-7a37454d3238`, pinned by digest
