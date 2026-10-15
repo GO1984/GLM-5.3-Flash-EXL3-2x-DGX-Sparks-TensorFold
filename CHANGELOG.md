@@ -11,6 +11,8 @@ kernel set `zig/aot/`, a CUDA runtime image: `zig/Dockerfile`) instead of the Py
 read yet are listed, with their status, in [`docs/zig-engine.md`](docs/zig-engine.md); the ones it cannot honour are refused.
 Credits: Ash Hart and the TensorFold contributors, jschmied (PR #443), b12x by local-inference-lab ([`CREDITS.md`](CREDITS.md)).
 
+- `ENGINE=zig` with `DRAFTER=mtp` starts: the checkpoint's MTP head is chosen by `DRAFTER=mtp` in the containers (passed to every rank), not `--drafter mtp`, which `tensorfold-native serve` read as a model path and refused ("mtp is neither a directory nor a Hugging Face repo id").
+
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
 Image: `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-7a37454d3238`, pinned by digest
