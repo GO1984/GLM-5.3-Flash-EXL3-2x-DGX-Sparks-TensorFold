@@ -12,6 +12,7 @@ read yet are listed, with their status, in [`docs/zig-engine.md`](docs/zig-engin
 Credits: Ash Hart and the TensorFold contributors, jschmied (PR #443), b12x by local-inference-lab ([`CREDITS.md`](CREDITS.md)).
 
 - `ENGINE=zig` with `DRAFTER=mtp` starts: the checkpoint's MTP head is chosen by `DRAFTER=mtp` in the containers (passed to every rank), not `--drafter mtp`, which `tensorfold-native serve` read as a model path and refused ("mtp is neither a directory nor a Hugging Face repo id").
+- `ENGINE=zig`: `zig/patches/0007` sends a long batch's record before the batch itself on the TP control link (`Records.put` in `zig/src/families/flashnext/cuda_mirror.zig`). Rank 1 reads the link only after the record, so a batch larger than the socket buffers (a prompt of roughly 262,000 tokens or more, 4 bytes a token) blocked rank 0's write while rank 1 waited for the record, until `TF_TP_TIMEOUT_S` ended the request with `LinkWriteFailed`. With the record first, 262,032-, 512,030- and 1,000,031-token prompts are served at `--context 1048576` (TP=2). It adds a regression test: a 16 MB prompt over 64 KiB socket buffers.
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
