@@ -36,7 +36,7 @@ would change what is served.
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
 | `CONTEXT`, `PARALLEL` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`: the captured kernels are keyed on that arena; other values need more captures (TODO; a warning says so) |
 | `MAX_TOKENS`, `THINKING` | `--max-tokens`, `--thinking` / `--no-thinking` |
-| `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> `--drafter mtp` (PARALLEL=1). The MTP head is in `zig/patches`; `ZIG_HAS` defaults to `mtp displaykv` |
+| `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> no `--drafter`; the container gets `DRAFTER=mtp` (PARALLEL=1), which the Zig engine reads from its environment. The MTP head is in `zig/patches`; `ZIG_HAS` defaults to `mtp displaykv` |
 | `KV`, `DENSE` | fixed at `fp8` and `q4`; other values refused (TODO) |
 | `COMM`, `TF_ROCE_MAX_KB` | `TF_GLM_ROCE` (1 for `roce`, 0 for `nccl`), `TF_ROCE_MAX_KB` |
 | `TF_GLM_L2PF` | `TF_GLM_L2PF` (0 / off: off; anything else: 1) |
