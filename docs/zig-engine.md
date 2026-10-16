@@ -14,7 +14,7 @@ yet. The Zig engine's greedy replies equal the Python engine's on two prompts at
 | Part | Source |
 | --- | --- |
 | `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus `zig/patches/0001-0005`, built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
-| captured Triton kernel set | `zig/aot/glm-aot-sm121.tar.xz` (aot.json and 183 cubins, captured from the Python engine on a GB10; pinned by its sha256), at `TENSORFOLD_CUDA_KERNELS` |
+| captured Triton kernel set | `zig/aot/glm-aot-sm121.tar.xz` (aot.json and 311 cubins, captured from the Python engine on a GB10; pinned by its sha256), at `TENSORFOLD_CUDA_KERNELS` |
 | runtime libraries | `nvidia/cuda:13.0.2-runtime-ubuntu24.04` (cuBLAS, cuBLASLt), NCCL 2.30.7 (the pip wheel; the Python image runs the same), libibverbs and the mlx5 provider |
 
 `zig/patches/` is the Zig port against TensorFold v1.0.7, in five patches: the shared engine changes (lane host, native
@@ -65,6 +65,23 @@ A Zig rank gets what a Python rank gets: every `TENSORFOLD_*`, `TF_GLM_*` and `T
 read fails the start), plus `TF_GLM_ROCE` from `COMM`, `TF_GLM_L2PF` as 0 or 1, and `TF_CUDA_DEVICE`, `TF_GRAPH_LOG`,
 `TF_ROUND_LOG`, `TF_TP_*` when you set them. `ZIG_HAS` (space-separated `mtp`, `displaykv`) lifts the refusal of a feature
 once its port is in `zig/patches`.
+
+## Prefill capture coverage
+
+The SM121 archive includes dense `_merge` specializations for NCH 1–37 and
+all three row classes (constant 1, aligned runtime, unaligned runtime), plus
+`_dense_chunks` FP8 HBT32/R=1 and `_hc_partial_mma` R=1. These add the HC R=1 capture
+reported in #176 and dense merge coverage relevant to #177. All 210 original cubins are
+preserved byte-for-byte; 101 captures are appended. Kernel arithmetic and
+native dispatch are unchanged.
+
+The archive passed 549 strict direct-cubin GPU comparisons against the
+original JIT kernels on GB10. The same archive was also used in a TP2 build
+with capture-coverage tests and a behavior-preserving extraction of the dense
+attention block: boundary, serial/drafted parity, eight
+concurrent requests, tools/vision and 20 benchmark requests passed at 128K
+context with DFlash2. This does not qualify arbitrary MTP configurations,
+1M context, or every other missing-capture path. No speedup is claimed.
 
 ## Known limits (not the scripts')
 
