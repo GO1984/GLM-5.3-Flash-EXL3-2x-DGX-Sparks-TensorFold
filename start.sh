@@ -249,10 +249,12 @@ snapshot() {  # <repo id>: its snapshot path in the container, checked on every 
   echo "/root/.cache/huggingface/$sub"
 }
 MODEL_ARG=$(snapshot "$MODEL_ID")
-if [[ "$DRAFTER" == dflash2 ]]; then DRAFTER_ARG=$(snapshot "$DFLASH2_ID")
-elif [[ "$ENGINE" == zig ]]; then DRAFTER_ARG=mtp      # (the Zig engine names the MTP head; Python takes none)
-else DRAFTER_ARG=none; fi                           # the checkpoint's MTP head, even when DFlash2 is downloaded
-SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the command line comes later and wins
+# --drafter names a draft model (a directory or a repo id). The checkpoint's own MTP head: Python takes --drafter none;
+# tensorfold-native takes no --drafter at all and reads DRAFTER=mtp from its environment (cuda_mtp_choice.zig; zig_env
+# passes it), since its serve resolves every --drafter value as a model and rejects "mtp".
+if [[ "$DRAFTER" == dflash2 ]]; then SERVE_ARGS=(--drafter "$(snapshot "$DFLASH2_ID")" "${SERVE_ARGS[@]}")
+elif [[ "$ENGINE" != zig ]]; then SERVE_ARGS=(--drafter none "${SERVE_ARGS[@]}"); fi   # MTP head, even when DFlash2 is downloaded
+# (a --drafter on the command line comes later and wins)
 ENGINE_CMD=(tensorfold serve); [[ "$ENGINE" == zig ]] && ENGINE_CMD=(tensorfold-native serve)
 
 # ---------------------------------------------------------------- 2. checks
@@ -359,6 +361,7 @@ zig_env() {
   [[ "$TF_GLM_L2PF" =~ ^(0|off)$ ]] && l2=0
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" | grep -v '^TF_GLM_L2PF=' || true)
   ENV_ARGS+=(-e "TF_GLM_ROCE=$([[ "$COMM" == roce ]] && echo 1 || echo 0)" -e "TF_GLM_L2PF=$l2")
+  ENV_ARGS+=(-e "DRAFTER=$DRAFTER")   # the Zig engine's drafter choice (dflash2 | mtp), the same on every rank
   for v in TF_CUDA_DEVICE TF_GRAPH_LOG TF_ROUND_LOG TF_TP_TRACE TF_TP_STATS TF_TP_TIMEOUT_S; do
     [[ -z "${!v:-}" ]] || ENV_ARGS+=(-e "$v=${!v}")
   done
