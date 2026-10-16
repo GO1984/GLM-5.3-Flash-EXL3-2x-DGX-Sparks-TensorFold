@@ -11,6 +11,8 @@ kernel set `zig/aot/`, a CUDA runtime image: `zig/Dockerfile`) instead of the Py
 read yet are listed, with their status, in [`docs/zig-engine.md`](docs/zig-engine.md); the ones it cannot honour are refused.
 Credits: Ash Hart and the TensorFold contributors, jschmied (PR #443), b12x by local-inference-lab ([`CREDITS.md`](CREDITS.md)).
 
+- `ENGINE=zig`: `zig/patches/0007` sends a long batch's record before the batch itself on the TP control link (`Records.put` in `zig/src/families/flashnext/cuda_mirror.zig`). Rank 1 reads the link only after the record, so a batch larger than the socket buffers (a prompt of roughly 262,000 tokens or more, 4 bytes a token) blocked rank 0's write while rank 1 waited for the record, until `TF_TP_TIMEOUT_S` ended the request with `LinkWriteFailed`. With the record first, 262,032-, 512,030- and 1,000,031-token prompts are served at `--context 1048576` (TP=2). It adds a regression test: a 16 MB prompt over 64 KiB socket buffers.
+
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
 Image: `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-7a37454d3238`, pinned by digest
