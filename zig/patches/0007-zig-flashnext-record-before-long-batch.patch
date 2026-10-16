@@ -1,0 +1,124 @@
+zig-engine fix: send a long batch's record before the batch itself (TP control link), so a prompt larger than the
+socket buffers cannot deadlock rank 0 (blocked writing the batch) against rank 1 (waiting for the record)
+Apply from the checkout root with: git apply 0007-zig-flashnext-record-before-long-batch.patch
+
+diff --git a/zig/src/families/flashnext/cuda_mirror.zig b/zig/src/families/flashnext/cuda_mirror.zig
+index f02b489..c0bbd08 100644
+--- a/zig/src/families/flashnext/cuda_mirror.zig
++++ b/zig/src/families/flashnext/cuda_mirror.zig
+@@ -704,9 +704,11 @@ pub const Records = struct {
+         if (r.idle) try r.link.send(.request, &.{}); // rank 1 back on the wire
+         r.idle = false;
+         const k = packRecord(&r.rec, kind, bytes);
+-        // the long batch is on the link before its record: rank 1 reads it after the record
+-        if (k == .on_link) try r.link.send(.round, bytes);
++        // The record first, then a long batch on the link: rank 1 reads the link only after the record, so a batch larger
++        // than the sockets can buffer (a few-hundred-thousand-token prompt) would block this write while rank 1 waits for
++        // the record, and neither rank would move.
+         try r.wire.put(r.wire.ptr, &r.rec);
++        if (k == .on_link) try r.link.send(.round, bytes);
+     }
+ 
+     fn sendFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+@@ -1728,6 +1730,8 @@ const LinkWire = struct {
+ 
+ const Rank1Records = struct {
+     target: fake.Fake,
++    /// set SO_RCVBUF on the payload link (the prompt's), to bound how much the kernel buffers for rank 1
++    rcvbuf: ?c_int = null,
+     err: ?anyerror = null,
+     calls: u64 = 0,
+     failed: u64 = 0,
+@@ -1739,6 +1743,10 @@ const Rank1Records = struct {
+             return;
+         };
+         defer l.close();
++        if (r.rcvbuf) |n| std.posix.setsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&n)) catch |e| {
++            r.err = e;
++            return;
++        };
+         const wl = Link.join(io, net.IpAddress.parse("127.0.0.1", wire_port) catch unreachable, 5000) catch |e| {
+             r.err = e;
+             return;
+@@ -1812,6 +1820,81 @@ test "the mirror over records: batched rounds, idle waits on the link, long prom
+     try std.testing.expectEqual(@as(u32, 0), rank1.target.lanes.count());
+ }
+ 
++test "a prompt larger than the sockets can buffer reaches rank 1: the record goes before the long batch" {
++    const gpa = std.testing.allocator;
++    var threaded: std.Io.Threaded = .init(gpa, .{});
++    defer threaded.deinit();
++    const io = threaded.io();
++    // 4,000,000 ids = 16 MB on the link. Both ends of that link get 64 KiB socket buffers (checked below), so with the
++    // batch sent before its record rank 0 blocks in the write while rank 1 waits for the record, on any host.
++    const huge = try gpa.alloc(u32, 4_000_000);
++    defer gpa.free(huge);
++    for (huge, 0..) |*x, i| x.* = @intCast((i * 13) % 97);
++    const cases = [_]Case{
++        .{ .prompt = huge, .max_new = 4 },
++        .{ .prompt = &.{ 2, 7, 1, 8 }, .max_new = 6 },
++    };
++    var alone: fake.Fake = .{ .gpa = gpa };
++    defer alone.deinit();
++    const want = try drive(gpa, alone.backend(), &cases);
++    defer freeRuns(gpa, want);
++
++    const server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
++    defer server.close();
++    const wire_server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
++    defer wire_server.close();
++    const small: c_int = 64 * 1024;
++    var rank1: Rank1Records = .{ .target = .{ .gpa = gpa }, .rcvbuf = small };
++    defer rank1.target.deinit();
++    const t = try std.Thread.spawn(.{}, Rank1Records.run, .{ &rank1, io, server.port(), wire_server.port() });
++    var rank0: fake.Fake = .{ .gpa = gpa };
++    defer rank0.deinit();
++    const l = try server.accept(5000);
++    defer l.close();
++    try std.posix.setsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small));
++    var got_buf: c_int = 0;
++    var got_len: std.posix.socklen_t = @sizeOf(c_int);
++    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&got_buf), &got_len));
++    try std.testing.expect(got_buf > 0 and got_buf <= 1024 * 1024); // the kernel doubles the request; far below 16 MB
++    const wl = try wire_server.accept(5000);
++    defer wl.close();
++    // bounded: a stuck transfer is cut after 180 s (both rank 0 sockets shut down), so the test fails instead of hanging
++    const StuckCut = struct {
++        done: std.atomic.Value(bool) = .init(false),
++        fired: std.atomic.Value(bool) = .init(false),
++        fn run(w: *@This(), wio: std.Io, fds: [2]std.posix.socket_t) void {
++            var waited: u32 = 0;
++            while (waited < 180_000 and !w.done.load(.acquire)) : (waited += 100) std.Io.sleep(wio, .fromMilliseconds(100), .awake) catch {};
++            if (w.done.load(.acquire)) return;
++            w.fired.store(true, .release);
++            for (fds) |fd| _ = std.posix.system.shutdown(fd, std.posix.SHUT.RDWR);
++        }
++    };
++    var watch: StuckCut = .{};
++    const wt = try std.Thread.spawn(.{}, StuckCut.run, .{ &watch, io, [2]std.posix.socket_t{ l.fd, wl.fd } });
++    var lw: LinkWire = .{ .link = wl };
++    var records: Records = .{ .gpa = gpa, .wire = lw.wire(), .link = l };
++    defer records.deinit();
++    var leader = Leader.init(gpa, rank0.backend(), records.channel());
++    const result = drive(gpa, leader.backend(), &cases);
++    watch.done.store(true, .release);
++    wt.join();
++    const got = result catch |e| {
++        leader.deinit();
++        t.join();
++        return e;
++    };
++    defer freeRuns(gpa, got);
++    leader.deinit();
++    t.join();
++    try std.testing.expect(!watch.fired.load(.acquire));
++    if (rank1.err) |e| return e;
++    for (want, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
++    try std.testing.expectEqualSlices(u32, rank0.drawn.items, rank1.target.drawn.items);
++    try std.testing.expectEqual(leader.calls, rank1.calls);
++    try std.testing.expectEqual(@as(u64, 0), rank1.failed);
++}
++
+ test "rank 0 closing the link while no stream is open stops rank 1 cleanly" {
+     const gpa = std.testing.allocator;
+     var threaded: std.Io.Threaded = .init(gpa, .{});
