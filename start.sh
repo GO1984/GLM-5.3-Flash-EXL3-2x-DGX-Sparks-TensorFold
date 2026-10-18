@@ -122,8 +122,8 @@ if [[ "$ENGINE" == zig ]]; then
     # three Sparks (a triangle): unsplit prefill over NCCL, the path the engine has for three ranks; the kernel set holds
     # the TP=3 shapes (22/21/21 heads), captured from the Python engine at TP=3 and checked equal to it
     [[ "$SPLIT" == 0 ]] || die "ENGINE=zig at TP=3 needs SPLIT=0 (split prefill is two ranks)"
-    [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=3 needs COMM=nccl"
-    warn "ENGINE=zig: TP=3 is experimental (unsplit prefill, NCCL)"
+    [[ "$COMM" == nccl || "$COMM" == roce ]] || die "ENGINE=zig at TP=3 needs COMM=nccl or COMM=roce"
+    warn "ENGINE=zig: TP=3 is experimental (unsplit prefill, COMM=$COMM)"
   fi
   if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4 (spark3/spark4 are not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=4 commands only (spark3/spark4 are not in this project)"; fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
