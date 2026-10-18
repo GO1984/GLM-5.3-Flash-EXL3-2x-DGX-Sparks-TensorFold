@@ -1,0 +1,44 @@
+zig-engine TP=3/4 direct RoCE: with a fixed GID index, probe every rail's subnet beyond two ranks so the routes can pair
+rails, but only when the probed RoCE v2 IPv4 GID is the fixed index's own; a mismatched rail is left out of the routes
+(an empty plan keeps every rank on NCCL) instead of being described by another GID's address
+Apply from the checkout root with: git apply 0010-zig-glm-tpn-roce-probe.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_comm.zig b/zig/src/families/glm_cuda/cuda_comm.zig
+index c0b90d3..631204b 100644
+--- a/zig/src/families/glm_cuda/cuda_comm.zig
++++ b/zig/src/families/glm_cuda/cuda_comm.zig
+@@ -247,7 +247,7 @@ pub const Comm = struct {
+ 
+     /// This rank's rails: TF_ROCE_HCA, else NCCL_IB_HCA (at most two rails at two ranks, four beyond); the GID of every
+     /// rail is TF_ROCE_GID_INDEX / NCCL_IB_GID_INDEX (3) at two ranks or when set, else each rail's own RoCE v2 IPv4
+-    /// GID, whose address and prefix go into `found` for the routes.
++    /// GID. Beyond two ranks every rail's address and prefix go into `found` for the routes, fixed index or not.
+     fn openRoce(d: *const cuda.Driver, rank: u32, world: u32, found: *[roce.max_ports]?roce.Addr) ?roce.Roce {
+         const hca_env = std.c.getenv("TF_ROCE_HCA") orelse std.c.getenv("NCCL_IB_HCA") orelse {
+             std.log.warn("RoCE: NCCL_IB_HCA is not set", .{});
+@@ -264,14 +264,22 @@ pub const Comm = struct {
+             break :blk std.fmt.parseInt(c_int, std.mem.span(g), 10) catch 3;
+         };
+         var gids: [roce.max_ports]c_int = @splat(fixed orelse 3);
+-        if (world > 2 and fixed == null) for (ports, 0..) |p, i| {
++        // beyond two ranks the routes pair rails by subnet, so every rail's address is probed even when the GID index
++        // is fixed (a fixed index alone left `found` empty and every route NoSharedSubnet); the fixed index still wins
++        if (world > 2) for (ports, 0..) |p, i| {
+             var z: [256:0]u8 = undefined;
+             if (p.len >= z.len) continue;
+             @memcpy(z[0..p.len], p);
+             z[p.len] = 0;
+             if (roce.probe(z[0..p.len :0])) |pr| {
+-                gids[i] = pr.gid;
+-                found[i] = pr.addr;
++                if (fixed) |f| {
++                    // the routes may use this rail only if the probed address is the fixed index's own; otherwise the
++                    // rail is left out (an empty plan keeps every rank on NCCL) rather than described by another GID
++                    if (f == pr.gid) found[i] = pr.addr else std.log.warn("RoCE: {s}: fixed GID index {d}, but its RoCE v2 IPv4 GID is at {d}: rail left out of the routes", .{ p, f, pr.gid });
++                } else {
++                    gids[i] = pr.gid;
++                    found[i] = pr.addr;
++                }
+             }
+         };
+         const tc: c_int = if (std.c.getenv("NCCL_IB_TC")) |t| std.fmt.parseInt(c_int, std.mem.span(t), 0) catch 0 else 0;

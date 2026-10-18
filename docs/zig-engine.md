@@ -99,7 +99,10 @@ Three Sparks, each cabled to the other two (a triangle). The tested start:
 TP=3 ENGINE=zig SPLIT=0 COMM=nccl DRAFTER=dflash2 PARALLEL=8 CONTEXT=131072 MEMORY_RESERVE_GIB=24 ./start.sh
 ```
 
-start.sh refuses other SPLIT/COMM values for the Zig engine at TP=3. `MEMORY_RESERVE_GIB=24` is not the default: rank 0
+`COMM=roce` also works at TP=3: b12x's RoCEnante transport carries the small all-gathers over the direct routes
+(patch 0010); larger collectives stay on NCCL by design. On the tested triangle, Grill's default C1 workload measured
++12.2% against `COMM=nccl`, with the same replies, on an image that also contained patch 0011. start.sh
+refuses other SPLIT/COMM values for the Zig engine at TP=3. `MEMORY_RESERVE_GIB=24` is not the default: rank 0
 holds the most (22 heads and the server), and with 19.6 its free memory dropped under 8 GiB during a long sweep.
 
 - Network: start.sh gives a triangle the ring's NCCL graph files (rank 0 -> 1 -> 2 -> 0, each rank listening toward the
@@ -119,8 +122,10 @@ holds the most (22 heads and the server), and with 19.6 its free memory dropped 
   gave identical replies (17 parity cases, 4 chat-resume cases, 428 sweep cases, by text, counts and token digest),
   with no missing kernel variant on any rank. At `CONTEXT=1048576` (`TF_TP_TIMEOUT_S=1500`), 262k, 512k and
   1,000,031-token prompts were served (HTTP 200; the ~1M prompt took 962 s with drafts off and 961 s on, with the GPU
-  clock capped at 2200 MHz). TP=2 with this kernel set gave the same replies as before. Not qualified at TP=3: MTP
-  drafts, vision, other arenas, the prompt cache, and TP=3 against TP=2 numerically.
+  clock capped at 2200 MHz). TP=2 with this kernel set gave the same replies as before. MTP drafts (`DRAFTER=mtp
+  PARALLEL=1`) at TP=3 gave the same replies as the Python engine (one more kernel, `_residual_add` at WORLD=3);
+  their acceptance depends on the sampler fix in patch 0011 (separate PR). Not qualified at TP=3: vision, other
+  arenas, the prompt cache, and TP=3 against TP=2 numerically.
 
 ## Build and test the Zig side
 
