@@ -1,0 +1,109 @@
+zig-engine sampler: a greedy draft that asks for its probability is planned with up to 28 candidates a row, but the
+greedy fast path (glm_greedy_pick) writes one, so the draft ids were read from stale memory and MTP drafts were almost
+never accepted (replies stayed exact: verification asks for no probabilities). The fast path is now taken only for one
+candidate a row (usesGreedyPick), with host tests of that decision and of a 28-wide packed row.
+Apply from the checkout root with: git apply 0011-zig-glm-greedy-draft-probs.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_sampler.zig b/zig/src/families/glm_cuda/cuda_sampler.zig
+--- a/zig/src/families/glm_cuda/cuda_sampler.zig
++++ b/zig/src/families/glm_cuda/cuda_sampler.zig
+@@ -10,6 +10,12 @@
+ pub const Part = struct { probs: ?[]f64 = null, logits: u64, positions: []const u64, sampling: ?S.Sampling, out: []u32 };
+ pub fn isGreedy(p: Part) bool {
+     return p.sampling == null or p.sampling.?.temperature <= 0;
++}
++/// samplePacked's fast path: glm_greedy_pick writes one [value | id] a row, so only a greedy part planned with one
++/// candidate may take it. A greedy draft that wants its confidence (probs) is planned with up to 28 (plan), which
++/// only the top-k branch writes; sent to glm_greedy_pick, its ids would be read from stale memory.
++pub fn usesGreedyPick(p: Part, q: Plan, legacy_greedy: bool) bool {
++    return isGreedy(p) and !legacy_greedy and q.count == 1;
+ }
+ /// The order glm_greedy_pick (and the radix top-k's selection_key) ranks floats by: any NaN above everything, then the
+ /// IEEE total order of the bits (+0 above -0, -inf lowest).
+@@ -204,7 +210,7 @@
+             if (q.nucleus) {
+                 try s.th.scaledMax(p.logits, dst, q.rows, s.columns, @max(p.sampling.?.temperature, 1e-6));
+                 nucleus_rows += q.rows;
+-            } else if (isGreedy(p) and !s.legacy_greedy) {
++            } else if (usesGreedyPick(p, q, s.legacy_greedy)) {
+                 try s.th.greedyPick(p.logits, try s.partial(), dst, q.rows, s.columns, s.vocab_offset);
+                 if (s.check_greedy) try s.checkGreedy(i, p, q, dst);
+             } else {
+@@ -467,3 +473,77 @@
+         try std.testing.expectApproxEqAbs(f.probability, p, 1e-15);
+     }
+ }
++test "a greedy draft that wants its confidence is planned 28 wide and stays off the one-candidate kernel" {
++    var probs: [2]f64 = undefined;
++    var o: [2]u32 = undefined;
++    const pos = [_]u64{ 1, 2 };
++    const zero: S.Sampling = .{ .seed = 1, .temperature = 0, .top_k = 0, .top_p = 1, .min_p = 0 };
++    const hot_k: S.Sampling = .{ .seed = 1, .temperature = 0.7, .top_k = 20, .top_p = 1, .min_p = 0 };
++    const hot_p: S.Sampling = .{ .seed = 1, .temperature = 0.7, .top_k = 0, .top_p = 0.9, .min_p = 0 };
++    const Case = struct { part: Part, columns: usize, legacy: bool, count: usize, fast: bool };
++    const cases = [_]Case{
++        // MTP / DFlash2 drafts with confidence: as wide as the plan, never the one-candidate kernel
++        .{ .part = .{ .probs = &probs, .logits = 0, .positions = &pos, .sampling = null, .out = &o }, .columns = 100, .legacy = false, .count = 28, .fast = false },
++        .{ .part = .{ .probs = &probs, .logits = 0, .positions = &pos, .sampling = zero, .out = &o }, .columns = 100, .legacy = false, .count = 28, .fast = false },
++        // a shard narrower than 28 columns: every column, still the top-k branch
++        .{ .part = .{ .probs = &probs, .logits = 0, .positions = &pos, .sampling = null, .out = &o }, .columns = 10, .legacy = false, .count = 10, .fast = false },
++        // one column: one candidate, which the fast kernel writes exactly
++        .{ .part = .{ .probs = &probs, .logits = 0, .positions = &pos, .sampling = null, .out = &o }, .columns = 1, .legacy = false, .count = 1, .fast = true },
++        // verification and plain greedy: one candidate, the fast kernel unless TF_GLM_GREEDY_TOPK
++        .{ .part = .{ .logits = 0, .positions = &pos, .sampling = null, .out = &o }, .columns = 100, .legacy = false, .count = 1, .fast = true },
++        .{ .part = .{ .logits = 0, .positions = &pos, .sampling = zero, .out = &o }, .columns = 100, .legacy = false, .count = 1, .fast = true },
++        .{ .part = .{ .logits = 0, .positions = &pos, .sampling = null, .out = &o }, .columns = 100, .legacy = true, .count = 1, .fast = false },
++        // sampled parts never take it
++        .{ .part = .{ .logits = 0, .positions = &pos, .sampling = hot_k, .out = &o }, .columns = 100, .legacy = false, .count = 28, .fast = false },
++        .{ .part = .{ .logits = 0, .positions = &pos, .sampling = hot_p, .out = &o }, .columns = 100, .legacy = false, .count = 1, .fast = false },
++    };
++    for (cases) |c| {
++        var q: [1]Plan = undefined;
++        _ = try plan(&.{c.part}, c.columns, &q);
++        try std.testing.expectEqual(c.count, q[0].count);
++        try std.testing.expectEqual(c.fast, usesGreedyPick(c.part, q[0], c.legacy));
++    }
++}
++test "a 28-wide packed greedy row: the global top-1 across ranks and rows, and its confidence over the competitors" {
++    const gpa = std.testing.allocator;
++    const id = struct {
++        fn bits(x: u32) f32 {
++            return @bitCast(x);
++        }
++    }.bits;
++    const count = 28;
++    const rows = 2;
++    const world = 2;
++    const offset = 6; // a part after another part's words
++    const words = offset + rows * 2 * count + 4; // and one more part after it
++    const got = try gpa.alloc(f32, world * words);
++    defer gpa.free(got);
++    @memset(got, std.math.nan(f32)); // unrelated storage: never read
++    for (0..world) |rank| for (0..rows) |r| {
++        const row = got[rank * words + offset + r * 2 * count ..][0 .. 2 * count];
++        for (0..count) |j| {
++            row[j] = -100;
++            row[count + j] = id(@intCast(1000 + rank * 100 + r * 30 + j));
++        }
++    };
++    // row 0: both ranks hold 9.0; the lower global id (rank 1's 50) wins
++    got[0 * words + offset + 3] = 9;
++    got[0 * words + offset + count + 3] = id(100);
++    got[1 * words + offset + 5] = 9;
++    got[1 * words + offset + count + 5] = id(50);
++    // row 1: rank 0 holds 7.0 (id 300), rank 1 the larger 8.0 (id 200) at its last column
++    got[0 * words + offset + 2 * count + 0] = 7;
++    got[0 * words + offset + 3 * count + 0] = id(300);
++    got[1 * words + offset + 2 * count + count - 1] = 8;
++    got[1 * words + offset + 3 * count + count - 1] = id(200);
++    var out: [rows]u32 = undefined;
++    try choosePacked(gpa, got, world, words, .{ .rows = rows, .count = count, .offset = offset, .nucleus = false }, &.{ 10, 11 }, null, &out);
++    try std.testing.expectEqualSlices(u32, &.{ 50, 200 }, &out);
++    // the confidence a greedy draft gets from those competitors (decode.py:_probability): one value 5, 27 zeros
++    var vals: [count]f64 = @splat(0);
++    var ids: [count]u64 = undefined;
++    for (&ids, 0..) |*x, k| x.* = 10 + k;
++    vals[0] = 5;
++    const p = try probability(gpa, &vals, &ids, 10, null);
++    try std.testing.expectApproxEqAbs(1.0 / (1.0 + 27.0 * @exp(-5.0)), p, 1e-12);
++}
