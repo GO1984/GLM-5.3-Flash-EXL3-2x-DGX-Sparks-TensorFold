@@ -31,7 +31,7 @@ would change what is served.
 
 | Setting | Zig engine |
 | --- | --- |
-| `TP`, `WORKER`, `WORKER2/3`, `FABRIC_PEER*`, `MASTER_PORT`, `MASTER_ADDR`, `SOCKET_IFNAME` | `--tp`, `--rank`, `--master`, `--master-port`; NCCL variables as the Python engine's. TP=2, and TP=3 on a triangle with `SPLIT=0 COMM=nccl` (experimental, see below). TP=4 has no split, ring or relay code yet (start refuses TP=4; `DRY_RUN=1` still prints it) |
+| `TP`, `WORKER`, `WORKER2/3`, `FABRIC_PEER*`, `MASTER_PORT`, `MASTER_ADDR`, `SOCKET_IFNAME` | `--tp`, `--rank`, `--master`, `--master-port`; NCCL variables as the Python engine's. TP=2, TP=3 on a triangle with `SPLIT=0 COMM=nccl` and TP=4 on a ring of four with `SPLIT=0 COMM=nccl` (both experimental, see below; TP=3 also takes `COMM=roce`). TP=4 on a switch is untested and refused; the RoCE ring relay is not ported (start refuses `COMM=roce` at TP=4) |
 | `MODEL_ID`, `MODEL_REVISION`, `ABLIT`, `DFLASH2_ID`, `DFLASH2_REVISION`, `HF_CACHE`, `WORKER_WEIGHTS*`, `NFS_*` | unchanged: the snapshots are mounted at `/root/.cache/huggingface` and passed as `MODEL` and `--drafter` (`ABLIT=1` has the same architecture; not tried yet) |
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
 | `CONTEXT`, `PARALLEL` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`: the captured kernels are keyed on that arena; other values need more captures (TODO; a warning says so) |
@@ -86,8 +86,8 @@ context with DFlash2. This does not qualify arbitrary MTP configurations,
 ## Known limits (not the scripts')
 
 - Wider decode `_select_split` cubins are in the AOT set (the long-context branch). Prompts past the captured buckets still fail with `MissingTritonVariant`.
-- TP=2 is what this project runs by default. TP=3 runs on three Sparks cabled as a triangle (below); TP=4 is not run in
-  this project yet, and split prefill past two ranks stays unsplit.
+- TP=2 is what this project runs by default. TP=3 runs on three Sparks cabled as a triangle and TP=4 on four cabled as
+  a ring (below); split prefill past two ranks stays unsplit.
 
 - Qual on this head (`zig-notes/r107-int.md`): 58 of 61 cases identical to Python. `tools_required` differs after the call opener. Decode at 8 streams is still under the Python engine.
 
@@ -126,6 +126,32 @@ holds the most (22 heads and the server), and with 19.6 its free memory dropped 
   PARALLEL=1`) at TP=3 gave the same replies as the Python engine (one more kernel, `_residual_add` at WORLD=3);
   their acceptance depends on the sampler fix in patch 0011 (separate PR). Not qualified at TP=3: vision, other
   arenas, the prompt cache, and TP=3 against TP=2 numerically.
+
+### TP=4 (experimental)
+
+Four Sparks cabled as a ring, each to its two neighbours (README "4 Sparks", without a switch), the workers in the
+ring's order in `scripts/local.sh`. The tested start:
+
+```bash
+ENGINE=zig SPLIT=0 COMM=nccl DRAFTER=dflash2 PARALLEL=8 CONTEXT=131072 MEMORY_RESERVE_GIB=24 ./start-tp4-switchless.sh
+```
+
+start.sh refuses the Zig engine at TP=4 on a switch (`./start-tp4.sh`, not tested), with `SPLIT=1`, or with
+`COMM=roce`: the ring's RoCE relay to the Spark across (`TF_ROCE_RING=1`, the Python engine's patch 0099) is not
+ported, so every collective goes over NCCL's ring channels and its graph files (`scripts/nodes.sh`, as for the Python
+engine on a ring).
+
+- Kernel set: the TP=3 set's 510 entries first and unchanged, then 72 TP=4 entries captured from the Python engine at
+  TP=4 on a ring (16 heads on every rank; the four ranks compiled byte-identical sets). No variant had to be compiled
+  offline. Its `aot.json` records the step in `tp3_completion` (the merge tool's list of appended steps).
+- Checked, for this configuration (DFlash2 drafts, text only): the same requests on the Zig and Python engines at TP=4
+  gave identical replies (17 parity cases, 4 chat-resume cases, 428 sweep cases, and the step-3 main set's 56
+  requests including eight at once, drafts off and on), with no missing kernel variant on any rank. At
+  `CONTEXT=1048576` (`TF_TP_TIMEOUT_S=1500`), 262k, 512k and 1,000,031-token prompts were served (HTTP 200; the ~1M
+  prompt took 889 s, drafts off and on). TP=2 with this kernel set gave the same replies as before. The measured
+  428-case sweep took much longer on Zig: 974 s against 85 s on Python, with the same replies (observed workload
+  times, not a controlled attribution: the Python run had a capture hook and its default memory reserve, Zig 24 GiB).
+  Not qualified at TP=4: vision, MTP drafts, other arenas, the prompt cache, and TP=4 against TP=2 or TP=3 numerically.
 
 ## Build and test the Zig side
 
