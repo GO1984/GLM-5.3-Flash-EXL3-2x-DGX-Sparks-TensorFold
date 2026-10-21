@@ -1,0 +1,421 @@
+zig: a round's draws and commits in one call each
+
+With several streams, each round of the GLM lanes verified all windows in
+one forward and then did the rest one window at a time: a packed sampler
+call per window (each a gather and a host readback), and a commit per
+window (a commit table staged, a replay when the window was cut short, a
+conv shift, and the drafter's tap pass with its blocking check). With eight
+streams that is eight readbacks and up to eight tap checks a round.
+
+- cuda_engine: `sampleWindows` draws every window in one samplePacked call
+  (the sampler already takes up to eight parts: one gather and one readback
+  for greedy and top-k draws; nucleus draws add their second one, and a
+  retry, as before; TF_GLM_GREEDY_CHECK=1's diagnostic still reads back
+  per part). Structured output's bits get a buffer a window, so the
+  windows' masks can be uploaded back to back before the one draw;
+  `commitWindows` commits several windows with one commit table and one
+  replay for the windows cut short, one table and one conv shift for all,
+  and one tap pass for the drafter (`Multi.commitTaps`, one blocking check
+  per tap batch where addTaps checks every window's pass; past 64 kept rows
+  it falls back to a tap pass per window).
+- cuda_dflash: `commitTaps` absorbs the kept rows of any windows of a round
+  in one tap pass, each window at its own row of the plane
+  (commitDraftsStrided takes the whole round in order).
+- cuda_lanes: verifyFn draws all windows at once; keepFn checks every
+  window before it touches any (a refused batch leaves them all pending),
+  then keepFn and the drafts' pre-draft commits go through `commitAll`:
+  commitWindows when the engine has it, the per-window calls otherwise
+  (one batch per callback; a round with drafting and non-drafting streams
+  has one before the drafts and one after). The Toy test engine gets the
+  batched forms, counted, so the eight-streams test pins the batched path.
+
+The rows, tables, positions and parities are those of the per-window path;
+the commit tables and the tap pass are shared within each batch (one per
+nonempty callback) instead of staged per window, while each window's
+position still advances on its own; the sampler's draws keep their per-row
+positions. The drafter's tap pass runs over the round's kept
+rows together (a wider row bucket than one window's), so its result is
+checked live: on a TP=2 pair (SPLIT=1, COMM=roce, cache off), the replies
+on the 56-request main set (eight at once) and the 428-case sweep are
+identical to the per-window engine's and to the Python engine's. Eight
+requests at once: 90.5 tok/s with drafts (89.1 before), 75.1 without
+(70.6 before); one request: unchanged within 2 %.
+
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 6e3b066..31e9bc1 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -1078,6 +1078,8 @@ pub const Toy = struct {
+     round_n: usize = 0,
+     rounds: usize = 0,
+     widest: usize = 0,
++    batched_draws: usize = 0, // sampleWindows calls (one a round with the GLM lanes)
++    batched_commits: usize = 0, // commitWindows calls
+     snaps: usize = 0,
+     passes: usize = 0,
+     resumed: usize = 0,
+@@ -1290,6 +1292,18 @@ pub const Toy = struct {
+         try w.seq.tokens.appendSlice(t.gpa, w.tokens[0..keep]);
+         w.n = 0; // committed once
+     }
++    // the batched forms (cuda_engine's sampleWindows / commitWindows): the lanes take these when an engine has them
++    pub fn sampleWindows(t: *Toy, samplings: []const ?lanes.Sampling, outs: []const []u32, masks: []const []const u32) !void {
++        if (samplings.len != t.round_n or outs.len != t.round_n or masks.len != t.round_n or t.round_n == 0) return error.ToyMisuse;
++        for (0..t.round_n) |i| try t.sampleWindow(i, samplings[i], outs[i]);
++        t.batched_draws += 1;
++    }
++    pub fn commitWindows(t: *Toy, idx: []const usize, keeps: []const usize) !void {
++        if (idx.len != keeps.len or idx.len == 0 or idx.len > max_streams) return error.ToyMisuse;
++        for (idx, 0..) |i, k| for (idx[0..k]) |j| if (j == i) return error.ToyMisuse;
++        for (idx, keeps) |i, keep| try t.commitWindow(i, keep);
++        t.batched_commits += 1;
++    }
+     pub fn draftMany(t: *Toy, reqs: []DraftReq) !void {
+         for (reqs) |*r| {
+             const q = r.seq;
+diff --git a/zig/src/families/glm_cuda/cuda_dflash.zig b/zig/src/families/glm_cuda/cuda_dflash.zig
+index cca45f9..0e89427 100644
+--- a/zig/src/families/glm_cuda/cuda_dflash.zig
++++ b/zig/src/families/glm_cuda/cuda_dflash.zig
+@@ -90,6 +90,37 @@ pub const Multi = struct {
+         try m.forward.tapsDone();
+         for (windows, keeps) |w, k| m.contexts[w.state.slot].end += k;
+     }
++    /// The kept rows of several windows of one round in one tap pass, each window at its own first row of the plane
++    /// (commitDraftsStrided takes the whole round in order; this takes any of its windows): at most 64 kept rows.
++    pub const TapItem = struct { slot: usize, row0: usize, keep: usize };
++    pub fn commitTaps(m: *Multi, items: []const TapItem, source: u64, plane_rows: usize) !void {
++        if (items.len == 0 or items.len > 8) return error.BadWindow;
++        var rows: usize = 0;
++        var pos: [64]i64 = undefined;
++        var slots: [64]i64 = undefined;
++        for (items, 0..) |it, i| {
++            if (it.slot >= m.forward.streams or it.keep == 0 or rows + it.keep > 64 or it.row0 > plane_rows or it.keep > plane_rows - it.row0 or it.keep > m.contexts[it.slot].capacity - m.contexts[it.slot].end) return error.BadDraftCommit;
++            for (items[0..i]) |prev| if (prev.slot == it.slot) return error.DuplicateSlot;
++            for (0..it.keep) |j| {
++                pos[rows + j] = @intCast(m.contexts[it.slot].end + j);
++                slots[rows + j] = @intCast(it.slot);
++            }
++            rows += it.keep;
++        }
++        // Validate the whole batch before any cache write.
++        rows = 0;
++        if (!m.forward.stager.ready()) try m.forward.stream.synchronize();
++        for (items) |it| {
++            try rounds.packTaps(m.forward.th.base, source, plane_rows, it.row0, it.keep, m.forward.tap_in + rows * 5 * 8192);
++            rows += it.keep;
++        }
++        const bucket = std.mem.alignForward(usize, rows, 8);
++        try m.padRows(rows, bucket, &pos, &slots);
++        try m.stageRows(pos[0..bucket], slots[0..bucket]);
++        try m.forward.tapsPass(bucket);
++        try m.forward.check(); // the round's one check (addTaps checks each window's pass; tapsDone would defer it to a proposal that may not come)
++        for (items) |it| m.contexts[it.slot].end += it.keep;
++    }
+     fn padRows(m: *Multi, rows: usize, bucket: usize, pos: *[64]i64, slots: *[64]i64) !void {
+         for (rows..bucket) |i| {
+             pos[i] = @intCast(i - rows);
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 9e857b4..0b313dc 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -146,7 +146,7 @@ pub const Engine = struct {
+     commit_words: [48]i32 = @splat(0),
+     commit_nseg: usize = 0,
+     /// structured output's logits mask, loaded at the first constrained draw
+-    gmask: ?grammar.Mask = null,
++    gmasks: [8]?grammar.Mask = @splat(null), // structured output's bits, one buffer a window (a round's windows are masked before one draw)
+     /// the last kept state's id (Snap.id, Seq.tag)
+     snap_next: u64 = 0,
+     /// MEMORY_RESERVE_GIB in bytes: a kept state is refused when the machine would be left under it (0: no check)
+@@ -424,7 +424,7 @@ pub const Engine = struct {
+         if (e.mtp) |*m| m.deinit();
+         if (e.tower) |*t| t.deinit();
+         if (e.drafter) |p| p.deinit();
+-        if (e.gmask) |*m| m.deinit();
++        for (&e.gmasks) |*g| if (g.*) |*m| m.deinit();
+         if (e.lt) |*lt| lt.close();
+         e.sampler.deinit();
+         e.verify.deinit();
+@@ -595,7 +595,7 @@ pub const Engine = struct {
+         st.pos = prompt.len;
+         var out: [1]u32 = undefined;
+         const rule: ?lanes.Sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null;
+-        if (o.mask.len > 0) try e.maskRows(e.pe.b.logits, 1, o.mask);
++        if (o.mask.len > 0) try e.maskRows(0, e.pe.b.logits, 1, o.mask);
+         try e.sampler.samplePacked(&.{.{ .logits = e.pe.b.logits, .positions = &.{@as(u64, prompt.len)}, .sampling = rule, .out = &out }});
+         return .{ .first = out[0], .kept = kept };
+     }
+@@ -1013,10 +1013,13 @@ pub const Engine = struct {
+ 
+     /// `rows` rows of this rank's logits at `logits` with the tokens `mask` (rows x the grammar's words, over the whole
+     /// vocabulary) does not allow set to -inf: Python's `constraint.mask(logits, window, vocab_offset)`.
+-    fn maskRows(e: *Engine, logits: u64, rows: usize, mask: []const u32) !void {
++    fn maskRows(e: *Engine, i: usize, logits: u64, rows: usize, mask: []const u32) !void {
+         if (rows == 0 or mask.len % rows != 0) return error.InvalidGrammarMasks;
+-        if (e.gmask == null) e.gmask = try grammar.Mask.load(e.stream.d, e.g.vocab);
+-        try e.gmask.?.apply(e.gpa, e.stream, logits, rows, e.g.vocab, @intCast(e.g.vocab_start), mask, mask.len / rows);
++        if (i >= e.gmasks.len) return error.NoSuchWindow;
++        // window i's own bit buffer: the bits are uploaded on the default stream while the engine's stream may still
++        // run another window's mask kernel over that window's buffer
++        if (e.gmasks[i] == null) e.gmasks[i] = try grammar.Mask.load(e.stream.d, e.g.vocab);
++        try e.gmasks[i].?.apply(e.gpa, e.stream, logits, rows, e.g.vocab, @intCast(e.g.vocab_start), mask, mask.len / rows);
+     }
+ 
+     pub fn sampleWindow(e: *Engine, i: usize, s: ?lanes.Sampling, out: []u32) !void {
+@@ -1032,7 +1035,7 @@ pub const Engine = struct {
+         var positions: [64]u64 = undefined;
+         for (0..rows) |r| positions[r] = @as(u64, @intCast(st.pos)) + 1 + @as(u64, r);
+         const rule: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
+-        if (mask.len > 0) try e.maskRows(e.fwd.b.logits + e.round_row0[i] * e.g.vocab * 2, rows, mask);
++        if (mask.len > 0) try e.maskRows(i, e.fwd.b.logits + e.round_row0[i] * e.g.vocab * 2, rows, mask);
+         try e.sampler.samplePacked(&.{.{
+             .logits = e.fwd.b.logits + e.round_row0[i] * e.g.vocab * 2,
+             .positions = positions[0..rows],
+@@ -1041,6 +1044,81 @@ pub const Engine = struct {
+         }});
+     }
+ 
++    /// Every window's draws in one packed sampler call (one gather and one readback for the round, where
++    /// sampleWindow does one per window): `samplings[i]`, `outs[i]` (as many as window i's rows) and `masks[i]`
++    /// (structured output's bits for its rows; empty: none).
++    pub fn sampleWindows(e: *Engine, samplings: []const ?lanes.Sampling, outs: []const []u32, masks: []const []const u32) !void {
++        const n = e.round_n;
++        if (n == 0 or samplings.len != n or outs.len != n or masks.len != n) return error.BadWindow;
++        var parts: [8]sampler.Part = undefined;
++        var positions: [8][64]u64 = undefined;
++        for (0..n) |i| {
++            const rows = e.round_len[i];
++            if (outs[i].len != rows) return error.BadWindow;
++            const st = e.round_state(i);
++            for (0..rows) |r| positions[i][r] = @as(u64, @intCast(st.pos)) + 1 + @as(u64, r);
++            const rule: ?lanes.Sampling = if (samplings[i]) |x| (if (x.temperature > 0) x else null) else null;
++            const logits = e.fwd.b.logits + e.round_row0[i] * e.g.vocab * 2;
++            if (masks[i].len > 0) try e.maskRows(i, logits, rows, masks[i]);
++            parts[i] = .{ .logits = logits, .positions = positions[i][0..rows], .sampling = rule, .out = outs[i] };
++        }
++        try e.sampler.samplePacked(parts[0..n]);
++    }
++
++    /// Several of the round's windows committed at once (commitWindow for each, the GPU work shared): one commit table
++    /// and one replay for the windows cut short of their rows, one table and one conv shift for all, one tap pass
++    /// for the drafter (per window past 64 kept rows).
++    pub fn commitWindows(e: *Engine, idx: []const usize, keeps: []const usize) !void {
++        if (idx.len != keeps.len or idx.len == 0 or idx.len > 8) return error.BadWindow;
++        var table: [8 * 6]i32 = undefined;
++        var cut: [8 * 6]i32 = undefined;
++        var n_cut: usize = 0;
++        var kept: usize = 0;
++        for (idx, keeps, 0..) |i, keep, k| {
++            if (i >= e.round_n) return error.NoSuchWindow;
++            if (e.committed[i]) return error.AlreadyCommitted;
++            for (idx[0..k]) |j| if (j == i) return error.AlreadyCommitted;
++            const rows = e.round_len[i];
++            if (keep < 1 or keep > rows) return error.BadKeep;
++            const st = e.round_state(i);
++            if (e.drafter) |p| if (p.multi.contexts[st.slot].end != st.pos) return error.BadDraftCommit;
++            const row = [_]i32{
++                @intCast(e.round_row0[i]),
++                @intCast(rows),
++                @intCast(st.slot),
++                @intCast(st.cur[0]),
++                @intCast(st.slot),
++                @intCast(keep),
++            };
++            @memcpy(table[k * 6 ..][0..6], &row);
++            if (keep < rows) {
++                @memcpy(cut[n_cut * 6 ..][0..6], &row);
++                n_cut += 1;
++            }
++            kept += keep;
++        }
++        if (n_cut > 0) {
++            try e.stageCommit(cut[0 .. n_cut * 6]);
++            try e.replay();
++        }
++        try e.stageCommit(table[0 .. idx.len * 6]);
++        try e.convShift();
++        var items: [8]dflash.Multi.TapItem = undefined;
++        for (idx, keeps, 0..) |i, keep, k| {
++            const st = e.round_state(i);
++            try e.setPosition(st, st.pos + keep);
++            st.pos += keep;
++            st.cur = @splat(1 - st.cur[0]);
++            e.committed[i] = true;
++            items[k] = .{ .slot = st.slot, .row0 = e.round_row0[i], .keep = keep };
++        }
++        if (e.drafter) |p| {
++            if (kept <= 64) {
++                try p.multi.commitTaps(items[0..idx.len], e.fwd.b.taps, e.fwd.b.rows);
++            } else for (items[0..idx.len]) |it| try e.absorbTaps(p, it.slot, e.fwd.b.taps, e.fwd.b.rows, it.row0, it.keep);
++        }
++    }
++
+     pub fn commitWindow(e: *Engine, i: usize, keep: usize) !void {
+         if (i >= e.round_n) return error.NoSuchWindow;
+         if (e.committed[i]) return error.AlreadyCommitted;
+@@ -1132,6 +1210,8 @@ test "round and lane contracts compile against the GLM engine" {
+     _ = rounds.Round(Engine).commit;
+     _ = @import("cuda_serving.zig").Serving(Engine).init;
+     _ = Engine.verifyMany;
++    _ = Engine.sampleWindows;
++    _ = Engine.commitWindows;
+     _ = Engine.draftMany;
+     _ = Engine.seqBytes;
+ }
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index d6e76d4..23aa36e 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -926,9 +926,21 @@ pub fn Lanes(comptime E: type) type {
+             const n = windows.len;
+             e.verifyMany(wins[0..n]) catch |err| return self.lost("a round's forward", err);
+             self.round += 1;
++            if (comptime @hasDecl(E, "sampleWindows")) {
++                // every window's draws in one sampler call: one gather and one readback for the round
++                var samplings: [max_streams]?lanes.Sampling = undefined;
++                var outs: [max_streams][]u32 = undefined;
++                var masks: [max_streams][]const u32 = undefined;
++                for (windows, out, 0..) |w, o, i| {
++                    samplings[i] = w.stream.sampling;
++                    outs[i] = o.sampled[0..w.rows()];
++                    masks[i] = if (comptime masked) w.masks else &.{};
++                }
++                e.sampleWindows(samplings[0..n], outs[0..n], masks[0..n]) catch |err| return self.lost("the round's draws", err);
++            }
+             for (windows, out, ls[0..n], 0..) |w, o, l, i| {
+                 const rows = w.rows();
+-                (if (comptime masked) e.sampleWindowMasked(i, w.stream.sampling, o.sampled[0..rows], w.masks) else e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows])) catch |err| return self.lost("a window's draws", err);
++                if (comptime !@hasDecl(E, "sampleWindows")) (if (comptime masked) e.sampleWindowMasked(i, w.stream.sampling, o.sampled[0..rows], w.masks) else e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows])) catch |err| return self.lost("a window's draws", err);
+                 @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
+                 l.held_n = 0;
+                 l.pending_rows = rows;
+@@ -962,16 +974,36 @@ pub fn Lanes(comptime E: type) type {
+         fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+             const self = of(ptr);
+             if (windows.len != paths.len) return error.PathsWindowsMismatch;
++            // every window checked before any is touched: a refused batch leaves them all pending
++            var ls: [max_streams]*Lane = undefined;
++            var idx: [max_streams]usize = undefined;
++            var keeps: [max_streams]usize = undefined;
++            var n: usize = 0;
+             for (windows, paths) |w, path| {
+                 if (path.len == 0) return error.EmptyPath;
+                 for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
+                 const l = self.lanes.get(w.stream) orelse return error.UnknownStream;
+                 const rows = l.pending_rows orelse continue;
+                 if (path.len > rows) return error.PathTooLong;
+-                l.pending_rows = null;
+-                // a commit runs no collective, but a failed one leaves this rank's caches apart from the other's
+-                self.e.commitWindow(l.index, path.len) catch |err| return self.lost("a window's commit", err);
++                if (n == max_streams) return error.TooManyStreams;
++                for (ls[0..n]) |seen| if (seen == l) return error.StreamTwiceInRound;
++                ls[n] = l;
++                idx[n] = l.index;
++                keeps[n] = path.len;
++                n += 1;
+             }
++            for (ls[0..n]) |l| l.pending_rows = null;
++            // a commit runs no collective, but a failed one leaves this rank's caches apart from the other's
++            try self.commitAll(idx[0..n], keeps[0..n]);
++        }
++
++        /// The windows' commits: at once when the engine can (one commit table, one replay, one conv shift, one tap
++        /// pass for the round), else one by one.
++        fn commitAll(self: *Self, idx: []const usize, keeps: []const usize) !void {
++            if (idx.len == 0) return;
++            if (comptime @hasDecl(E, "commitWindows")) {
++                self.e.commitWindows(idx, keeps) catch |err| return self.lost("the windows' commit", err);
++            } else for (idx, keeps) |i, k| self.e.commitWindow(i, k) catch |err| return self.lost("a window's commit", err);
+         }
+ 
+         /// Every request's head absorbs its kept rows with the token after each (after a prompt: its last row and
+@@ -989,14 +1021,23 @@ pub fn Lanes(comptime E: type) type {
+             var firsts: [max_streams][1]u32 = undefined;
+             var ls: [max_streams]*Lane = undefined;
+             const conf = self.confidenceNow();
+-            for (requests, 0..) |r, i| {
++            // a shared round drafts before it keeps: the kept rows are these requests', commit them first (at once)
++            var idx: [max_streams]usize = undefined;
++            var keeps: [max_streams]usize = undefined;
++            var n: usize = 0;
++            for (requests) |r| {
+                 const l = self.lanes.get(r.stream).?;
+-                ls[i] = l;
+-                // a shared round drafts before it keeps: the kept rows are this request's, commit them first
+                 if (r.rows) |rows| if (l.pending_rows) |_| {
+                     l.pending_rows = null;
+-                    e.commitWindow(l.index, rows.len) catch |err| return self.lost("a window's commit", err);
++                    idx[n] = l.index;
++                    keeps[n] = rows.len;
++                    n += 1;
+                 };
++            }
++            try self.commitAll(idx[0..n], keeps[0..n]);
++            for (requests, 0..) |r, i| {
++                const l = self.lanes.get(r.stream).?;
++                ls[i] = l;
+                 l.held_n = 0;
+                 const depth = @min(r.depth, self.window - 1);
+                 if (r.rows == null) firsts[i] = .{self.value(r.first.?)};
+@@ -1253,6 +1294,9 @@ test "GLM lane backend interleaves eight streams and preserves serial keyed outp
+     defer for (&streams) |*s| s.deinit(gpa);
+     for (&streams) |*s| try loop.addStream(s);
+     while (loop.activeCount() != 0) try loop.step();
++    // the round's draws and commits went through the batched calls, once a round (the per-window ones are the fallback)
++    try std.testing.expectEqual(t.rounds, t.batched_draws);
++    try std.testing.expect(t.batched_commits >= 1 and t.batched_commits <= t.rounds);
+     try std.testing.expectEqual(@as(usize, 0), t.seqs);
+     for (&streams) |*s| {
+         var serial: Toy = .{ .gpa = gpa };
+@@ -1729,3 +1773,50 @@ test "a save refused on rank 1 only is kept by no rank; both go on from the live
+ test "a save refused on rank 0 only is kept by no rank; both go on from the live rows and keep at the next mark" {
+     try lateRefusal(0);
+ }
++
++test "a keep batch with a bad path commits nothing and leaves every window pending; the next good batch commits them" {
++    const gpa = std.testing.allocator;
++    const Toy = @import("flashnext").lane_backend.Toy;
++    var t: Toy = .{ .gpa = gpa };
++    var b = Lanes(Toy).init(gpa, &t, true, 4096, 8);
++    defer b.deinit();
++    b.streams = 2;
++    const B = Lanes(Toy);
++    const prompt = [_]u32{ 5, 6, 7, 8, 9, 10, 11, 12 };
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 8 });
++    defer s1.deinit(gpa);
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 8 });
++    defer s2.deinit(gpa);
++    try B.prefillFn(&b, &s1);
++    try B.prefillFn(&b, &s2);
++    const t1 = try firstToken(B, &b, &s1);
++    const t2 = try firstToken(B, &b, &s2);
++    // a round of two windows: the pending token and two forced drafts each
++    const d1 = [_]u32{ 1, 2 };
++    const d2 = [_]u32{ 3, 4 };
++    const pos = [_]u64{ prompt.len + 1, prompt.len + 2, prompt.len + 3 };
++    const windows = [_]be.Window{
++        .{ .stream = &s1, .pending = t1, .held = 0, .tokens = &d1, .parents = null, .positions = &pos },
++        .{ .stream = &s2, .pending = t2, .held = 0, .tokens = &d2, .parents = null, .positions = &pos },
++    };
++    var out: [2]be.Verified = undefined;
++    var sampled: [2][3]u32 = undefined;
++    var drafts: [2][2]u32 = undefined;
++    for (&out, 0..) |*o, i| o.* = .{ .sampled = &sampled[i], .drafts = &drafts[i] };
++    try B.verifyFn(&b, &windows, &out);
++    const commits = t.batched_commits;
++    // the second path is empty: nothing commits, both windows stay pending
++    const good = [_]u32{ 0, 1 };
++    try std.testing.expectError(error.EmptyPath, B.keepFn(&b, &windows, &.{ &good, &.{} }));
++    try std.testing.expectEqual(commits, t.batched_commits);
++    try std.testing.expectEqual(@as(?usize, 3), b.lanes.get(&s1).?.pending_rows);
++    try std.testing.expectEqual(@as(?usize, 3), b.lanes.get(&s2).?.pending_rows);
++    // the good batch commits both at once
++    const one = [_]u32{0};
++    try B.keepFn(&b, &windows, &.{ &good, &one });
++    try std.testing.expectEqual(commits + 1, t.batched_commits);
++    try std.testing.expectEqual(@as(?usize, null), b.lanes.get(&s1).?.pending_rows);
++    try std.testing.expectEqual(@as(?usize, null), b.lanes.get(&s2).?.pending_rows);
++    B.releaseFn(&b, &s1);
++    B.releaseFn(&b, &s2);
++}
