@@ -41,7 +41,7 @@ Zig port; start.sh's memory check counts the parked pages the same way
 (scripts/memavail.sh; ZIG_HAS parked, in its default). Applies after 0013; independent of the other 0014
 fixes (any order). Robert's GLM port series carries the same change;
 whichever lands first, the other copy is an exact duplicate (git apply
---reverse --check passes). Credits: Robert Wojciechowski (wojo).
+--reverse --check passes). Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
 
 diff --git a/zig/src/families/glm_cuda/cuda_cache_plan.zig b/zig/src/families/glm_cuda/cuda_cache_plan.zig
 index 6923ef2..b3d38cd 100644
