@@ -1,5 +1,5 @@
 # The memory a Spark can give a starting rank, counted the way the engine's startup budget counts it: MemAvailable plus
-# the pages parked on the kernel's per-CPU free lists (wojo's GLM patch 0119, PR #149; zig/patches/0014-zig-parked-pages
+# the pages parked on the kernel's per-CPU free lists (wojo's GLM patch 0119, PR #149; zig/patches' parked-pages patch
 # for the Zig engine; the same rule as the DeepSeek recipe's scripts/memavail.sh, from which this is copied).
 # start.sh counts them only for an engine that does (parked_counted below), and reads `free -g` as before otherwise.
 # Sourced by scripts/nodes.sh; start.sh sends mem_counting to each worker over ssh (self-contained: awk and getconf only).
@@ -71,15 +71,11 @@ mem_avail_gb() {
   fi
 }
 
-# parked_counted: the engine this image runs counts the parked pages in its startup budget: ENGINE=zig with
-# zig/patches' parked-pages patch (0014-zig-parked-pages.patch), ENGINE=python with patches/'s
-# 0119-cuda-budget-parked-pages.patch (PR #149). start.sh's memory check counts them only then, so that it never
-# expects more memory than the engine will budget
+# parked_counted: the engine this image runs counts the parked pages in its startup budget: ENGINE=zig with `parked` in
+# ZIG_HAS (start.sh's default: zig/patches carries the parked-pages patch, whatever its number or name), ENGINE=python
+# with patches/'s 0119-cuda-budget-parked-pages.patch (PR #149). start.sh's memory check counts them only then, so that
+# it never expects more memory than the engine will budget
 parked_counted() {
-  local r="${_cfg_root:-.}" p
-  if [[ "${ENGINE:-}" == zig ]]; then
-    for p in "$r"/zig/patches/*-zig-parked-pages.patch; do [[ -e "$p" ]] && return 0; done
-    return 1
-  fi
-  [[ -e "$r/patches/0119-cuda-budget-parked-pages.patch" ]]
+  if [[ "${ENGINE:-}" == zig ]]; then [[ " ${ZIG_HAS:-} " == *" parked "* ]]; return; fi
+  [[ -e "${_cfg_root:-.}/patches/0119-cuda-budget-parked-pages.patch" ]]
 }

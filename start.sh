@@ -111,8 +111,10 @@ if [[ "$ENGINE" == zig ]]; then
   # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
   # cannot do yet is refused here, before anything is stopped, never silently dropped
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
-  # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image.
-  ZIG_HAS="${ZIG_HAS:-mtp displaykv}"
+  # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image. parked: the
+  # engine's startup budget counts the pages parked on the per-CPU free lists (zig/patches' parked-pages patch), so the
+  # memory check below counts them too
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv parked}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
@@ -343,8 +345,8 @@ fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
 # Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
-# MemAvailable for a minute or two. An engine that counts it in its budget (parked_counted: ENGINE=zig with zig/patches'
-# parked-pages patch, ENGINE=python with patches/'s 0119) has it, and then this check counts it too: mem_avail_gb
+# MemAvailable for a minute or two. An engine that counts it in its budget (parked_counted: ENGINE=zig with `parked` in
+# ZIG_HAS, ENGINE=python with patches/'s 0119) has it, and then this check counts it too: mem_avail_gb
 # (scripts/memavail.sh), here and on each worker. Otherwise both read MemAvailable alone, as `free -g` shows it.
 parked_note() { awk -v p="${1:-0}" 'BEGIN { if (p + 0 >= 0.1) printf " (%.1f of it parked on the per-CPU free lists)", p }'; }
 PARKED=0; ! parked_counted || PARKED=1

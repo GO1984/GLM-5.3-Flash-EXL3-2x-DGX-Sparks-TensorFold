@@ -101,15 +101,24 @@ case_ "start check: mem_avail_gb runs on a worker as start.sh sends it (declare 
   if [[ -r /proc/meminfo ]]; then [[ \"\$l\" =~ ^[0-9]+\\ [0-9]+\\.[0-9]\$ ]] || { echo \"[\$l]\"; exit 1; }; fi"
 
 # ---- parked_counted: only an engine whose budget counts the parked pages
-case_ "start check: parked_counted is the zig engine with its parked-pages patch, the python one with patches/'s 0119" "
-  mkdir -p '$tmp/r-none/zig/patches' '$tmp/r-none/patches' '$tmp/r-zig/zig/patches' '$tmp/r-py/patches'
-  : > '$tmp/r-zig/zig/patches/0014-zig-parked-pages.patch'; : > '$tmp/r-py/patches/0119-cuda-budget-parked-pages.patch'
-  ( ENGINE=zig; _cfg_root='$tmp/r-zig'; parked_counted ) || { echo 'zig not counted with its patch'; exit 1; }
-  ( ENGINE=zig; _cfg_root='$tmp/r-none'; ! parked_counted ) || { echo 'zig counted without the patch'; exit 1; }
-  ( ENGINE=zig; _cfg_root='$tmp/r-py'; ! parked_counted ) || { echo 'zig counted by the python patch'; exit 1; }
-  ( ENGINE=python; _cfg_root='$tmp/r-py'; parked_counted ) || { echo 'python not counted with 0119'; exit 1; }
-  ( ENGINE=python; _cfg_root='$tmp/r-zig'; ! parked_counted ) || { echo 'python counted by the zig patch'; exit 1; }
-  ( ENGINE=zig; _cfg_root='$root'; parked_counted ) || { echo 'this recipe: zig/patches has no parked-pages patch'; exit 1; }"
+case_ "start check: parked_counted is the zig engine with parked in ZIG_HAS, the python one with patches/'s 0119" "
+  mkdir -p '$tmp/r-none/patches' '$tmp/r-py/patches'; : > '$tmp/r-py/patches/0119-cuda-budget-parked-pages.patch'
+  ( ENGINE=zig; ZIG_HAS='mtp displaykv parked'; parked_counted ) || { echo 'zig not counted with parked'; exit 1; }
+  ( ENGINE=zig; ZIG_HAS=parked; parked_counted ) || { echo 'zig not counted with parked alone'; exit 1; }
+  ( ENGINE=zig; ZIG_HAS='mtp displaykv'; ! parked_counted ) || { echo 'zig counted without parked'; exit 1; }
+  ( ENGINE=zig; ZIG_HAS='mtp parked2'; ! parked_counted ) || { echo 'zig counted by another name'; exit 1; }
+  ( ENGINE=zig; unset ZIG_HAS; ! parked_counted ) || { echo 'zig counted without ZIG_HAS'; exit 1; }
+  ( ENGINE=zig; ZIG_HAS='mtp displaykv'; _cfg_root='$tmp/r-py'; ! parked_counted ) || { echo 'zig counted by the python patch'; exit 1; }
+  ( ENGINE=python; ZIG_HAS=parked; _cfg_root='$tmp/r-none'; ! parked_counted ) || { echo 'python counted by ZIG_HAS'; exit 1; }
+  ( ENGINE=python; _cfg_root='$tmp/r-py'; parked_counted ) || { echo 'python not counted with 0119'; exit 1; }"
+# start.sh's default ZIG_HAS (its line ZIG_HAS="${ZIG_HAS:-...}")
+zig_has_default() { sed -n 's/^ *ZIG_HAS="\${ZIG_HAS:-\(.*\)}"$/\1/p' "$1/start.sh"; }
+case_ "start check: this recipe's zig engine counts them: start.sh's default ZIG_HAS names parked, and a zig/patches patch adds the engine's reading (by content, whatever its number or name)" "
+  $(declare -f zig_has_default)
+  d=\$(zig_has_default '$root')
+  [[ -n \"\$d\" ]] || { echo 'start.sh sets no ZIG_HAS default'; exit 1; }
+  ( ENGINE=zig; ZIG_HAS=\$d; parked_counted ) || { echo \"start.sh's default ZIG_HAS (\$d) lacks parked\"; exit 1; }
+  grep -q '^+pub fn parkedBytes(' '$root'/zig/patches/*.patch || { echo 'no zig/patches patch adds parkedBytes'; exit 1; }"
 
 # ---- what start.sh and scripts/nodes.sh wire up
 check_in() { grep -qF -- "$2" "$root/$1" || { echo "$1 lacks: $2"; return 1; }; }
