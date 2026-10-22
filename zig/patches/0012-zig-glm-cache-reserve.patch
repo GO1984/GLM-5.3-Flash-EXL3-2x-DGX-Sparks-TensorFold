@@ -1,0 +1,617 @@
+zig: the prompt cache's keep floor and refused saves
+
+The kept-state budget stopped at MemAvailable - MEMORY_RESERVE_GIB, so the
+cache filled to the reserve itself and the next keep took one rank under it:
+takeSnap returned BelowMemoryReserve after the ranks had agreed on the keep,
+and the agreement made it fatal ("a prompt's prefill failed after the ranks
+agreed (BelowMemoryReserve); exiting"). Seen on a TP=2 pair with
+--prompt-cache-gib 8 (a 5.3 GiB budget after the reserve) and
+TF_GLM_CACHE_ENTRIES=32, after a few hundred prompts.
+
+- cuda_cache_plan: TF_GLM_KEEP_HEADROOM_GIB (2 GiB by default; 0 turns it
+  off): what the kept states' budget leaves free above the reserve for the
+  prompts' own buffers as they grow. The budget is the asked size, at most
+  what is free at start minus the reserve and this headroom; the keep floor
+  (where a save is refused) stays the reserve, so a full cache still leaves
+  the headroom to the prompts. The startup line says both.
+- cuda_lanes pass: before each keep the ranks agree that every rank has room
+  for the state (Engine.keepFits, from /proc/meminfo); without it the mark is
+  skipped on all ranks. After the keep's prefill the ranks agree on the save's
+  outcome too: a save the engine refused on any rank (memory went in between,
+  or no device memory) is kept by none, the other rank frees the state it
+  took, and every rank goes on from the rows it just ran (`live_from`): no
+  restore, no rows twice. A rank keeping alone would be no use: a resume
+  needs the state on all ranks, and the ranks' segments must match.
+- cuda_engine prefillWith: a refused save keeps nothing and warns instead of
+  failing the prefill; `live_from` continues from the sequence's own rows;
+  a prefill from the start on a sequence that ran rows zeroes its recurrent
+  state first, on the engine's stream (position 0 does not clear it by
+  itself). Other errors still fail the prefill.
+- cuda_native: with an MTP head loaded the cache stays off (the head's taps
+  count from the prompt's start, so a continuation would misplace them; a
+  log line says so). The default configuration, DFlash2 drafts without an
+  MTP head, is unaffected.
+- tests (host, a mock engine under the lanes): the planner's headroom
+  (parsing, the floor at an exact fit and one byte under, the budget, the
+  launch defaults keep theirs); on two ranks: the room refusal, and one
+  rank's late refusal in each direction, with both ranks' segment traces
+  equal (every row once), both replies the fresh prompt's, kept lists
+  equal, no leaked state; on one rank: the engine's refusal from cold and
+  with an earlier state kept (every row once, the reply the fresh one).
+  The engine's own `live_from` is beyond the host suite. Live TP=2 runs on
+  the image built from this patch (--prompt-cache-gib 8, 32 entries): with
+  the default headroom no keep was refused; with the headroom off the room
+  check skipped 127 keeps at the reserve and the server ran on; no save was
+  refused after the agreement in either, so `live_from` ran only in the
+  host tests. Every reply in both runs equals the Python engine's (428
+  sweep cases, 56 main-set requests). The cold reset of a used sequence is
+  defensive: the lanes never prefill a used sequence from the start (they
+  pass `live_from` or `resume_from`), so no path exercises it; it has no
+  test.
+
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index fcfd5cd..6e3b066 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -1142,7 +1142,7 @@ pub const Toy = struct {
+     // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
+ 
+     pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
+ 
+     /// The prompt from 0, or from a kept state of this sequence (its first pos rows the prompt's), keeping the
+diff --git a/zig/src/families/glm_cuda/cuda_cache_plan.zig b/zig/src/families/glm_cuda/cuda_cache_plan.zig
+index 2cbb132..6923ef2 100644
+--- a/zig/src/families/glm_cuda/cuda_cache_plan.zig
++++ b/zig/src/families/glm_cuda/cuda_cache_plan.zig
+@@ -27,6 +27,7 @@ pub const Env = struct {
+     shared_prefix: ?[]const u8 = null, // TF_GLM_SHARED_PREFIX (0 off; 1 or on: 256; or 16 and more)
+     cache_gib: ?[]const u8 = null, // TF_GLM_CACHE_GIB (3; the launch scripts' KV_POOL_GIB)
+     reserve_gib: ?[]const u8 = null, // TENSORFOLD_MEMORY_RESERVE_GIB (MEMORY_RESERVE_GIB)
++    headroom_gib: ?[]const u8 = null, // TF_GLM_KEEP_HEADROOM_GIB (2): what the budget leaves free above the reserve, for the prompts' own buffers
+ };
+ 
+ pub const shared_default: u32 = 256;
+@@ -34,7 +35,7 @@ pub const shared_min: u32 = 16;
+ /// Kept states never take more than this share of the budget by their count (engine.kept_entries).
+ pub const ceiling_pct: f64 = 75.0;
+ 
+-pub const Error = error{ BadEntries, BadSharePct, BadKeptBytes, BadPerChat, BadSharedPrefix, BadCacheGib, BadReserve };
++pub const Error = error{ BadEntries, BadSharePct, BadKeptBytes, BadPerChat, BadSharedPrefix, BadCacheGib, BadReserve, BadHeadroom };
+ 
+ fn trimmed(v: ?[]const u8) []const u8 {
+     return std.mem.trim(u8, v orelse "", " \t\r\n");
+@@ -76,6 +77,18 @@ pub fn keptBytesCap(v: ?[]const u8) Error!u64 {
+     return if (g <= 0) 0 else @intFromFloat(g * gib);
+ }
+ 
++/// TF_GLM_KEEP_HEADROOM_GIB in bytes: what the kept states' budget leaves free above the memory reserve, for the prompts'
++/// own buffers as they grow (2 GiB by default; 0: none). The budget stops that far above the reserve; the saves stop at
++/// the reserve itself, and a keep that would cross it is refused on every rank before the ranks agree to it (cuda_lanes
++/// pass), never a failed prefill.
++pub fn keepHeadroom(v: ?[]const u8) Error!u64 {
++    const t = trimmed(v);
++    if (t.len == 0) return 2 << 30;
++    const g = std.fmt.parseFloat(f64, t) catch return error.BadHeadroom;
++    if (!std.math.isFinite(g) or g < 0) return error.BadHeadroom;
++    return @intFromFloat(@min(g * gib, 1e18));
++}
++
+ /// TF_GLM_CACHE_ENTRIES (at least 1; default 8).
+ pub fn cacheEntries(v: ?[]const u8) Error!u32 {
+     const t = trimmed(v);
+@@ -111,7 +124,7 @@ pub fn keptEntries(configured: u32, share_pct: f64, budget: u64, state: u64) Ent
+ }
+ 
+ /// What memory the kept states may take: TF_GLM_CACHE_GIB (or --prompt-cache-gib), less what the machine leaves after
+-/// the reserve (MemAvailable now minus MEMORY_RESERVE_GIB).
++/// the reserve (MemAvailable now minus MEMORY_RESERVE_GIB, less the keep headroom: `plan` passes reserve + headroom).
+ pub fn budgetBytes(asked_gib: ?f64, env_gib: ?[]const u8, available: u64, reserve: u64) Error!u64 {
+     const wanted: f64 = if (asked_gib) |g| g else blk: {
+         const t = trimmed(env_gib);
+@@ -174,6 +187,8 @@ pub const Plan = struct {
+     per_chat: u32,
+     shared_least: u32,
+     reserve: u64,
++    /// the keep headroom (keepHeadroom): the budget stops at reserve + headroom; the keep floor stays the reserve
++    headroom: u64,
+     entries_capped: bool,
+     share_pct: f64,
+ };
+@@ -181,7 +196,8 @@ pub const Plan = struct {
+ /// `state`: one kept state's fixed bytes (recurrent states, conv windows, rings, the drafter's window).
+ pub fn plan(env: Env, asked_gib: ?f64, mem: MemInfo, state: u64) Error!Plan {
+     const reserve = try reserveBytes(env.reserve_gib, mem.total);
+-    const budget = try budgetBytes(asked_gib, env.cache_gib, mem.available, reserve);
++    const headroom = try keepHeadroom(env.headroom_gib);
++    const budget = try budgetBytes(asked_gib, env.cache_gib, mem.available, reserve +| headroom);
+     const pct = try sharePct(env.share_pct);
+     const n = keptEntries(try cacheEntries(env.entries), pct, budget, state);
+     return .{
+@@ -191,6 +207,7 @@ pub fn plan(env: Env, asked_gib: ?f64, mem: MemInfo, state: u64) Error!Plan {
+         .per_chat = try keepPerChat(env.per_chat),
+         .shared_least = try sharedPrefix(env.shared_prefix),
+         .reserve = reserve,
++        .headroom = headroom,
+         .entries_capped = n.capped,
+         .share_pct = pct,
+     };
+@@ -270,3 +287,30 @@ test "plan: the recipe's launch defaults" {
+     try std.testing.expect(!p.entries_capped);
+     try std.testing.expect(meminfo("MemTotal: 1 kB\n") == null);
+ }
++
++test "the keep headroom: the budget stops that far above the reserve" {
++    const g: u64 = 1 << 30;
++    try std.testing.expectEqual(@as(u64, 2 * g), try keepHeadroom(null));
++    try std.testing.expectEqual(@as(u64, 0), try keepHeadroom("0"));
++    try std.testing.expectEqual(g / 2, try keepHeadroom("0.5"));
++    try std.testing.expectError(error.BadHeadroom, keepHeadroom("-1"));
++    try std.testing.expectError(error.BadHeadroom, keepHeadroom("some"));
++    try std.testing.expectError(error.BadHeadroom, keepHeadroom("inf"));
++    try std.testing.expectError(error.BadHeadroom, keepHeadroom("nan"));
++    try std.testing.expectEqual(@as(u64, 1_000_000_000_000_000_000), try keepHeadroom("1e12")); // capped, no overflow
++    // the floor: a state that leaves exactly the floor fits, one byte more does not
++    try std.testing.expect(fits(100, 60, 40));
++    try std.testing.expect(!fits(99, 60, 40));
++    try std.testing.expect(fits(100, 0, 100));
++    // ~22.9 GiB available, 19.6 reserved: 8 GiB asked gives ~1.3 GiB with the 2 GiB headroom, ~3.3 without it
++    const mem = meminfo("MemTotal:  126000000 kB\nMemFree: 1 kB\nMemAvailable: 24000000 kB\n").?;
++    const p = try plan(.{ .reserve_gib = "19.6" }, 8, mem, 100 << 20);
++    try std.testing.expectEqual(@as(u64, 2 * g), p.headroom);
++    try std.testing.expect(p.budget > g and p.budget < 2 * g);
++    const p0 = try plan(.{ .reserve_gib = "19.6", .headroom_gib = "0" }, 8, mem, 100 << 20);
++    try std.testing.expectEqual(@as(u64, 0), p0.headroom);
++    try std.testing.expect(p0.budget > 3 * g and p0.budget < 4 * g);
++    // the launch defaults keep their budget: 100 GiB free leaves room for both
++    const big = meminfo("MemTotal:  126000000 kB\nMemFree: 1 kB\nMemAvailable: 100000000 kB\n").?;
++    try std.testing.expectEqual(@as(u64, 12 * g + g / 2), (try plan(.{ .cache_gib = "12.5", .reserve_gib = "14.5" }, null, big, 100 << 20)).budget);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index f8dd150..9e857b4 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -67,7 +67,9 @@ pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf:
+ const SpillJob = struct { snap: *Snap, tokens: []u32, at: u32, key: u64 };
+ /// `mask`: structured output's bits for the first token (one row, the grammar's words); empty: unconstrained.
+ /// `media`: picture and clip rows for this prompt.
+-pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++/// `live_from`: the bound sequence stands at this position with live rows and no snapshot (a refused save, cuda_lanes
++/// pass): the prefill goes on from there, restoring nothing. `resume_from` and `live_from` exclude each other.
++pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+ pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
+ 
+ /// A prompt's feature rows while it prefills: the prompt rows they replace (host copy, ascending) and the device
+@@ -475,16 +477,21 @@ pub const Engine = struct {
+         errdefer e.pool.remove(eid) catch unreachable;
+         const base = (try e.pool.get(eid)).base;
+         e.seqs[slot] = .{ .slot = slot, .st = try state.State.bind(e.slots, e.caches, slot, base, extent), .alive = true, .eid = eid };
+-        const st = &e.seqs[slot].st;
++        try e.zeroState(&e.seqs[slot].st);
++        e.used[slot] = true;
++        e.pool_free.store(e.pool.freeRows(), .release);
++        return &e.seqs[slot];
++    }
++
++    /// The recurrent and convolution state of a sequence at its start (zero), and MTP's cursor. The clears go on the
++    /// engine's stream, after the rows a used sequence may still have in flight there and before the next prefill's.
++    fn zeroState(e: *Engine, st: *state.State) !void {
+         const n = state.Slots.layout(e.g, 1, e.slots.rows);
+         const rec: cuda.DeviceBuffer = .{ .d = e.stream.d, .ptr = st.fixed.rec, .len = n[0] };
+         const conv: cuda.DeviceBuffer = .{ .d = e.stream.d, .ptr = st.fixed.conv, .len = n[1] };
+-        try rec.fill8(0, null);
+-        try conv.fill8(0, null);
++        try rec.fill8(0, e.stream.handle);
++        try conv.fill8(0, e.stream.handle);
+         if (e.mtp) |*m| m.cursor = .{};
+-        e.used[slot] = true;
+-        e.pool_free.store(e.pool.freeRows(), .release);
+-        return &e.seqs[slot];
+     }
+ 
+     pub fn freeSeq(e: *Engine, s: *Seq) void {
+@@ -535,10 +542,20 @@ pub const Engine = struct {
+             d.* = @intCast(t);
+         }
+         var begin: usize = 0;
+-        if (o.resume_from) |snap| {
++        if (o.live_from) |p| {
++            // the sequence's own rows up to p (a refused save left it there): no restore
++            if (o.resume_from != null or p == 0 or p >= prompt.len or p % 64 != 0 or st.pos != p) return error.ResumeMustExtend;
++            begin = p;
++        } else if (o.resume_from) |snap| {
+             if (snap.pos == 0 or snap.pos >= prompt.len or snap.pos % 64 != 0) return error.ResumeMustExtend;
+             if (!(s.tag == snap.id and st.pos == snap.pos)) try e.restoreSnap(s, snap);
+             begin = snap.pos;
++        } else if (st.pos != 0) {
++            // from the start on a sequence that ran rows already: its recurrent state is the start's again (position
++            // 0 does not clear it by itself: the KDA kernels read the state they are given)
++            try e.zeroState(st);
++            st.pos = 0;
++            s.tag = 0;
+         }
+         e.prompt_tokens = prompt;
+         e.prompt_at = 0;
+@@ -557,7 +574,16 @@ pub const Engine = struct {
+         if (o.keep_at) |k| if (k > begin) {
+             _ = try prefill_loop.run(&e.pe, &st.cur, .{ .tokens = ids[0..k], .begin = begin, .limit = e.prefill_rows, .head = false, .tap_ctx = e, .on_taps = promptTaps });
+             st.pos = k;
+-            kept = try e.takeSnap(s, k);
++            // the save may be refused (the keep floor, or no device memory): never the prompt, which goes on from its
++            // live rows (the lanes continue from them, `live_from`; the ranks agreed on this keep from their free
++            // memory first, cuda_lanes pass, so this is the rare case of memory going in between)
++            kept = e.takeSnap(s, k) catch |err| switch (err) {
++                error.BelowMemoryReserve, error.OutOfDeviceMemory => blk: {
++                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k, @errorName(err) });
++                    break :blk null;
++                },
++                else => return err,
++            };
+             begin = k;
+         };
+         if (begin == prompt.len) return .{ .first = 0, .kept = kept };
+@@ -604,6 +630,15 @@ pub const Engine = struct {
+         return .{ .ptr = e, .copy = copyBytes };
+     }
+ 
++    /// Whether a kept state of `bytes` leaves the keep floor (the memory reserve) alone now: the
++    /// ranks ask this before they agree to keep at a mark, so a save that would cross it is refused on every rank
++    /// instead of failing one rank's prefill after the agreement.
++    pub fn keepFits(e: *const Engine, bytes: u64) bool {
++        if (e.keep_reserve == 0) return true;
++        const m = cache_plan.memNow() orelse return true;
++        return cache_plan.fits(m.available, e.keep_reserve, bytes);
++    }
++
+     /// The bound sequence's state after `at` tokens (its position), copied into a new buffer.
+     pub fn takeSnap(e: *Engine, s: *Seq, at: usize) !*Snap {
+         if (at == 0 or at != s.st.pos or at % 64 != 0) return error.BadKeepPoint;
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index bb8d780..d6e76d4 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -500,6 +500,7 @@ pub fn Lanes(comptime E: type) type {
+             var cur: ?SnapPtr = null; // the state the next segment resumes
+             var owned = false; // `cur` is this pass's own (no Kept holds it)
+             defer if (owned) e.freeSnapshot(cur.?);
++            var live: ?usize = null; // a refused save left the sequence here with live rows: the next segment goes on from them
+             var at: usize = 0;
+             if (from) |k| {
+                 if (k.keeper) |kp| try e.copyPrefix(l.seq, kp, k.snap.pos, k.snap.mtp_len);
+@@ -511,10 +512,31 @@ pub fn Lanes(comptime E: type) type {
+             self.dropTentative();
+             for (s.reuse.marks) |m| {
+                 if (m <= at or m >= ids.len) continue;
+-                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = cur });
++                // a keep at m must leave every rank's keep floor (the memory reserve) alone: the ranks
++                // agree on that before the pass keeps, so a rank that cannot leaves all without it (a state one rank
++                // holds alone is no use: a resume needs it on all), instead of an engine error after the agreement
++                const room = if (comptime @hasDecl(E, "keepFits")) e.keepFits(self.stateBytes(m)) else true;
++                if (!(try self.agreeOn(room))) {
++                    std.log.warn("prompt cache: no state kept at {d} tokens (a rank is at its keep floor)", .{m});
++                    continue;
++                }
++                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = if (live == null) cur else null, .live_from = live });
++                // the save's outcome, agreed too: a rank the engine refused after all holds no state, so none keeps it,
++                // and every rank goes on the same way, from the rows it just ran (no restore, no rows again)
++                if (!(try self.agreeOn(r.kept != null))) {
++                    std.log.warn("prompt cache: no state kept at {d} tokens (a save was refused)", .{m});
++                    if (r.kept) |k| e.freeSnapshot(k);
++                    if (owned) e.freeSnapshot(cur.?);
++                    cur = null;
++                    owned = false;
++                    live = m;
++                    at = m;
++                    continue;
++                }
+                 if (owned) e.freeSnapshot(cur.?);
+                 cur = r.kept.?;
+                 owned = true;
++                live = null;
+                 if (self.keep(l, cur.?, m, ids)) |k| {
+                     owned = false; // the Kept holds it now
+                     try self.tentative.append(self.gpa, .{ .at = m, .kept = k });
+@@ -527,7 +549,7 @@ pub fn Lanes(comptime E: type) type {
+             var bits: ?[]u32 = null;
+             defer if (bits) |m| self.gpa.free(m);
+             const mask: []const u32 = if (comptime masked) try self.firstMask(s, &bits) else &.{};
+-            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = cur, .mask = mask, .media = s.media });
++            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = if (live == null) cur else null, .live_from = live, .mask = mask, .media = s.media });
+             self.endPass();
+             return r.first;
+         }
+@@ -1253,7 +1275,7 @@ const MiniEngine = struct {
+     pub const snap_holds_rows = true;
+     pub const Seq = struct { tokens: std.ArrayList(u32) = .empty };
+     pub const Snap = struct { id: u64, pos: usize, mtp_len: usize = 0, tokens: []u32 };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
+     pub const Window = struct { seq: *Seq, tokens: []const u32 };
+     pub const DraftReq = struct { seq: *Seq };
+@@ -1268,6 +1290,10 @@ const MiniEngine = struct {
+     disk: std.ArrayList(Disk) = .empty,
+     writes: usize = 0,
+     spill_on: bool = false,
++    keep_fits: bool = true, // what keepFits answers: this rank's room for a kept state
++    refuse_keep: bool = false, // prefillWith keeps nothing (a save refused after the agreement)
++    refuse_keep_at: ?usize = null, // prefillWith keeps nothing at this mark only
++    trace: std.ArrayList([2]usize) = .empty, // every prefillWith's rows: [begin, end)
+ 
+     fn hash(tokens: []const u32) u32 {
+         return @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(tokens)));
+@@ -1278,6 +1304,9 @@ const MiniEngine = struct {
+     pub fn snapBytes(_: *const MiniEngine, at: usize) usize {
+         return 1000 + at * 4;
+     }
++    pub fn keepFits(e: *const MiniEngine, _: u64) bool {
++        return e.keep_fits;
++    }
+     pub fn newSeq(e: *MiniEngine, _: usize) !*Seq {
+         const s = try e.gpa.create(Seq);
+         s.* = .{};
+@@ -1309,14 +1338,18 @@ const MiniEngine = struct {
+     }
+     pub fn prefillWith(e: *MiniEngine, prompt: []const u32, _: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
+         const q = e.bound.?;
+-        if (o.resume_from) |snap| {
++        if (o.live_from) |p| {
++            // the sequence's own rows: it must stand exactly there (as the engine checks st.pos)
++            if (o.resume_from != null or q.tokens.items.len != p or !std.mem.eql(u32, q.tokens.items, prompt[0..p])) return error.ResumeMustExtend;
++        } else if (o.resume_from) |snap| {
+             if (snap.pos >= prompt.len or !std.mem.eql(u32, snap.tokens, prompt[0..snap.pos])) return error.ResumeOtherPrompt;
+             q.tokens.clearRetainingCapacity();
+             try q.tokens.appendSlice(e.gpa, snap.tokens);
+             e.resumed += 1;
+-        } else q.tokens.clearRetainingCapacity();
++        } else q.tokens.clearRetainingCapacity(); // the engine's cold reset of a used sequence
++        try e.trace.append(e.gpa, .{ q.tokens.items.len, prompt.len });
+         try q.tokens.appendSlice(e.gpa, prompt[q.tokens.items.len..]);
+-        const kept = if (o.keep_at) |k| try e.snapOf(prompt[0..k]) else null;
++        const kept: ?*Snap = if (o.keep_at) |k| (if (e.refuse_keep or e.refuse_keep_at == k) null else try e.snapOf(prompt[0..k])) else null;
+         return .{ .first = hash(q.tokens.items), .kept = kept };
+     }
+     pub fn commitWindow(_: *MiniEngine, _: usize, _: usize) !void {
+@@ -1352,6 +1385,7 @@ const MiniEngine = struct {
+     fn deinit(e: *MiniEngine) void {
+         for (e.disk.items) |d| e.gpa.free(d.tokens);
+         e.disk.deinit(e.gpa);
++        e.trace.deinit(e.gpa);
+     }
+ };
+ 
+@@ -1514,3 +1548,184 @@ test "a state the store drops inside the pass that kept it is gone from the pass
+     try std.testing.expectEqual(@as(usize, 0), e0.snaps);
+     try std.testing.expectEqual(@as(usize, 0), e1.snaps);
+ }
++
++/// A gate for tests: the ranks' all-gather, with the other rank's vote scripted per ask. A prefill asks once for the
++/// prepare agreement (`agree`), then per mark it would keep at: once for the room (`agreeOn`), and once for the save's
++/// outcome when the room was agreed. `other` holds the other rank's votes in that order, rank 0's asks first, then
++/// rank 1's (the tests run the ranks one after the other).
++const TestGate = struct {
++    other: []const bool,
++    asked: usize = 0,
++    fn agree(ptr: *anyopaque, ok: bool) anyerror!bool {
++        const g: *TestGate = @ptrCast(@alignCast(ptr));
++        const vote = g.other[g.asked];
++        g.asked += 1;
++        return ok and vote;
++    }
++    fn fatal(_: *anyopaque, _: []const u8, _: anyerror) void {}
++};
++
++/// Two ranks on one gate: rank 1 follows rank 0's notes through `sink`.
++const Pair = struct {
++    e0: MiniEngine,
++    e1: MiniEngine,
++    r0: Lanes(MiniEngine),
++    r1: Lanes(MiniEngine),
++    sink: NoteSink,
++    gate: TestGate,
++    fn init(p: *Pair, gpa: std.mem.Allocator, other: []const bool) void {
++        p.e0 = .{ .gpa = gpa };
++        p.e1 = .{ .gpa = gpa };
++        p.r0 = Lanes(MiniEngine).init(gpa, &p.e0, true, 1 << 20, 8);
++        p.r1 = Lanes(MiniEngine).init(gpa, &p.e1, true, 1 << 20, 8);
++        p.r1.follower = true;
++        p.sink = .{ .gpa = gpa };
++        p.r0.notes = .{ .ptr = &p.sink, .send = NoteSink.send };
++        p.gate = .{ .other = other };
++        p.r0.gate = .{ .ptr = &p.gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
++        p.r1.gate = .{ .ptr = &p.gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
++    }
++    fn deinit(p: *Pair) void {
++        p.r0.deinit();
++        p.r1.deinit();
++        p.sink.deinit();
++        p.e0.deinit();
++        p.e1.deinit();
++    }
++    /// Both ranks run the stream's pass; rank 1 takes the notes; both first tokens are the fresh prompt's.
++    fn pass(p: *Pair, s: *lanes.Stream) !void {
++        const B = Lanes(MiniEngine);
++        try B.prefillFn(&p.r0, s);
++        try B.prefillFn(&p.r1, s);
++        try p.sink.take(&p.r1);
++        try std.testing.expectEqual(MiniEngine.hash(s.prompt()), try firstToken(B, &p.r0, s));
++        try std.testing.expectEqual(MiniEngine.hash(s.prompt()), try firstToken(B, &p.r1, s));
++        try std.testing.expectEqualSlices([2]usize, p.e0.trace.items, p.e1.trace.items);
++        B.releaseFn(&p.r0, s);
++        B.releaseFn(&p.r1, s);
++    }
++};
++
++fn testPrompt(seed: u32) [150]u32 {
++    var prompt: [150]u32 = undefined;
++    for (&prompt, 0..) |*t, i| t.* = @intCast((i * seed) % 101);
++    return prompt;
++}
++
++const whole_pass: []const [2]usize = &.{ .{ 0, 64 }, .{ 64, 128 }, .{ 128, 150 } }; // every row once
++
++test "a keep that would cross a rank's keep floor is refused on every rank before the agreement; the pass goes on and keeps again when there is room" {
++    const gpa = std.testing.allocator;
++    var p: Pair = undefined;
++    // rank 0 has no room at either mark: it votes no itself; rank 1 (room) hears that no from the all-gather
++    p.init(gpa, &.{ true, true, true, true, false, false });
++    defer p.deinit();
++    p.e0.keep_fits = false;
++    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
++    const prompt = testPrompt(7);
++    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true }; // the store caps at one, as the existing tests
++    // 1. marks at 64 and 128: every rank asks, no rank keeps, no rows run twice, nothing leaks
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s1.deinit(gpa);
++    try p.pass(&s1);
++    try std.testing.expectEqual(@as(usize, 6), p.gate.asked); // each rank: the prepare agreement and the two rooms
++    try std.testing.expectEqual(@as(usize, 0), adopter.n);
++    try std.testing.expectEqual(@as(usize, 0), p.r0.kept.items.len);
++    try std.testing.expectEqual(@as(usize, 0), p.r1.kept.items.len);
++    try std.testing.expectEqualSlices([2]usize, &.{.{ 0, 150 }}, p.e0.trace.items);
++    try std.testing.expectEqual(@as(usize, 0), p.e0.snaps);
++    try std.testing.expectEqual(@as(usize, 0), p.e1.snaps);
++    // 2. with room on every rank, the next pass keeps at both marks (the store drops the first: one left) and rank 1 follows
++    p.gate.other = &.{ true, true, true, true, true, true, true, true, true, true };
++    p.gate.asked = 0;
++    p.e0.keep_fits = true;
++    p.e0.trace.clearRetainingCapacity();
++    p.e1.trace.clearRetainingCapacity();
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s2.deinit(gpa);
++    try p.pass(&s2);
++    try std.testing.expectEqual(@as(usize, 10), p.gate.asked); // each rank: prepare, then room and outcome at two marks
++    try std.testing.expectEqual(@as(usize, 2), adopter.n);
++    try std.testing.expectEqual(@as(usize, 1), p.r0.kept.items.len);
++    try std.testing.expectEqual(@as(usize, 1), p.r1.kept.items.len);
++    try std.testing.expectEqualSlices([2]usize, whole_pass, p.e0.trace.items);
++}
++
++test "a save the engine refuses leaves the pass going on from the rows it ran: no state, no rows twice, the reply the fresh one; with an earlier state, that one stays" {
++    const gpa = std.testing.allocator;
++    const B = Lanes(MiniEngine);
++    var e0: MiniEngine = .{ .gpa = gpa, .refuse_keep = true };
++    defer e0.deinit();
++    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
++    defer r0.deinit();
++    const hooks = r0.cacheHooks(1 << 30, .{}, 0, 5);
++    const prompt = testPrompt(11);
++    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
++    // 1. both saves refused from cold: the segments go on from the live rows
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s1.deinit(gpa);
++    try B.prefillFn(&r0, &s1);
++    try std.testing.expectEqual(@as(usize, 0), adopter.n);
++    try std.testing.expectEqual(@as(usize, 0), r0.kept.items.len);
++    try std.testing.expectEqualSlices([2]usize, whole_pass, e0.trace.items);
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(B, &r0, &s1));
++    B.releaseFn(&r0, &s1);
++    try std.testing.expectEqual(@as(usize, 0), e0.snaps);
++    // 2. the 64 state kept, the save at 128 refused: the pass goes on live from 128, the 64 state stays kept
++    e0.refuse_keep = false;
++    e0.refuse_keep_at = 128;
++    e0.trace.clearRetainingCapacity();
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s2.deinit(gpa);
++    try B.prefillFn(&r0, &s2);
++    try std.testing.expectEqual(@as(usize, 1), adopter.n);
++    try std.testing.expectEqual(@as(usize, 1), r0.kept.items.len);
++    try std.testing.expectEqualSlices([2]usize, whole_pass, e0.trace.items);
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(B, &r0, &s2));
++    B.releaseFn(&r0, &s2);
++    try std.testing.expectEqual(@as(usize, 1), e0.snaps); // the kept 64 state
++    // 3. nothing refused: both marks keep again
++    e0.refuse_keep_at = null;
++    e0.trace.clearRetainingCapacity();
++    var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s3.deinit(gpa);
++    try B.prefillFn(&r0, &s3);
++    try std.testing.expectEqual(@as(usize, 3), adopter.n);
++    try std.testing.expectEqualSlices([2]usize, whole_pass, e0.trace.items);
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(B, &r0, &s3));
++    B.releaseFn(&r0, &s3);
++}
++
++/// One rank's save refused after the room agreement: the other rank frees the state it took, both go on from the live
++/// rows the same way, and both keep at the next mark.
++fn lateRefusal(refuser: u8) !void {
++    const gpa = std.testing.allocator;
++    var p: Pair = undefined;
++    // each rank: prepare, room at 64, the save at 64, room at 128, the save at 128; the refusing rank votes no itself
++    p.init(gpa, if (refuser == 1) &.{ true, true, false, true, true, true, true, true, true, true } else &.{ true, true, true, true, true, true, true, false, true, true });
++    defer p.deinit();
++    if (refuser == 1) p.e1.refuse_keep_at = 64 else p.e0.refuse_keep_at = 64;
++    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
++    const prompt = testPrompt(13);
++    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s1.deinit(gpa);
++    try p.pass(&s1);
++    try std.testing.expectEqual(@as(usize, 10), p.gate.asked);
++    try std.testing.expectEqual(@as(usize, 1), adopter.n); // the 128 state only
++    try std.testing.expectEqual(@as(usize, 1), p.r0.kept.items.len);
++    try std.testing.expectEqual(@as(usize, 1), p.r1.kept.items.len);
++    try std.testing.expectEqual(@as(u32, 128), p.r0.kept.items[0].at);
++    try std.testing.expectEqual(@as(u32, 128), p.r1.kept.items[0].at);
++    try std.testing.expectEqualSlices([2]usize, whole_pass, p.e0.trace.items);
++    try std.testing.expectEqual(@as(usize, 1), p.e0.snaps); // the state taken at 64 and not agreed is gone
++    try std.testing.expectEqual(@as(usize, 1), p.e1.snaps);
++}
++
++test "a save refused on rank 1 only is kept by no rank; both go on from the live rows and keep at the next mark" {
++    try lateRefusal(1);
++}
++
++test "a save refused on rank 0 only is kept by no rank; both go on from the live rows and keep at the next mark" {
++    try lateRefusal(0);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index a5b26a4..00398cd 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -225,6 +225,12 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
+ /// The recipe's prompt cache for this process (rank 0 holds the store; both ranks hold the states and the reserve):
+ /// budget and caps from the environment as the Python engine reads them, the machine's memory less the reserve.
+ fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
++    // MTP drafts: the head's taps pair a continuation's rows with the prompt's tokens from its start (promptTaps,
++    // prompt_at), so a prefill that goes on from a kept or live state would misplace them; kept states wait for that
++    if (own.engine.?.mtp != null) {
++        if (o.rank == 0) std.log.info("prompt cache: off (MTP drafts do not resume from kept states yet)", .{});
++        return null;
++    }
+     const env: cache_plan.Env = .{
+         .entries = envText("TF_GLM_CACHE_ENTRIES"),
+         .share_pct = envText("TF_GLM_CACHE_SHARE_PCT"),
+@@ -233,6 +239,7 @@ fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
+         .shared_prefix = envText("TF_GLM_SHARED_PREFIX"),
+         .cache_gib = envText("TF_GLM_CACHE_GIB"),
+         .reserve_gib = envText("TENSORFOLD_MEMORY_RESERVE_GIB"),
++        .headroom_gib = envText("TF_GLM_KEEP_HEADROOM_GIB"),
+     };
+     const mem = cache_plan.memNow() orelse {
+         std.log.warn("prompt cache: /proc/meminfo is unreadable; no prompt cache", .{});
+@@ -243,6 +250,9 @@ fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
+         std.log.err("prompt cache: bad setting ({s}); no prompt cache", .{@errorName(err)});
+         return null;
+     };
++    // the keep floor is the reserve: a save (or a load from the spill tier) that would leave the machine under it is
++    // refused (cuda_lanes pass agrees on the room first); the headroom only shapes the budget, so the kept states stay
++    // that far above the floor and the prompts' own buffers have it
+     e.keep_reserve = p.reserve;
+     // every rank writes and reads its own copies (rank 0 decides, rank 1 follows its notes)
+     const spill = if (p.budget > 0) openSpill(own, o, build_key) else null;
+@@ -251,10 +261,10 @@ fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
+         std.log.info("prompt cache: off (budget 0)", .{});
+         return null;
+     }
+-    std.log.info("prompt cache: {d:.1} GiB for kept states, at most {d} (fixed {d} MiB each){s}; per chat {d}, bytes cap {d} MiB, shared prefix {d}; {d:.1} GiB reserved", .{
++    std.log.info("prompt cache: {d:.1} GiB for kept states, at most {d} (fixed {d} MiB each){s}; per chat {d}, bytes cap {d} MiB, shared prefix {d}; {d:.1} GiB reserved, {d:.1} GiB headroom for the prompts' buffers", .{
+         @as(f64, @floatFromInt(p.budget)) / cache_plan.gib,                                        p.entries,                                     e.snapBytes(0) >> 20,
+         if (p.entries_capped) " (cut to three quarters of the budget)" else "",                    p.per_chat,                                    p.bytes_cap >> 20,
+-        p.shared_least,                                                                            @as(f64, @floatFromInt(p.reserve)) / cache_plan.gib,
++        p.shared_least,                                                                            @as(f64, @floatFromInt(p.reserve)) / cache_plan.gib,                              @as(f64, @floatFromInt(p.headroom)) / cache_plan.gib,
+     });
+     return own.serving.?.local.cacheHooks(p.budget, .{ .grid = 64, .min_gap = 256, .min_prompt = 64, .entries = p.entries, .bytes_cap = p.bytes_cap, .per_chat = p.per_chat, .shared_least = p.shared_least }, if (spill) |sp| sp.highwater else 0, if (spill) |sp| sp.flush_s else 60);
+ }
