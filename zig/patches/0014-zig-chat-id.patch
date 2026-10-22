@@ -44,7 +44,7 @@ port of 0111 (continued chats) does that in the lane host and keeps this fix
 for the hosts that name none. Applies after 0013; independent of the other
 0014 fixes (any order). Robert's GLM port series carries the same change;
 whichever lands first, the other copy is an exact duplicate (git apply
---reverse --check passes). Credits: Robert Wojciechowski (wojo).
+--reverse --check passes). Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
 
 diff --git a/zig/src/core/keepalive.zig b/zig/src/core/keepalive.zig
 index 737c99f..970e9d4 100644
