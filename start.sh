@@ -117,7 +117,7 @@ if [[ "$ENGINE" == zig ]]; then
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
   (( DISPLAY_KV_MIB == 0 )) || [[ " $ZIG_HAS " == *" displaykv "* ]] || zig_unsupported "DISPLAY_KV_MIB (set ZIG_HAS=displaykv)"
-  # TP=3/4 control plane is in the engine; split prefill is two ranks only. TP=4 is not run in this project yet.
+  # TP=3/4 control plane is in the engine; split prefill is two ranks only.
   if (( TP == 3 )); then
     # three Sparks (a triangle): unsplit prefill over NCCL, the path the engine has for three ranks; the kernel set holds
     # the TP=3 shapes (22/21/21 heads), captured from the Python engine at TP=3 and checked equal to it
@@ -125,7 +125,15 @@ if [[ "$ENGINE" == zig ]]; then
     [[ "$COMM" == nccl || "$COMM" == roce ]] || die "ENGINE=zig at TP=3 needs COMM=nccl or COMM=roce"
     warn "ENGINE=zig: TP=3 is experimental (unsplit prefill, COMM=$COMM)"
   fi
-  if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4 (spark3/spark4 are not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=4 commands only (spark3/spark4 are not in this project)"; fi
+  if (( TP == 4 )); then
+    # four Sparks cabled as a ring (./start-tp4-switchless.sh): unsplit prefill over NCCL, whose ring channels run over
+    # the cables (the ring's graph files); the kernel set holds the TP=4 shapes (16 heads a rank), captured from the
+    # Python engine at TP=4 on a ring. A switch (./start-tp4.sh) is not tested, and the RoCE ring relay is not ported.
+    [[ "${FABRIC_EXPECT:-}" == ring ]] || die "ENGINE=zig at TP=4 runs on a ring of four (./start-tp4-switchless.sh)"
+    [[ "$SPLIT" == 0 ]] || die "ENGINE=zig at TP=4 needs SPLIT=0 (split prefill is two ranks)"
+    [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl (the RoCE ring relay, TF_ROCE_RING, is not ported)"
+    warn "ENGINE=zig: TP=4 is experimental (a ring of four, unsplit prefill, COMM=nccl)"
+  fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
     warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
   # The Zig image has no Python tower helper. VISION=1 loads the native tower, which dlopens cuDNN.
