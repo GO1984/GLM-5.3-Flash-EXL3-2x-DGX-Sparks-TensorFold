@@ -57,7 +57,9 @@ whose work it is (spill v2's block store design is [BadAd84](https://github.com/
 | `0020`, `0022` KV sharding | `TF_GLM_KV_SHARD=1`, `_CARRY`, `_TWINS`, `_CHECK` | off |
 | `0023` spill v2 with KV sharding | both of the above | off |
 
-Every switch is off in the engine and byte-identical when off, and this recipe sets none of them: they are usable as
+The spill v2 and KV shard switches are off in the engine and byte-identical when off. Not everything here is a switch:
+continued chats (`0017`) is on whenever a prompt cache is, and the three `0014` base fixes (the prepare gate, parked
+pages, the chat id) are on by default. This recipe sets no switch: they are usable as
 environment variables (every rank gets each `TF_GLM_*` variable), and the recipe settings that check and map them
 (`SPILL_V2`, `KV_SHARD`, `scripts/port.sh`) come separately. `ZIG_HAS`'s default names `spill2`, `kvshard` and
 `spillshard`. Measured on the pair (two GB10s, TP=2, `PARALLEL=8`, `CONTEXT=131072`, DFlash2, 2026-10-24, these
