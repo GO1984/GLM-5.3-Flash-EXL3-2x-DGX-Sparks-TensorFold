@@ -211,6 +211,13 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
+- `zig/patches/0014-zig-chat-id`, `zig/patches/0014-zig-parked-pages`, `zig/patches/0014-zig-prepare-memory`
+  (`ENGINE=zig`: a shared prompt cut no longer joins two conversations; the startup budgets count the pages parked on the
+  per-CPU free lists; a long prompt's preparation waits for memory in arrival order): by Robert Wojciechowski
+  ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull requests
+  [#213](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/213),
+  [#212](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/212) and
+  [#211](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/211), applied as contributed.
 - `zig/patches/0015-zig-glm-display-kv-zero-per-registration`, `zig/patches/0016-zig-glm-display-kv-copy-per-registration`
   (`ENGINE=zig` with `DISPLAY_KV_MIB`: the display span is zeroed, and each kept-state copy cut, one host registration at
   a time): by [ezoushen](https://github.com/ezoushen),
