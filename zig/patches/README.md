@@ -41,12 +41,12 @@ Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https:
 [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)) and KV sharding (0118,
 [#152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)), ported by him to this
 engine, after the three hand-written `0014` base fixes (#211-#213): one patch per feature, in the order they build on
-each other, each the diff of one commit of the engine branch `glm/series` (his
+each other, each the diff of one commit of the engine branch `glm/series` (Robert Wojciechowski's
 [`wojo/TensorFold` `glm-zig/series`](https://github.com/wojo/TensorFold/tree/glm-zig/series), rebased by Mia's AI Lab onto
 ezoushen's `0015` and `0016` and published as
 [`MiaAI-Lab/TensorFold` `glm-zig/series-on-186`](https://github.com/MiaAI-Lab/TensorFold/tree/glm-zig/series-on-186), from
 [`glm-zig/engine-fixes-186`](https://github.com/MiaAI-Lab/TensorFold/tree/glm-zig/engine-fixes-186) = `ZIG_TF_REF` plus
-`0001`-`0013`, the three `0014`s and `0015`-`0016`; the one change to his commits, in the spill store's, is the tests'
+`0001`-`0013`, the three `0014`s and `0015`-`0016`; the one change to those commits, in the spill store's, is the tests'
 scripted partial write, see its header) with a header that says what it does, its switches and defaults, what was measured on the pair and
 whose work it is (spill v2's block store design is [BadAd84](https://github.com/BadAd84)'s, #118).
 
