@@ -1,9 +1,9 @@
 diff --git a/zig/src/families/glm_cuda/cuda_display_kv.zig b/zig/src/families/glm_cuda/cuda_display_kv.zig
-index e090f9b..a771032 100644
+index b0d6742..c2e586d 100644
 --- a/zig/src/families/glm_cuda/cuda_display_kv.zig
 +++ b/zig/src/families/glm_cuda/cuda_display_kv.zig
-@@ -96,6 +96,19 @@ pub fn zeroRanges(s: Span, total: usize) [2]Range {
-     std.debug.assert(s.ordinary + s.display == total);
+@@ -96,6 +96,19 @@ pub fn zeroRanges(s: Span, total: usize) ![2]Range {
+     if (s.ordinary + s.display != total) return error.DisplaySpanSize;
      return .{ .{ .ptr = s.ptr, .len = s.ordinary }, .{ .ptr = s.ptr + s.ordinary, .len = s.display } };
  }
 +/// One piece of a device copy: `len` bytes at `off` from the start of both its source and its destination.
@@ -22,9 +22,9 @@ index e090f9b..a771032 100644
  fn mapped(address: usize, size: usize, prot: c_int, flags: c_int, fd: c_int, offset: u64) !usize {
      const p = mmap(if (address == 0) null else @ptrFromInt(address), size, prot, flags, fd, @intCast(offset)) orelse return error.DisplayMmap;
      const at = @intFromPtr(p);
-@@ -355,3 +368,19 @@ test "a mapped span is zeroed one host registration at a time, never across the
-     try std.testing.expectEqual(Range{ .ptr = 0x20_0000_0000, .len = 4 << 20 }, zeroRanges(one, 4 << 20)[0]);
-     try std.testing.expectEqual(@as(usize, 0), zeroRanges(one, 4 << 20)[1].len);
+@@ -361,3 +374,19 @@ test "a DRM span whose two registrations do not hold the planes is refused, in r
+     try std.testing.expectError(error.DisplaySpanSize, zeroRanges(drm, (3 << 20) + (1792 << 20) + 4096));
+     try std.testing.expectError(error.DisplaySpanSize, zeroRanges(drm, (3 << 20) + (1792 << 20) - 4096));
  }
 +
 +test "a device copy is cut where its source or destination crosses the ordinary/display registrations" {
