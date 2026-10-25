@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Export the GLM engine's port commits (the GLM-5.3-Flash patches 0088/0110/0111/0118/0119 by
 # Robert Wojciechowski (GitHub @wojo, X @rwojo), spill v2, continued chats, KV sharding and parked pages, ported to this
-# Zig engine) as zig/patches/NNNN-zig-<name>.patch, numbered after the last hand-written patch (here 0015 and later,
+# Zig engine) as zig/patches/NNNN-zig-<name>.patch, numbered after the last hand-written patch (here 0017 and later,
 # after the three 0014 base fixes), which zig/Dockerfile applies with `git apply` after the hand-written ones in filename
 # order. Nothing is written unless every step holds:
 #   1. a clean checkout of ZIG_TF_REF (the engine pin, scripts/config.sh) gets the hand-written zig/patches in filename

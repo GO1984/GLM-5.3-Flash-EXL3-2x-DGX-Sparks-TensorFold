@@ -113,8 +113,8 @@ if [[ "$ENGINE" == zig ]]; then
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
   # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image. parked: the
   # engine's startup budget counts the pages parked on the per-CPU free lists (zig/patches' parked-pages patch), so the
-  # memory check below counts them too. spill2 (spill v2, 0016/0017/0019), kvshard (KV sharding, 0018/0020) and
-  # spillshard (the two together, 0021) say the image carries them; their engine switches stay off (TF_GLM_SPILL_V2,
+  # memory check below counts them too. spill2 (spill v2, 0018/0019/0021), kvshard (KV sharding, 0020/0022) and
+  # spillshard (the two together, 0023) say the image carries them; their engine switches stay off (TF_GLM_SPILL_V2,
   # TF_GLM_KV_SHARD: docs/zig-engine.md), and nothing here reads these three names yet
   ZIG_HAS="${ZIG_HAS:-mtp displaykv parked spill2 kvshard spillshard}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
