@@ -210,6 +210,11 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
+- `zig/patches/0014-zig-glm-display-kv-zero-per-registration`, `zig/patches/0015-zig-glm-display-kv-copy-per-registration`
+  (`ENGINE=zig` with `DISPLAY_KV_MIB`: the display span is zeroed, and each kept-state copy cut, one host registration at
+  a time): by [ezoushen](https://github.com/ezoushen),
+  [pull request #186](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/186), applied as
+  contributed. They fix the zero and the copy that `0072` (above) needs on the Zig engine.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
