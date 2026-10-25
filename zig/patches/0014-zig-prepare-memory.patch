@@ -18,9 +18,10 @@ MemAvailable to zero.
   text and on GLM's pre-tokenizer.
 - server/prepare_gate.zig: each prepare reserves 48 bytes a text byte and
   goes when MemAvailable less the reservations in flight stays at the floor
-  with its own. The others wait in arrival order: only the oldest waiter may
-  go, so a large prepare is never starved by a stream of small ones that
-  would each fit beside the ones in flight. A waiter waits for memory at most
+  with its own, or at once when none is in flight and none waits (as before:
+  no prepare's end could free memory for it). The others wait in arrival
+  order: only the oldest waiter may go, so a large prepare is never starved
+  by a stream of small ones that would each fit beside the ones in flight. A waiter waits for memory at most
   TENSORFOLD_PREPARE_WAIT_MS, then goes as soon as none is in flight, so the
   gate never deadlocks and only turns concurrent prepares into queued ones;
   past TENSORFOLD_PREPARE_MAX_WAITING waiters one more is refused at once as
@@ -39,8 +40,8 @@ MemAvailable to zero.
 
 Switches: TENSORFOLD_PREPARE_FLOOR_GIB, the MemAvailable a prepare leaves
 (default 3 GiB; 0 turns the gate off); TENSORFOLD_PREPARE_WAIT_MS, how long a
-waiter waits for memory before it goes with none in flight (default 5000; 0:
-at once, the rule before the arrival order); TENSORFOLD_PREPARE_MAX_WAITING,
+waiter queued behind prepares in flight waits for memory before it goes with
+none in flight (default 5000; 0: at once); TENSORFOLD_PREPARE_MAX_WAITING,
 the prepares that may wait at once (default 64; 0: no bound). A malformed
 value refuses the start. start.sh passes every TENSORFOLD_* variable to every rank;
 only rank 0 prepares prompts.
@@ -55,7 +56,8 @@ reasoning took 673.6 before the one-pass signer, 35.7 after). Another test
 holds a reservation and runs chat.prepare: it waits having rendered nothing,
 then prepares and gives its reservation back. The gate's own tests: a large
 prepare behind a stream of four small ones goes before all of them (it went
-last before the arrival order), the wait bound alone and with one in flight,
+last before the arrival order), a prepare under the floor with none in flight and no waiter going at once,
+the wait bound behind a prepare in flight,
 the waiter bound and a cancelled waiter's place, and chat.prepare past the
 bound refused as a capacity refusal having rendered nothing. Replies are unchanged: zig build
 test-golden 309/319 equal to the frozen Python answers, 0 unexpected
@@ -839,10 +841,10 @@ index 99bc4bd..4fcccf3 100644
          const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
 diff --git a/zig/src/server/prepare_gate.zig b/zig/src/server/prepare_gate.zig
 new file mode 100644
-index 0000000..e039658
+index 0000000..085ce78
 --- /dev/null
 +++ b/zig/src/server/prepare_gate.zig
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,589 @@
 +//! The memory gate before a prompt is rendered and tokenized (rank 0's host side). A conversation's text is rendered
 +//! and tokenized three times with the prompt cache on (prompt.prepare: the prompt, its history and the rewind probe,
 +//! each after GLM's history repairs), so a resumed conversation of a million tokens needs memory in proportion to its
@@ -850,9 +852,10 @@ index 0000000..e039658
 +//! them at once can take MemAvailable to zero. Each prepare reserves `per_byte` bytes for every byte of its text and
 +//! goes when MemAvailable, less what the ones in flight reserved, stays at the floor or over with its own reservation.
 +//! Prepares that cannot go wait in arrival order: only the oldest waiter may go, so a large prepare is never starved by
-+//! a stream of small ones that would each fit beside the ones in flight (they queue behind it). A waiter waits for
-+//! memory at most `TENSORFOLD_PREPARE_WAIT_MS`; past it, it goes as soon as none is in flight (it can never wait on
-+//! itself, so the gate never deadlocks; 0 gives that rule at once, as before the order). At most
++//! a stream of small ones that would each fit beside the ones in flight (they queue behind it). A prepare that arrives
++//! with none in flight and no earlier waiter always goes at once, as before the order (no prepare's end could free
++//! memory for it). A waiter waits for memory at most `TENSORFOLD_PREPARE_WAIT_MS`; past it, it goes as soon as none is
++//! in flight (it can never wait on itself, so the gate never deadlocks; 0 gives that rule at once). At most
 +//! `TENSORFOLD_PREPARE_MAX_WAITING` prepares wait; one more is refused (`error.Full`, which chat.prepare answers as a
 +//! capacity refusal: 429 with `Retry-After` under the GLM recipe, else 503). The gate only ever turns concurrent
 +//! prepares into queued ones; it changes no reply. Off with a floor of 0, and where MemAvailable cannot be read (no
@@ -866,9 +869,10 @@ index 0000000..e039658
 +pub const env = [_][]const u8{ "TENSORFOLD_PREPARE_FLOOR_GIB", "TENSORFOLD_PREPARE_WAIT_MS", "TENSORFOLD_PREPARE_MAX_WAITING" };
 +/// TENSORFOLD_PREPARE_FLOOR_GIB unset: the MemAvailable a prepare leaves at least, in GiB.
 +pub const default_floor_gib: f64 = 3;
-+/// TENSORFOLD_PREPARE_WAIT_MS unset: how long a waiter waits for memory before it goes with none in flight. Long
-+/// enough for what frees rank 0's memory beside the prepares (a restore's staging, a finished request's arena), short
-+/// enough that a GB10 already under its floor delays a lone request by seconds, not for good.
++/// TENSORFOLD_PREPARE_WAIT_MS unset: how long a waiter (one queued behind prepares in flight) waits for memory before
++/// it goes with none in flight. Long enough for what frees rank 0's memory beside the prepares (a restore's staging, a
++/// finished request's arena), short enough that on a GB10 already under its floor a queued request waits seconds, not
++/// for good. A prepare that finds the gate empty never waits.
 +pub const default_wait_ms: u64 = 5000;
 +/// TENSORFOLD_PREPARE_MAX_WAITING unset: the prepares that may wait at once (0: no bound). Every lane's request and
 +/// a queue of the same size several times over; past it a client is told to retry rather than held unseen.
@@ -941,7 +945,9 @@ index 0000000..e039658
 +        if (g.floor == 0) return .{};
 +        var me: Waiter = .{ .bytes = bytes, .since = std.Io.Clock.awake.now(io).toNanoseconds() };
 +        g.mutex.lockUncancelable(io);
-+        if (g.first == null and g.goes(io, &me) != .wait) return g.take(io, &me, null);
++        // uncontended (none in flight, no earlier waiter): it goes at once, as before the order, even under the floor:
++        // no prepare's end can free memory for it, so waiting would only add latency
++        if (g.first == null and (g.inflight == 0 or g.goes(io, &me) != .wait)) return g.take(io, &me, null);
 +        if (g.max_waiting > 0 and g.waiting >= g.max_waiting) {
 +            g.refused += 1;
 +            const n = g.waiting;
@@ -1303,35 +1309,42 @@ index 0000000..e039658
 +    return error.TestUnexpectedResult;
 +}
 +
-+test "a prepare that would take MemAvailable under the floor waits at most TENSORFOLD_PREPARE_WAIT_MS, and then goes only with none in flight" {
++test "a waiter queued behind a prepare in flight waits for memory at most TENSORFOLD_PREPARE_WAIT_MS, and then goes only with none in flight" {
 +    const io = std.testing.io;
 +    var g = Gate.configured(3, 100, default_max_waiting);
 +    g.avail = fakeAvail;
-+    fake_avail.store(1 << 30, .release); // under the floor whatever goes
-+    // alone, it waits for memory the maximum, then goes (never for good)
-+    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-+    const a = try g.enter(io, 1 << 20, Never{});
-+    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
-+    try std.testing.expect(a.held);
-+    try std.testing.expect(took >= 100 * std.time.ns_per_ms and took < 5 * std.time.ns_per_s);
-+    try std.testing.expectEqual(@as(u64, 1), g.waited);
-+    try std.testing.expectEqual(@as(u64, 1), g.overdue);
-+    // past the maximum, a second still waits while the first is in flight, and goes once it has left
 +    var order: std.atomic.Value(u32) = .init(0);
++    // past the maximum, a waiter still waits while the one in flight is there, and goes once it has left
++    fake_avail.store(16 << 30, .release);
++    const a = try g.enter(io, 1 << 20, Never{});
++    fake_avail.store(1 << 30, .release); // under the floor whatever goes
 +    var b: Prep = .{ .bytes = 1 << 20 };
-+    const th = try std.Thread.spawn(.{}, Prep.run, .{ &b, &g, &order });
++    const tb = try std.Thread.spawn(.{}, Prep.run, .{ &b, &g, &order });
 +    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
 +    try std.testing.expect(!b.done.load(.acquire));
 +    g.leave(io, a);
-+    th.join();
++    tb.join();
 +    try b.result;
-+    try std.testing.expectEqual(@as(u32, 0), b.at);
-+    try std.testing.expectEqual(@as(u64, 2), g.overdue);
-+    // a wait of 0: with none in flight it goes at once, as before arrival order
-+    g.max_wait_ns = 0;
++    try std.testing.expectEqual(@as(u64, 1), g.waited);
++    try std.testing.expectEqual(@as(u64, 1), g.overdue);
++    // the one in flight leaves at once: the waiter, memory still short, waits out the maximum (never for good)
++    fake_avail.store(16 << 30, .release);
 +    const c = try g.enter(io, 1 << 20, Never{});
-+    try std.testing.expectEqual(@as(u64, 2), g.waited);
++    fake_avail.store(1 << 30, .release);
++    var d: Prep = .{ .bytes = 1 << 20 };
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    const td = try std.Thread.spawn(.{}, Prep.run, .{ &d, &g, &order });
++    try untilWaiting(&g, 1);
 +    g.leave(io, c);
++    td.join();
++    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
++    try d.result;
++    try std.testing.expect(took >= 100 * std.time.ns_per_ms and took < 5 * std.time.ns_per_s);
++    try std.testing.expectEqual(@as(u64, 2), g.overdue);
++    // uncontended again: at once, not counted as a wait
++    const e = try g.enter(io, 1 << 20, Never{});
++    try std.testing.expectEqual(@as(u64, 2), g.waited);
++    g.leave(io, e);
 +    try std.testing.expectEqual(@as(u32, 0), g.inflight);
 +    try std.testing.expectEqual(@as(u64, 0), g.reserved);
 +}
@@ -1402,6 +1415,24 @@ index 0000000..e039658
 +    try std.testing.expectEqual(@as(u32, 0), g.inflight);
 +    try std.testing.expectEqual(@as(u64, 0), g.reserved);
 +    try std.testing.expect(g.first == null and g.last == null);
++}
++
++test "uncontended: with nothing in flight and no waiter a prepare goes at once, even under the floor, and nothing counts it as waiting" {
++    const io = std.testing.io;
++    var g = Gate.init(3); // the default wait (5000 ms) and waiter bound
++    g.avail = fakeAvail;
++    fake_avail.store(1 << 30, .release); // MemAvailable under the 3 GiB floor
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    const a = try g.enter(io, 1 << 30, Never{});
++    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
++    try std.testing.expect(a.held);
++    try std.testing.expect(took < 50 * std.time.ns_per_ms);
++    // it never joined the queue: no wait counted, nothing overdue, so no "prepare waits" or "goes after" line
++    try std.testing.expectEqual(@as(u64, 0), g.waited);
++    try std.testing.expectEqual(@as(u64, 0), g.overdue);
++    try std.testing.expectEqual(@as(u32, 0), g.waiting);
++    try std.testing.expectEqual(@as(u32, 1), g.inflight);
++    g.leave(io, a);
 +}
 diff --git a/zig/src/server/prepare_gate_test.zig b/zig/src/server/prepare_gate_test.zig
 new file mode 100644
